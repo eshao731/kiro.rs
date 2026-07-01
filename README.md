@@ -41,7 +41,7 @@
 - 流式和非流式响应：支持 Anthropic SSE 事件格式。
 - **多凭据管理**：OAuth、Builder ID、Social、Enterprise / IdC、Kiro API Key。
 - 自动 token 刷新：支持刷新后回写 `credentials.json`。
-- **多凭据调度**：`priority` 固定优先级和 `balanced` 均衡分配。
+- **多凭据调度**：`priority` 固定优先级、`balanced` 均衡分配和 `least_conn` 最少在途请求。
 - **故障转移**：凭据失败、额度用尽、账号级 429 风控冷却、token 失效强制刷新。
 - **profileArn 策略**：流式端点按账号类型注入真实 ARN 或 Builder ID 占位 ARN；用量类 / 头部类调用跳过占位 ARN。
 - **端点抽象**：按凭据选择 `ide` 或 `cli` endpoint。
@@ -292,9 +292,10 @@ Admin API 鉴权同样支持：
 | `tlsBackend` | `rustls` | `rustls` 或 `native-tls` |
 | `proxyUrl` | 无 | 全局代理，支持 `http://`、`https://`、`socks5://` |
 | `proxyUsername` / `proxyPassword` | 无 | 全局代理认证 |
-| `loadBalancingMode` | `priority` | `priority` 或 `balanced` |
+| `loadBalancingMode` | `priority` | `priority`、`balanced` 或 `least_conn` |
 | `accountThrottleFailover` | `true` | 账号级 429 suspicious activity 时是否冷却并切换凭据 |
-| `accountThrottleCooldownSecs` | `1800` | 账号级风控冷却秒数 |
+| `accountThrottleCooldownSecs` | `300` | 账号级风控冷却秒数 |
+| `cacheMaxSavingsRatio` | `0.9` | Prompt cache 最多计入的输入 token 比例，范围 0-1 |
 | `extractThinking` | `true` | 非流式响应是否把旧 `<thinking>` 文本提取成 thinking block |
 | `traceEnabled` | `true` | 是否写入 `traces.db` |
 | `traceRetentionDays` | `7` | trace 保留天数 |
@@ -594,6 +595,8 @@ data/
 - `cache_read_input_tokens`
 - `output_tokens`
 
+`cacheMaxSavingsRatio` 可限制 `cache_creation_input_tokens + cache_read_input_tokens` 最多占输入 token 的比例。
+
 <a id="admin-ui"></a>
 ## 🖥️ Admin UI
 
@@ -661,6 +664,7 @@ credential.proxyUrl -> config.proxyUrl -> direct
 
 - `priority`：优先使用 priority 数字最小的可用凭据。
 - `balanced`：在可用凭据之间均衡分配。
+- `least_conn`：优先选择当前在途请求数最少的可用凭据。
 
 故障处理：
 

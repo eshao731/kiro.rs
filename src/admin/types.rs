@@ -399,7 +399,7 @@ pub struct EnableOverageAllResult {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LoadBalancingModeResponse {
-    /// 当前模式（"priority" 或 "balanced"）
+    /// 当前模式（"priority"、"balanced" 或 "least_conn"）
     pub mode: String,
 }
 
@@ -407,7 +407,7 @@ pub struct LoadBalancingModeResponse {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SetLoadBalancingModeRequest {
-    /// 模式（"priority" 或 "balanced"）
+    /// 模式（"priority"、"balanced" 或 "least_conn"）
     pub mode: String,
 }
 

@@ -753,6 +753,8 @@ struct CredentialEntry {
     /// `Some(t)` 且 `t > now()` 时视为不可用；`t <= now()` 时自动恢复。
     /// 不持久化，进程重启后清空。
     throttled_until: Option<Instant>,
+    /// 运行中（in-flight）请求计数。least_conn 负载均衡用。
+    in_flight: u32,
 }
 
 /// 禁用原因
@@ -912,6 +914,21 @@ pub struct CallContext {
     pub token: String,
 }
 
+/// in-flight 计数的 RAII 守卫（least_conn 负载均衡用）。
+pub struct InFlightGuard {
+    manager: std::sync::Arc<MultiTokenManager>,
+    id: u64,
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        let mut entries = self.manager.entries.lock();
+        if let Some(e) = entries.iter_mut().find(|e| e.id == self.id) {
+            e.in_flight = e.in_flight.saturating_sub(1);
+        }
+    }
+}
+
 /// 判断某账号的分组集合是否匹配请求所属分组（严格隔离）
 ///
 /// - `group = None`：Key 未绑定分组（含 master apiKey），匹配所有账号。
@@ -996,6 +1013,7 @@ impl MultiTokenManager {
                     success_count: 0,
                     last_used_at: None,
                     throttled_until: None,
+                    in_flight: 0,
                 }
             })
             .collect();
@@ -1135,7 +1153,8 @@ impl MultiTokenManager {
     /// 根据负载均衡模式选择下一个凭据
     ///
     /// - priority 模式：选择优先级最高（priority 最小）的可用凭据
-    /// - balanced 模式：均衡选择可用凭据
+    /// - balanced 模式：均衡选择可用凭据（成功次数最少优先）
+    /// - least_conn 模式：选择当前在途请求数最少的可用凭据
     ///
     /// # 参数
     /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
@@ -1179,6 +1198,14 @@ impl MultiTokenManager {
 
                 Some((entry.id, entry.credentials.clone()))
             }
+            "least_conn" => {
+                // Least-Connections 策略：选择当前在途请求数最少的凭据。
+                let entry = available
+                    .iter()
+                    .min_by_key(|e| (e.in_flight, e.credentials.priority, e.success_count))?;
+
+                Some((entry.id, entry.credentials.clone()))
+            }
             _ => {
                 // priority 模式（默认）：选择优先级最高的
                 let entry = available.iter().min_by_key(|e| e.credentials.priority)?;
@@ -1212,11 +1239,11 @@ impl MultiTokenManager {
             }
 
             let (id, credentials) = {
-                let is_balanced = self.load_balancing_mode.lock().as_str() == "balanced";
+                let re_select_each_request = self.load_balancing_mode.lock().as_str() != "priority";
 
-                // balanced 模式：每次请求都重新均衡选择，不固定 current_id
+                // 非 priority 模式：每次请求都重新选择，不固定 current_id
                 // priority 模式：优先使用 current_id 指向的凭据
-                let current_hit = if is_balanced {
+                let current_hit = if re_select_each_request {
                     None
                 } else {
                     let entries = self.entries.lock();
@@ -1279,6 +1306,8 @@ impl MultiTokenManager {
             // 尝试获取/刷新 Token
             match self.try_ensure_token(id, &credentials).await {
                 Ok(ctx) => {
+                    // 仅在最终把凭据交给调用方时 +1（least_conn 在途计数）。
+                    self.inc_in_flight(ctx.id);
                     return Ok(ctx);
                 }
                 Err(e) => {
@@ -1688,6 +1717,22 @@ impl MultiTokenManager {
 
         if should_flush {
             self.save_stats();
+        }
+    }
+
+    /// 对指定凭据 `in_flight += 1`。
+    pub(crate) fn inc_in_flight(&self, id: u64) {
+        let mut entries = self.entries.lock();
+        if let Some(e) = entries.iter_mut().find(|e| e.id == id) {
+            e.in_flight = e.in_flight.saturating_add(1);
+        }
+    }
+
+    /// 为指定凭据构造 in-flight RAII 守卫。
+    pub(crate) fn in_flight_guard(self: &std::sync::Arc<Self>, id: u64) -> InFlightGuard {
+        InFlightGuard {
+            manager: std::sync::Arc::clone(self),
+            id,
         }
     }
 
@@ -2787,6 +2832,24 @@ impl MultiTokenManager {
                     anyhow::bail!(msg);
                 }
             }
+            let new_groups = &validated_cred.groups;
+            let baseline_success = entries
+                .iter()
+                .filter(|e| {
+                    if e.disabled {
+                        return false;
+                    }
+                    new_groups.is_empty()
+                        || e.credentials.groups.is_empty()
+                        || e.credentials
+                            .groups
+                            .iter()
+                            .any(|g| new_groups.contains(g))
+                })
+                .map(|e| e.success_count)
+                .min()
+                .unwrap_or(0);
+
             entries.push(CredentialEntry {
                 id: new_id,
                 credentials: validated_cred,
@@ -2795,9 +2858,10 @@ impl MultiTokenManager {
                 refresh_failure_count: 0,
                 disabled: false,
                 disabled_reason: None,
-                success_count: 0,
+                success_count: baseline_success,
                 last_used_at: None,
                 throttled_until: None,
+                in_flight: 0,
             });
         }
 
@@ -3138,7 +3202,7 @@ impl MultiTokenManager {
     /// 设置负载均衡模式（Admin API）
     pub fn set_load_balancing_mode(&self, mode: String) -> anyhow::Result<()> {
         // 验证模式值
-        if mode != "priority" && mode != "balanced" {
+        if mode != "priority" && mode != "balanced" && mode != "least_conn" {
             anyhow::bail!("无效的负载均衡模式: {}", mode);
         }
 

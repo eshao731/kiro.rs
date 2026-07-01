@@ -142,7 +142,12 @@ pub fn map_model(model: &str) -> Option<String> {
     let model_lower = model.to_lowercase();
 
     if model_lower.contains("sonnet") {
-        if model_lower.contains("4-8") || model_lower.contains("4.8") {
+        if model_lower.contains("sonnet-5")
+            || model_lower.contains("sonnet5")
+            || model_lower.contains("sonnet.5")
+        {
+            Some("claude-sonnet-5".to_string())
+        } else if model_lower.contains("4-8") || model_lower.contains("4.8") {
             Some("claude-sonnet-4.8".to_string())
         } else if model_lower.contains("4-6") || model_lower.contains("4.6") {
             Some("claude-sonnet-4.6".to_string())
@@ -180,6 +185,7 @@ pub fn get_context_window_size(model: &str) -> i32 {
         Some(mapped)
             if mapped == "claude-sonnet-4.6"
                 || mapped == "claude-sonnet-4.8"
+                || mapped == "claude-sonnet-5"
                 || mapped == "claude-opus-4.6"
                 || mapped == "claude-opus-4.7"
                 || mapped == "claude-opus-4.8" =>
@@ -1264,6 +1270,36 @@ mod tests {
             Some("claude-sonnet-4.8".to_string())
         );
         assert_eq!(get_context_window_size("claude-sonnet-4-8"), 1_000_000);
+    }
+
+    #[test]
+    fn test_map_model_sonnet_5() {
+        assert_eq!(
+            map_model("claude-sonnet-5"),
+            Some("claude-sonnet-5".to_string())
+        );
+        assert_eq!(
+            map_model("claude-sonnet-5-thinking"),
+            Some("claude-sonnet-5".to_string())
+        );
+        assert_eq!(
+            map_model("claude-sonnet-5-20260615"),
+            Some("claude-sonnet-5".to_string())
+        );
+        assert_eq!(get_context_window_size("claude-sonnet-5"), 1_000_000);
+        assert!(model_supports_xhigh_effort("claude-sonnet-5"));
+    }
+
+    #[test]
+    fn test_map_model_sonnet_5_no_collision_with_4_x() {
+        assert_eq!(
+            map_model("claude-sonnet-4-5-20250929"),
+            Some("claude-sonnet-4.5".to_string())
+        );
+        assert_eq!(
+            map_model("claude-sonnet-4.5"),
+            Some("claude-sonnet-4.5".to_string())
+        );
     }
 
     #[test]

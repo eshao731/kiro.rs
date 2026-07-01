@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use clap::Parser;
-use kiro::endpoint::{CliEndpoint, IdeEndpoint, KiroEndpoint};
+use kiro::endpoint::{CliEndpoint, IdeEndpoint, KiroEndpoint, RuntimeEndpoint};
 use kiro::model::credentials::{CredentialsConfig, KiroCredentials};
 use kiro::provider::KiroProvider;
 use kiro::token_manager::MultiTokenManager;
@@ -122,6 +122,8 @@ async fn main() {
         endpoints.insert(ide.name().to_string(), Arc::new(ide));
         let cli = CliEndpoint::new();
         endpoints.insert(cli.name().to_string(), Arc::new(cli));
+        let runtime = RuntimeEndpoint::new();
+        endpoints.insert(runtime.name().to_string(), Arc::new(runtime));
     }
 
     // 校验默认端点存在
@@ -254,9 +256,12 @@ async fn main() {
 
     // CacheMeter：模拟 Anthropic 缓存、计量 cache_read/creation token 的进程内组件。
     // 持久化到 cache_dir/cache_metering.json，启动时自动加载未过期条目。
-    let cache_meter = std::sync::Arc::new(anthropic::cache_metering::CacheMeter::new(Some(
-        cache_dir.join("cache_metering.json"),
-    )));
+    let cache_meter = std::sync::Arc::new(anthropic::cache_metering::CacheMeter::with_config(
+        Some(cache_dir.join("cache_metering.json")),
+        config.cache_max_savings_ratio,
+        config.input_cache_short_ttl_secs,
+        config.input_cache_long_ttl_secs,
+    ));
     cache_meter.clone().spawn_background();
 
     let anthropic_app = anthropic::create_router(

@@ -604,6 +604,41 @@ impl TraceStore {
         }
     }
 
+    /// 清空全部请求链路记录（traces + attempts）。
+    pub fn clear_all(&self) -> usize {
+        let mut conn = self.conn.lock();
+        let tx = match conn.transaction() {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!("trace 清空事务失败: {}", e);
+                return 0;
+            }
+        };
+        let res = (|| -> rusqlite::Result<usize> {
+            tx.execute("DELETE FROM trace_attempts", [])?;
+            let n = tx.execute("DELETE FROM traces", [])?;
+            Ok(n)
+        })();
+        match res {
+            Ok(n) => match tx.commit() {
+                Ok(()) => {
+                    if n > 0 {
+                        tracing::info!("已清空 {} 条 trace 记录", n);
+                    }
+                    n
+                }
+                Err(e) => {
+                    tracing::warn!("trace 清空提交失败: {}", e);
+                    0
+                }
+            },
+            Err(e) => {
+                tracing::warn!("trace 清空失败: {}", e);
+                0
+            }
+        }
+    }
+
     /// 按凭据聚合失败跳数，归并为三类：鉴权 / 账号风控 / 其他。
     /// 统计 trace_attempts 里 outcome != 'success' 的跳，按 credential_id + outcome 分组。
     /// 返回 credential_id → (auth, throttle, other)。仅 warn 失败，返回空。

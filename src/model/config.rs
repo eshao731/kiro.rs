@@ -123,7 +123,7 @@ pub struct Config {
     #[serde(default = "default_update_auto_apply_time")]
     pub update_auto_apply_time: String,
 
-    /// 负载均衡模式（"priority" 或 "balanced"）
+    /// 负载均衡模式（"priority"、"balanced" 或 "least_conn"）
     #[serde(default = "default_load_balancing_mode")]
     pub load_balancing_mode: String,
 
@@ -135,9 +135,21 @@ pub struct Config {
     #[serde(default = "default_account_throttle_failover")]
     pub account_throttle_failover: bool,
 
-    /// 账号级风控冷却时长（秒，默认 1800 = 30 分钟）。
+    /// 账号级风控冷却时长（秒，默认 300 = 5 分钟）。
     #[serde(default = "default_account_throttle_cooldown_secs")]
     pub account_throttle_cooldown_secs: u64,
+
+    /// Prompt cache 最多计入的输入 token 比例，默认 0.90。
+    #[serde(default = "default_cache_max_savings_ratio")]
+    pub cache_max_savings_ratio: f64,
+
+    /// Prompt cache 短 TTL 秒数，默认 300 = 5 分钟。
+    #[serde(default = "default_input_cache_short_ttl_secs")]
+    pub input_cache_short_ttl_secs: u64,
+
+    /// Prompt cache 长 TTL 秒数，默认 3600 = 1 小时。
+    #[serde(default = "default_input_cache_long_ttl_secs")]
+    pub input_cache_long_ttl_secs: u64,
 
     /// 是否开启非流式响应的 thinking 块提取（默认 true）
     ///
@@ -218,7 +230,19 @@ fn default_account_throttle_failover() -> bool {
 }
 
 fn default_account_throttle_cooldown_secs() -> u64 {
-    30 * 60
+    5 * 60
+}
+
+fn default_cache_max_savings_ratio() -> f64 {
+    0.90
+}
+
+fn default_input_cache_short_ttl_secs() -> u64 {
+    5 * 60
+}
+
+fn default_input_cache_long_ttl_secs() -> u64 {
+    60 * 60
 }
 
 fn default_update_auto_apply_time() -> String {
@@ -275,6 +299,9 @@ impl Default for Config {
             load_balancing_mode: default_load_balancing_mode(),
             account_throttle_failover: default_account_throttle_failover(),
             account_throttle_cooldown_secs: default_account_throttle_cooldown_secs(),
+            cache_max_savings_ratio: default_cache_max_savings_ratio(),
+            input_cache_short_ttl_secs: default_input_cache_short_ttl_secs(),
+            input_cache_long_ttl_secs: default_input_cache_long_ttl_secs(),
             extract_thinking: default_extract_thinking(),
             default_endpoint: default_endpoint(),
             trace_enabled: default_trace_enabled(),

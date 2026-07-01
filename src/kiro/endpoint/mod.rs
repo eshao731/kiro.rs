@@ -13,9 +13,11 @@ use crate::model::config::Config;
 
 pub mod cli;
 pub mod ide;
+pub mod runtime;
 
 pub use cli::CliEndpoint;
 pub use ide::IdeEndpoint;
+pub use runtime::RuntimeEndpoint;
 
 /// Kiro 端点
 ///
@@ -23,6 +25,11 @@ pub use ide::IdeEndpoint;
 pub trait KiroEndpoint: Send + Sync {
     /// 端点名称（对应 credentials.endpoint / config.defaultEndpoint 的取值）
     fn name(&self) -> &'static str;
+
+    /// 429 限流时可降级到的备用端点名。
+    fn fallback_endpoint(&self) -> Option<&'static str> {
+        None
+    }
 
     /// API 请求的 Content-Type（默认 application/json）
     fn content_type(&self) -> &'static str {

@@ -1146,6 +1146,8 @@ impl StreamContext {
 
     /// 生成 message_start 事件
     pub fn create_message_start_event(&self) -> serde_json::Value {
+        let (input_tokens, cache_creation_input_tokens, cache_read_input_tokens) =
+            self.resolved_usage();
         json!({
             "type": "message_start",
             "message": {
@@ -1157,10 +1159,10 @@ impl StreamContext {
                 "stop_reason": null,
                 "stop_sequence": null,
                 "usage": {
-                    "input_tokens": self.input_tokens,
+                    "input_tokens": input_tokens,
                     "output_tokens": 1,
-                    "cache_creation_input_tokens": 0,
-                    "cache_read_input_tokens": 0
+                    "cache_creation_input_tokens": cache_creation_input_tokens,
+                    "cache_read_input_tokens": cache_read_input_tokens
                 }
             }
         })
@@ -2303,6 +2305,31 @@ mod tests {
             .iter()
             .map(|s| s.to_string())
             .collect()
+    }
+
+    #[test]
+    fn message_start_includes_cache_usage_before_final_event() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            100,
+            false,
+            std::collections::HashMap::new(),
+            test_known_tools(),
+        );
+        ctx.cache_usage = crate::anthropic::cache_metering::CacheUsage {
+            cache_read: 80,
+            cache_covered_est: 80,
+            prompt_total_est: 100,
+            max_savings_ratio: 0.9,
+        };
+
+        let events = ctx.generate_initial_events();
+        let usage = &events[0].data["message"]["usage"];
+
+        assert_eq!(usage["input_tokens"].as_i64(), Some(20));
+        assert_eq!(usage["cache_creation_input_tokens"].as_i64(), Some(0));
+        assert_eq!(usage["cache_read_input_tokens"].as_i64(), Some(80));
+        assert_eq!(usage["output_tokens"].as_i64(), Some(1));
     }
 
     // ---- extract_invoke_content_blocks: one-shot (non-streaming) reclamation ----

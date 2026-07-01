@@ -57,6 +57,10 @@ impl KiroEndpoint for CliEndpoint {
         CLI_ENDPOINT_NAME
     }
 
+    fn fallback_endpoint(&self) -> Option<&'static str> {
+        Some(super::runtime::RUNTIME_ENDPOINT_NAME)
+    }
+
     fn content_type(&self) -> &'static str {
         "application/x-amz-json-1.0"
     }

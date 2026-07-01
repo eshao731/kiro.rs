@@ -171,7 +171,11 @@ impl ClientKeyManager {
         let mut inner = self.inner.write();
         // 防止 bootstrap 重复导入同一明文
         if let Some(&id) = inner.by_key.get(&plaintext) {
-            return inner.entries.get(&id).cloned().expect("by_key 与 entries 应一致");
+            return inner
+                .entries
+                .get(&id)
+                .cloned()
+                .expect("by_key 与 entries 应一致");
         }
         let id = inner.next_id;
         inner.next_id += 1;
@@ -337,7 +341,11 @@ impl ClientKeyManager {
 
     /// 返回指定 Key 绑定的分组名（None 表示未绑定或 Key 不存在）
     pub fn group_of(&self, id: u64) -> Option<String> {
-        self.inner.read().entries.get(&id).and_then(|e| e.group.clone())
+        self.inner
+            .read()
+            .entries
+            .get(&id)
+            .and_then(|e| e.group.clone())
     }
 
     /// 列出所有当前被引用的分组名（仅去重，不带计数）。
@@ -453,9 +461,6 @@ impl ClientKeyManager {
     /// 用 `ConstantTimeEq` 对所有 active Key 做常量时间比对，防止时序攻击；
     /// 之前的 HashMap 直接 lookup 仅作快速短路（命中后还会再做一次常量时间比较）。
     pub fn verify_and_touch(&self, presented: &str) -> Option<u64> {
-        if !presented.starts_with(CLIENT_KEY_PREFIX) {
-            return None;
-        }
         let mut inner = self.inner.write();
         // 第一遍：扫描所有 entry 做常量时间比较，避免 HashMap 短路泄露
         let mut hit_id: Option<u64> = None;
@@ -503,7 +508,12 @@ impl ClientKeyManager {
 
     /// 获取统计后的 active Key 数（未禁用）
     pub fn active_count(&self) -> usize {
-        self.inner.read().entries.values().filter(|e| !e.disabled).count()
+        self.inner
+            .read()
+            .entries
+            .values()
+            .filter(|e| !e.disabled)
+            .count()
     }
 }
 
@@ -520,8 +530,7 @@ fn is_false(b: &bool) -> bool {
 
 /// 生成 `csk_` 前缀 + 32 位 base62 随机字符串
 pub fn generate_client_key() -> String {
-    const CHARSET: &[u8] =
-        b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    const CHARSET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     let body: String = (0..32)
         .map(|_| {
             let idx = fastrand::usize(..CHARSET.len());
@@ -557,8 +566,15 @@ mod tests {
         let entry = mgr.create("test".to_string(), None, None);
         assert!(entry.key.starts_with(CLIENT_KEY_PREFIX));
         assert_eq!(mgr.verify_and_touch(&entry.key), Some(entry.id));
-        // 不带前缀的拒绝
+        // 未登记的 Key 拒绝
         assert_eq!(mgr.verify_and_touch("nope"), None);
+    }
+
+    #[test]
+    fn system_key_can_use_legacy_sk_prefix() {
+        let mgr = ClientKeyManager::new();
+        mgr.ensure_system_key("默认密钥".into(), None, "sk-kiro-abc".into());
+        assert_eq!(mgr.verify_and_touch("sk-kiro-abc"), Some(0));
     }
 
     #[test]
@@ -643,7 +659,11 @@ mod tests {
         // 修复后启动：应迁移到 id=0
         mgr.ensure_system_key("默认密钥".into(), None, "sk-kiro-abc".into());
         assert!(mgr.is_system(0));
-        assert!(!mgr.list().iter().any(|k| k.id == 1 && k.key == "sk-kiro-abc"));
+        assert!(
+            !mgr.list()
+                .iter()
+                .any(|k| k.id == 1 && k.key == "sk-kiro-abc")
+        );
     }
 
     #[test]
