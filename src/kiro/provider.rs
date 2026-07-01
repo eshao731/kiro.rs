@@ -262,8 +262,21 @@ impl KiroProvider {
                 self.profile_resolution_attempted.lock().insert(ctx.id);
             }
             Err(e) => {
-                // 网络/瞬态错误：不标记，下次请求再试；本次按原 profileArn 继续
-                tracing::warn!("凭据 #{} 解析真实 profileArn 失败（按原 profileArn 继续）: {}", ctx.id, e);
+                let msg = e.to_string();
+                if msg.contains("AWS Builder ID is not supported for this operation") {
+                    self.profile_resolution_attempted.lock().insert(ctx.id);
+                    tracing::warn!(
+                        "凭据 #{} 不支持 ListAvailableProfiles，按 BuilderID 占位 profileArn 继续",
+                        ctx.id
+                    );
+                } else {
+                    // 网络/瞬态错误：不标记，下次请求再试；本次按原 profileArn 继续
+                    tracing::warn!(
+                        "凭据 #{} 解析真实 profileArn 失败（按原 profileArn 继续）: {}",
+                        ctx.id,
+                        e
+                    );
+                }
             }
         }
     }
@@ -586,6 +599,54 @@ impl KiroProvider {
 
             // 400 Bad Request - 请求问题，重试/切换凭据无意义
             if status.as_u16() == 400 {
+                if endpoint.is_model_unsupported(&body) {
+                    let cooldown_secs = self
+                        .token_manager
+                        .get_account_throttle_cooldown_secs()
+                        .max(1);
+                    let cooldown = std::time::Duration::from_secs(cooldown_secs);
+                    tracing::warn!(
+                        "API 请求失败（凭据 #{} 不支持模型 {:?}，冷却 {}s 并切换，尝试 {}/{}）: {}",
+                        ctx.id,
+                        model,
+                        cooldown_secs,
+                        attempt + 1,
+                        max_retries,
+                        body
+                    );
+                    Self::emit_attempt(
+                        sink,
+                        attempt,
+                        ctx.id,
+                        endpoint_name,
+                        Some(400),
+                        outcome::MODEL_UNSUPPORTED,
+                        Some(&body),
+                        attempt_start,
+                    );
+                    let remaining = self.token_manager.report_temporary_cooldown(
+                        ctx.id,
+                        cooldown,
+                        "账号不支持当前模型",
+                    );
+                    last_error = Some(anyhow::anyhow!(
+                        "{} API 请求失败（凭据 #{} 不支持当前模型，已冷却 {} 分钟）: {} {}",
+                        api_type,
+                        ctx.id,
+                        cooldown_secs / 60,
+                        status,
+                        body
+                    ));
+                    if remaining == 0 {
+                        anyhow::bail!(
+                            "{} API 请求失败：所有凭据都不支持当前模型或已不可用。原始响应: {} {}",
+                            api_type,
+                            status,
+                            body
+                        );
+                    }
+                    continue;
+                }
                 Self::emit_attempt(
                     sink, attempt, ctx.id, endpoint_name, Some(400),
                     outcome::BAD_REQUEST, Some(&body), attempt_start,

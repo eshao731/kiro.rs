@@ -88,6 +88,15 @@ pub trait KiroEndpoint: Send + Sync {
         default_is_client_validation_error(body)
     }
 
+    /// 判断响应体是否表示当前账号 / profile 不支持请求的模型。
+    ///
+    /// 这类错误通常是上游 `400 INVALID_MODEL_ID`：请求模型本身已经通过本地
+    /// Anthropic→Kiro 映射，但所选凭据不可用该模型。应切换凭据，而不是把用户
+    /// 卡在同一个账号上反复 400。
+    fn is_model_unsupported(&self, body: &str) -> bool {
+        default_is_model_unsupported(body)
+    }
+
     /// 判断响应体是否表示上游网关超时。
     ///
     /// 524 通常来自 Cloudflare/边缘层，继续在同一次客户端调用里重试会把等待时间
@@ -216,6 +225,22 @@ pub fn default_is_client_validation_error(body: &str) -> bool {
         .any(|m| body.contains(m))
 }
 
+/// 默认的“当前账号不支持模型”判断逻辑。
+pub fn default_is_model_unsupported(body: &str) -> bool {
+    if !body.contains("INVALID_MODEL_ID") && !body.contains("Invalid model ID") {
+        return false;
+    }
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(body) {
+        let top = value.get("reason").and_then(|v| v.as_str());
+        let nested = value.pointer("/error/reason").and_then(|v| v.as_str());
+        return [top, nested]
+            .into_iter()
+            .flatten()
+            .any(|r| r == "INVALID_MODEL_ID");
+    }
+    body.contains("Invalid model ID")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -322,6 +347,22 @@ mod tests {
         // 宽泛的 ValidationException 不再单独命中（无精确 reason / 无特异短语时）
         assert!(!default_is_client_validation_error(
             r#"{"__type":"ValidationException","message":"some other validation"}"#
+        ));
+    }
+
+    #[test]
+    fn test_default_is_model_unsupported() {
+        assert!(default_is_model_unsupported(
+            r#"{"message":"Invalid model ID. Please select a different model to continue.","reason":"INVALID_MODEL_ID"}"#
+        ));
+        assert!(default_is_model_unsupported(
+            r#"{"error":{"reason":"INVALID_MODEL_ID"}}"#
+        ));
+        assert!(!default_is_model_unsupported(
+            r#"{"message":"Invalid model ID text in details","reason":"OTHER"}"#
+        ));
+        assert!(!default_is_model_unsupported(
+            r#"{"reason":"TOOL_USE_RESULT_MISMATCH"}"#
         ));
     }
 }

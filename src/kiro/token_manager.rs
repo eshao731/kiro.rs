@@ -2157,6 +2157,19 @@ impl MultiTokenManager {
     ///
     /// 返回剩余可用凭据数（已排除冷却中的）。
     pub fn report_account_throttled(&self, id: u64, cooldown: StdDuration) -> usize {
+        self.report_temporary_cooldown(id, cooldown, "账号级风控")
+    }
+
+    /// 标记凭据进入临时冷却期。
+    ///
+    /// 用于账号级风控、账号不支持当前模型等“换账号即可恢复”的场景。不同于
+    /// `report_failure`，这里不增加连续失败计数，避免短期/模型级问题导致永久禁用。
+    pub fn report_temporary_cooldown(
+        &self,
+        id: u64,
+        cooldown: StdDuration,
+        reason: &str,
+    ) -> usize {
         let now = Instant::now();
         {
             let mut entries = self.entries.lock();
@@ -2170,9 +2183,10 @@ impl MultiTokenManager {
                 // 计入累计失败（账号风控不动连续 failure_count，避免冷却结束后误禁用）
                 entry.total_failure_count += 1;
                 tracing::warn!(
-                    "凭据 #{} 触发账号级风控，冷却 {} 秒",
+                    "凭据 #{} 进入临时冷却 {} 秒：{}",
                     id,
-                    cooldown.as_secs()
+                    cooldown.as_secs(),
+                    reason
                 );
             }
 

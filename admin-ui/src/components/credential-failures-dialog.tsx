@@ -34,6 +34,8 @@ function outcomeStyle(outcome: string | null): {
       return { label: "网络错误", variant: "destructive" };
     case "bad_request":
       return { label: "请求错误", variant: "destructive" };
+    case "model_unsupported":
+      return { label: "模型不可用", variant: "destructive" };
     case "stream_interrupted":
       return { label: "流中断", variant: "warning" };
     default:

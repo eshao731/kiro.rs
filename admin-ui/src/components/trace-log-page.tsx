@@ -67,6 +67,8 @@ function outcomeStyle(outcome: string): {
       return { label: '网络错误', variant: 'destructive' }
     case 'bad_request':
       return { label: '请求错误', variant: 'destructive' }
+    case 'model_unsupported':
+      return { label: '模型不可用', variant: 'destructive' }
     case 'stream_interrupted':
       return { label: '流中断', variant: 'warning' }
     default:
@@ -145,6 +147,7 @@ const ERROR_TYPE_OPTIONS = [
   { value: 'transient', label: '瞬态错误' },
   { value: 'network_error', label: '网络错误' },
   { value: 'bad_request', label: '请求错误' },
+  { value: 'model_unsupported', label: '模型不可用' },
   { value: 'stream_interrupted', label: '流中断' },
   { value: 'unknown', label: '未知' },
 ]
@@ -649,6 +652,5 @@ export function TraceLogPage() {
     </div>
   )
 }
-
 
 
