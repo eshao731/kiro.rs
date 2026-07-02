@@ -141,7 +141,12 @@ Complete all chunked operations without commentary.";
 pub fn map_model(model: &str) -> Option<String> {
     let model_lower = model.to_lowercase();
 
-    if model_lower.contains("sonnet") {
+    if model_lower.contains("fable-5")
+        || model_lower.contains("fable5")
+        || model_lower.contains("fable.5")
+    {
+        Some("claude-fable-5".to_string())
+    } else if model_lower.contains("sonnet") {
         if model_lower.contains("sonnet-5")
             || model_lower.contains("sonnet5")
             || model_lower.contains("sonnet.5")
@@ -186,6 +191,7 @@ pub fn get_context_window_size(model: &str) -> i32 {
             if mapped == "claude-sonnet-4.6"
                 || mapped == "claude-sonnet-4.8"
                 || mapped == "claude-sonnet-5"
+                || mapped == "claude-fable-5"
                 || mapped == "claude-opus-4.6"
                 || mapped == "claude-opus-4.7"
                 || mapped == "claude-opus-4.8" =>
@@ -1288,6 +1294,30 @@ mod tests {
         );
         assert_eq!(get_context_window_size("claude-sonnet-5"), 1_000_000);
         assert!(model_supports_xhigh_effort("claude-sonnet-5"));
+    }
+
+    #[test]
+    fn test_map_model_fable_5() {
+        assert_eq!(
+            map_model("claude-fable-5"),
+            Some("claude-fable-5".to_string())
+        );
+        assert_eq!(
+            map_model("claude-fable-5-thinking"),
+            Some("claude-fable-5".to_string())
+        );
+        assert_eq!(
+            map_model("claude-fable-5-20260615"),
+            Some("claude-fable-5".to_string())
+        );
+        assert_eq!(get_context_window_size("claude-fable-5"), 1_000_000);
+        assert!(model_supports_xhigh_effort("claude-fable-5"));
+    }
+
+    #[test]
+    fn test_map_model_fable_5_no_collision_with_4_x() {
+        assert!(map_model("claude-fable-4-5-20260615").is_none());
+        assert!(map_model("claude-fable-4.5").is_none());
     }
 
     #[test]

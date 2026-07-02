@@ -366,6 +366,24 @@ fn resolve_usage_input_tokens(
 fn available_models() -> Vec<Model> {
     vec![
         Model {
+            id: "claude-fable-5".to_string(),
+            object: "model".to_string(),
+            created: 1781481600, // Jun 15, 2026
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Fable 5".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 128000,
+        },
+        Model {
+            id: "claude-fable-5-thinking".to_string(),
+            object: "model".to_string(),
+            created: 1781481600, // Jun 15, 2026
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Fable 5 (Thinking)".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 128000,
+        },
+        Model {
             id: "claude-sonnet-5".to_string(),
             object: "model".to_string(),
             created: 1781481600, // Jun 15, 2026
@@ -1851,5 +1869,19 @@ mod tests {
 
         assert!(ids.contains(&"claude-sonnet-5"));
         assert!(ids.contains(&"claude-sonnet-5-thinking"));
+    }
+
+    #[test]
+    fn available_models_include_fable_5_variants() {
+        let models = available_models();
+        let ids: Vec<&str> = models.iter().map(|model| model.id.as_str()).collect();
+        let fable = models
+            .iter()
+            .find(|model| model.id == "claude-fable-5")
+            .expect("fable model should be listed");
+
+        assert!(ids.contains(&"claude-fable-5"));
+        assert!(ids.contains(&"claude-fable-5-thinking"));
+        assert_eq!(fable.max_tokens, 128000);
     }
 }

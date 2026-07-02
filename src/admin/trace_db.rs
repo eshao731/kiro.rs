@@ -352,14 +352,16 @@ impl TraceStore {
                     rec.first_token_ms.map(|v| v as i64),
                 ],
             )?;
-            for a in &rec.attempts {
+            // Runtime fallback can emit more than one hop in the same retry round.
+            // Persist the emission order so one hop does not overwrite another.
+            for (seq, a) in rec.attempts.iter().enumerate() {
                 tx.execute(
                     "INSERT OR REPLACE INTO trace_attempts (trace_id, attempt, credential_id, \
                      endpoint, http_status, outcome, error_snippet, duration_ms) \
                      VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
                     rusqlite::params![
                         rec.trace_id,
-                        a.attempt as i64,
+                        seq as i64,
                         a.credential_id as i64,
                         a.endpoint,
                         a.http_status.map(|v| v as i64),
