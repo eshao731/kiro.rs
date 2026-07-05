@@ -4,6 +4,16 @@ All notable changes to this project are documented in this file. The format
 loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### ✨ 新功能 — 企业 SSO（Microsoft 365 / Entra ID / Azure AD）`external_idp` 认证
+
+- **新增 `external_idp` 认证方式**：支持导入 Microsoft Entra ID / Azure AD 企业租户账号（既不是 AWS Builder ID 也不是 IAM Identity Center，原先无法接入）。凭据新增 `tokenEndpoint`（IdP OAuth2 token 端点）、`issuerUrl`（OIDC issuer，纯备注）、`scopes`（空格分隔的已授权 scope）三个字段。
+- **IdP token 端点刷新**：`external_idp` 账号的 Token 刷新走 IdP 的 OAuth2 `refresh_token` grant（公共客户端，`application/x-www-form-urlencoded`，无 client_secret），区别于 Social / IdC 的刷新路径。响应缺省新 refresh_token 时保留原值（Azure AD 有时不轮换）；`invalid_grant` 复用既有永久失效检测，自动禁用凭据。
+- **`TokenType: EXTERNAL_IDP` 头**：数据面（streaming / runtime）与 `ListAvailableProfiles` / `getUsageLimits` 等 REST 请求对 `external_idp` 账号自动携带该头，否则 CodeWhisperer 静默返回空 profile 列表并拒绝数据面调用。真实 profileArn 仍由 `ListAvailableProfiles` 懒解析回填（与 IdC 一致）。
+- **Admin UI 支持**：「添加凭据」对话框新增「企业 SSO (Microsoft Entra / Azure AD)」选项与对应字段（Client ID / Token Endpoint / Issuer URL / Scopes），凭据卡片展示 `Entra ID` 标签。直接导入 / 导出 JSON 凭据均无损保留新字段。
+- **说明**：本版仅实现凭据导入与刷新；不包含浏览器门户登录 / 回调监听 / 两段式状态机（按需手动获取 Azure 凭据后以 JSON 导入）。
+
 ## [0.6.7] - 2026-06-17
 
 主题：**远程部署 Social 登录零配置化（OAuth 回调地址自动派生）+ 凭据列表卡片 / 列表双视图与分页增强 + 来源渠道模糊搜索与移动端体验优化 + output_config.effort 分级归一化**。这一版解决了远程部署（Render / Docker / VPS）下 Social 登录回调指向 `127.0.0.1` 无法使用的痛点——前端按当前访问地址自动派生公网回调地址，远程部署零配置即可完成 Google / GitHub 登录；凭据列表新增 iOS 风格的卡片 / 列表双视图切换、可配置每页数量与跨页全选；同时归一化 `output_config.effort` 分级，避免较老模型收到不支持的 `xhigh` 报错，并在删除凭据时清理其历史失败记录。凭据管理页面还新增按来源渠道（备注）/ 邮箱的模糊搜索、批量导入 / 验活 / 刷新余额的 8 路并发化，以及一轮移动端工具栏布局与下拉菜单渲染异常的修复。

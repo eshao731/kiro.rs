@@ -23,7 +23,8 @@ use crate::kiro::model::available_models::ListAvailableModelsResponse;
 use crate::kiro::model::available_profiles::ListAvailableProfilesResponse;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::model::token_refresh::{
-    IdcRefreshRequest, IdcRefreshResponse, RefreshRequest, RefreshResponse,
+    ExternalIdpRefreshResponse, IdcRefreshRequest, IdcRefreshResponse, RefreshRequest,
+    RefreshResponse,
 };
 use crate::kiro::model::usage_limits::UsageLimitsResponse;
 use crate::model::config::Config;
@@ -131,7 +132,9 @@ pub(crate) async fn refresh_token(
         }
     });
 
-    if auth_method.eq_ignore_ascii_case("idc")
+    if auth_method.eq_ignore_ascii_case("external_idp") {
+        refresh_external_idp_token(credentials, config, proxy).await
+    } else if auth_method.eq_ignore_ascii_case("idc")
         || auth_method.eq_ignore_ascii_case("builder-id")
         || auth_method.eq_ignore_ascii_case("iam")
     {
@@ -322,6 +325,106 @@ async fn refresh_idc_token(
     Ok(new_credentials)
 }
 
+/// 刷新外部 IdP（Microsoft Entra ID / Azure AD）Token
+///
+/// 通过 IdP 的 OAuth2 token 端点以公共客户端 `refresh_token` grant 刷新（无
+/// client_secret）。原始登录 scope 中的 `offline_access` 才会让 IdP 下发
+/// refresh_token。IdP 不返回 profileArn —— 真实 ARN 由
+/// [`list_available_profiles`]（携带 `TokenType: EXTERNAL_IDP` 头）单独解析回填。
+async fn refresh_external_idp_token(
+    credentials: &KiroCredentials,
+    config: &Config,
+    proxy: Option<&ProxyConfig>,
+) -> anyhow::Result<KiroCredentials> {
+    tracing::info!("正在刷新外部 IdP (Entra ID / Azure AD) Token...");
+
+    let refresh_token = credentials.refresh_token.as_ref().unwrap();
+    let client_id = credentials
+        .client_id
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("外部 IdP 刷新需要 clientId"))?;
+    let token_endpoint = credentials
+        .token_endpoint
+        .as_ref()
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("外部 IdP 刷新需要 tokenEndpoint"))?;
+
+    // 表单字段：client_id + grant_type=refresh_token + refresh_token，scope 可选
+    let mut form: Vec<(&str, &str)> = vec![
+        ("client_id", client_id.as_str()),
+        ("grant_type", "refresh_token"),
+        ("refresh_token", refresh_token.as_str()),
+    ];
+    if let Some(scopes) = credentials.scopes.as_deref() {
+        if !scopes.trim().is_empty() {
+            form.push(("scope", scopes));
+        }
+    }
+
+    let client = build_client(proxy, 60, config.tls_backend)?;
+    let response = client
+        .post(token_endpoint)
+        .header("Accept", "application/json")
+        // reqwest 的 .form(...) 会设置 Content-Type: application/x-www-form-urlencoded
+        .form(&form)
+        .send()
+        .await?;
+
+    let status = response.status();
+    let body_text = response.text().await.unwrap_or_default();
+    let data: ExternalIdpRefreshResponse =
+        serde_json::from_str(&body_text).unwrap_or_default();
+
+    // 非 2xx 或缺少 access_token 视为失败
+    let access_token = match data.access_token {
+        Some(t) if status.is_success() && !t.is_empty() => t,
+        _ => {
+            // invalid_grant → refreshToken 永久失效，交由上层自动禁用
+            let is_invalid_grant = data
+                .error
+                .as_deref()
+                .map(|e| e.eq_ignore_ascii_case("invalid_grant"))
+                .unwrap_or(false);
+            if is_invalid_grant {
+                return Err(RefreshTokenInvalidError {
+                    message: format!(
+                        "外部 IdP refreshToken 已失效 (invalid_grant): {}",
+                        data.error_description.as_deref().unwrap_or(&body_text)
+                    ),
+                }
+                .into());
+            }
+            if let Some(err) = data.error {
+                bail!(
+                    "外部 IdP Token 刷新失败 {}: {}: {}",
+                    status,
+                    err,
+                    data.error_description.unwrap_or_default()
+                );
+            }
+            bail!("外部 IdP Token 刷新失败 {}: {}", status, body_text);
+        }
+    };
+
+    let mut new_credentials = credentials.clone();
+    new_credentials.access_token = Some(access_token);
+
+    // 部分 IdP（Azure AD）会轮换 refresh_token；未返回新值时保留原 refresh_token
+    if let Some(new_refresh_token) = data.refresh_token {
+        if !new_refresh_token.is_empty() {
+            new_credentials.refresh_token = Some(new_refresh_token);
+        }
+    }
+
+    if let Some(expires_in) = data.expires_in {
+        let expires_at = Utc::now() + Duration::seconds(expires_in);
+        new_credentials.expires_at = Some(expires_at.to_rfc3339());
+    }
+
+    // 不动 profile_arn：IdP 不返回，由 ARN 解析路径（resolve_profile_arn_for）补
+    Ok(new_credentials)
+}
+
 /// 官方 Kiro 用量 / 模型 REST 接口（getUsageLimits / ListAvailableModels /
 /// setUserPreference）仅在 `us-east-1` 与 `eu-central-1` 两个端点提供服务。
 ///
@@ -395,6 +498,10 @@ pub(crate) async fn get_usage_limits(
 
         if credentials.is_api_key_credential() {
             request = request.header("tokentype", "API_KEY");
+        } else if credentials.is_external_idp() {
+            // 外部 IdP（Entra ID / Azure AD）token 必须声明类型，否则 CodeWhisperer
+            // 静默返回空 profile 列表并拒绝数据面调用。
+            request = request.header("tokentype", "EXTERNAL_IDP");
         }
 
         let response = request.send().await?;
@@ -492,6 +599,10 @@ pub(crate) async fn get_available_models(
 
         if credentials.is_api_key_credential() {
             request = request.header("tokentype", "API_KEY");
+        } else if credentials.is_external_idp() {
+            // 外部 IdP（Entra ID / Azure AD）token 必须声明类型，否则 CodeWhisperer
+            // 静默返回空 profile 列表并拒绝数据面调用。
+            request = request.header("tokentype", "EXTERNAL_IDP");
         }
 
         let response = request.send().await?;
@@ -591,6 +702,10 @@ pub(crate) async fn list_available_profiles(
 
         if credentials.is_api_key_credential() {
             request = request.header("tokentype", "API_KEY");
+        } else if credentials.is_external_idp() {
+            // 外部 IdP（Entra ID / Azure AD）token 必须声明类型，否则 CodeWhisperer
+            // 静默返回空 profile 列表并拒绝数据面调用。
+            request = request.header("tokentype", "EXTERNAL_IDP");
         }
 
         let response = request.send().await?;
@@ -684,6 +799,10 @@ pub(crate) async fn set_user_preference(
 
         if credentials.is_api_key_credential() {
             request = request.header("tokentype", "API_KEY");
+        } else if credentials.is_external_idp() {
+            // 外部 IdP（Entra ID / Azure AD）token 必须声明类型，否则 CodeWhisperer
+            // 静默返回空 profile 列表并拒绝数据面调用。
+            request = request.header("tokentype", "EXTERNAL_IDP");
         }
 
         let response = request.send().await?;

@@ -137,6 +137,18 @@ pub struct AddCredentialRequest {
     #[serde(default)]
     pub start_url: Option<String>,
 
+    /// 外部 IdP（Microsoft Entra ID / Azure AD）OAuth2 token 端点（external_idp 刷新必填）
+    #[serde(default)]
+    pub token_endpoint: Option<String>,
+
+    /// 外部 IdP 的 OIDC issuer URL（external_idp，纯备注）
+    #[serde(default)]
+    pub issuer_url: Option<String>,
+
+    /// 外部 IdP 授予的 scope（external_idp，空格分隔）
+    #[serde(default)]
+    pub scopes: Option<String>,
+
     /// 优先级（可选，默认 0）
     #[serde(default)]
     pub priority: u32,
@@ -903,6 +915,15 @@ pub struct ExportedCredentials {
     pub region: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub start_url: Option<String>,
+    /// 外部 IdP（Entra ID / Azure AD）OAuth2 token 端点（external_idp）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_endpoint: Option<String>,
+    /// 外部 IdP 的 OIDC issuer URL（external_idp）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub issuer_url: Option<String>,
+    /// 外部 IdP 授予的 scope（external_idp，空格分隔）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scopes: Option<String>,
     pub expires_at: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auth_method: Option<String>,

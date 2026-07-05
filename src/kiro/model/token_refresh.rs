@@ -43,6 +43,27 @@ pub struct IdcRefreshResponse {
     pub profile_arn: Option<String>,
 }
 
+/// 外部 IdP（Microsoft Entra ID / Azure AD）Token 刷新响应体
+///
+/// 标准 OAuth2 token 端点响应（**snake_case**，区别于 Social/IdC 的 camelCase）。
+/// 公共客户端 `refresh_token` grant；IdP 不返回 profileArn（由
+/// `ListAvailableProfiles` 用 EXTERNAL_IDP token 类型单独解析）。
+#[derive(Debug, Default, Deserialize)]
+pub struct ExternalIdpRefreshResponse {
+    #[serde(default)]
+    pub access_token: Option<String>,
+    #[serde(default)]
+    pub refresh_token: Option<String>,
+    #[serde(default)]
+    pub expires_in: Option<i64>,
+    /// OAuth2 错误码（如 `invalid_grant`）
+    #[serde(default)]
+    pub error: Option<String>,
+    /// OAuth2 错误描述
+    #[serde(default)]
+    pub error_description: Option<String>,
+}
+
 // ============ AWS SSO OIDC 设备授权流程 ============
 
 /// 注册 OIDC 客户端请求体
@@ -147,4 +168,43 @@ pub struct SocialCreateTokenResponse {
     pub expires_in: Option<i64>,
     #[serde(default)]
     pub profile_arn: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_external_idp_refresh_response_snake_case() {
+        // Azure AD 标准 OAuth2 token 响应（snake_case）
+        let json = r#"{
+            "access_token": "new-access",
+            "refresh_token": "new-refresh",
+            "expires_in": 3600,
+            "token_type": "Bearer"
+        }"#;
+        let resp: ExternalIdpRefreshResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.access_token.as_deref(), Some("new-access"));
+        assert_eq!(resp.refresh_token.as_deref(), Some("new-refresh"));
+        assert_eq!(resp.expires_in, Some(3600));
+        assert!(resp.error.is_none());
+    }
+
+    #[test]
+    fn test_external_idp_refresh_response_error() {
+        let json = r#"{"error":"invalid_grant","error_description":"token expired"}"#;
+        let resp: ExternalIdpRefreshResponse = serde_json::from_str(json).unwrap();
+        assert!(resp.access_token.is_none());
+        assert_eq!(resp.error.as_deref(), Some("invalid_grant"));
+        assert_eq!(resp.error_description.as_deref(), Some("token expired"));
+    }
+
+    #[test]
+    fn test_external_idp_refresh_response_no_rotation() {
+        // IdP 不轮换 refresh_token 时，响应里缺省该字段
+        let json = r#"{"access_token":"a","expires_in":3600}"#;
+        let resp: ExternalIdpRefreshResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.access_token.as_deref(), Some("a"));
+        assert!(resp.refresh_token.is_none());
+    }
 }

@@ -42,15 +42,15 @@ pub struct KiroCredentials {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<String>,
 
-    /// 认证方式 (social / idc)
+    /// 认证方式 (social / idc / external_idp / api_key)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auth_method: Option<String>,
 
-    /// 身份提供商（BuilderId / Enterprise / Github / Google / IAM_SSO）
+    /// 身份提供商（BuilderId / Enterprise / Github / Google / IAM_SSO / AzureAD）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
 
-    /// OIDC Client ID (IdC 认证需要)
+    /// OIDC Client ID（IdC 认证需要；external_idp 刷新也需要）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_id: Option<String>,
 
@@ -61,6 +61,21 @@ pub struct KiroCredentials {
     /// SSO Start URL（Enterprise / IAM Identity Center 账号专用）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub start_url: Option<String>,
+
+    /// 外部 IdP（Microsoft Entra ID / Azure AD）的 OAuth2 token 端点
+    ///
+    /// 仅 `external_idp` 认证方式使用：刷新 Token 时以 `refresh_token` grant
+    /// （公共客户端，无 client_secret）POST 到此端点。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_endpoint: Option<String>,
+
+    /// 外部 IdP 的 OIDC issuer URL（端点的发现来源，纯备注）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub issuer_url: Option<String>,
+
+    /// 外部 IdP 授予的 scope（空格分隔），刷新时原样回传
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scopes: Option<String>,
 
     /// 凭据优先级（数字越小优先级越高，默认为 0）
     #[serde(default)]
@@ -170,6 +185,9 @@ impl std::fmt::Debug for KiroCredentials {
             .field("client_id", &fmt_redacted(&self.client_id))
             .field("client_secret", &fmt_redacted(&self.client_secret))
             .field("start_url", &self.start_url)
+            .field("token_endpoint", &self.token_endpoint)
+            .field("issuer_url", &self.issuer_url)
+            .field("scopes", &self.scopes)
             .field("priority", &self.priority)
             .field("region", &self.region)
             .field("auth_region", &self.auth_region)
@@ -341,6 +359,19 @@ impl KiroCredentials {
                 .unwrap_or(false)
     }
 
+    /// 是否为外部 IdP（Microsoft Entra ID / Azure AD）企业 SSO 凭据。
+    ///
+    /// 这类账号走 OAuth2 公共客户端 `refresh_token` grant 刷新（见
+    /// [`crate::kiro::token_manager`] 的 `refresh_external_idp_token`），且数据面 /
+    /// Profile 请求必须携带 `TokenType: EXTERNAL_IDP` 头才能被 CodeWhisperer 识别。
+    /// 与 [`Self::is_api_key_credential`] 互斥。
+    pub fn is_external_idp(&self) -> bool {
+        self.auth_method
+            .as_deref()
+            .map(|m| m.eq_ignore_ascii_case("external_idp"))
+            .unwrap_or(false)
+    }
+
     /// 凭据缺少显式 profileArn 时应使用的默认 ARN：
     /// Social 登录用共享 Social ARN，其余（BuilderID 等）用 BuilderID 占位符。
     fn default_profile_arn(&self) -> &'static str {
@@ -476,6 +507,9 @@ mod tests {
             client_id: None,
             client_secret: None,
             start_url: None,
+            token_endpoint: None,
+            issuer_url: None,
+            scopes: None,
             priority: 0,
             region: None,
             auth_region: None,
@@ -507,6 +541,49 @@ mod tests {
             KiroCredentials::default_credentials_path(),
             "credentials.json"
         );
+    }
+
+    #[test]
+    fn test_external_idp_fields_roundtrip() {
+        // external_idp 凭据：tokenEndpoint / issuerUrl / scopes 往返序列化
+        let json = r#"{
+            "accessToken": "azure-access",
+            "refreshToken": "azure-refresh-token-that-is-long-enough-to-pass",
+            "authMethod": "external_idp",
+            "provider": "AzureAD",
+            "clientId": "11111111-2222-3333-4444-555555555555",
+            "tokenEndpoint": "https://login.microsoftonline.com/tenant/oauth2/v2.0/token",
+            "issuerUrl": "https://login.microsoftonline.com/tenant/v2.0",
+            "scopes": "openid profile offline_access"
+        }"#;
+        let creds = KiroCredentials::from_json(json).unwrap();
+        assert!(creds.is_external_idp());
+        // 与 API Key 互斥
+        assert!(!creds.is_api_key_credential());
+        assert_eq!(
+            creds.token_endpoint.as_deref(),
+            Some("https://login.microsoftonline.com/tenant/oauth2/v2.0/token")
+        );
+        assert_eq!(
+            creds.scopes.as_deref(),
+            Some("openid profile offline_access")
+        );
+
+        // 重新序列化后字段仍在
+        let out = creds.to_pretty_json().unwrap();
+        assert!(out.contains("tokenEndpoint"));
+        assert!(out.contains("issuerUrl"));
+        assert!(out.contains("scopes"));
+    }
+
+    #[test]
+    fn test_is_external_idp_case_insensitive_and_false_default() {
+        let mut creds = KiroCredentials::default();
+        assert!(!creds.is_external_idp());
+        creds.auth_method = Some("External_IDP".to_string());
+        assert!(creds.is_external_idp());
+        creds.auth_method = Some("social".to_string());
+        assert!(!creds.is_external_idp());
     }
 
     #[test]
@@ -667,6 +744,9 @@ mod tests {
             client_id: None,
             client_secret: None,
             start_url: None,
+            token_endpoint: None,
+            issuer_url: None,
+            scopes: None,
             priority: 0,
             region: Some("eu-west-1".to_string()),
             auth_region: None,
@@ -702,6 +782,9 @@ mod tests {
             client_id: None,
             client_secret: None,
             start_url: None,
+            token_endpoint: None,
+            issuer_url: None,
+            scopes: None,
             priority: 0,
             region: None,
             auth_region: None,
@@ -820,6 +903,9 @@ mod tests {
             client_id: None,
             client_secret: None,
             start_url: None,
+            token_endpoint: None,
+            issuer_url: None,
+            scopes: None,
             priority: 3,
             region: Some("us-west-2".to_string()),
             auth_region: None,

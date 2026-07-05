@@ -372,6 +372,24 @@ Enterprise / IdC 账号在流式调用前会按需调用 `ListAvailableProfiles`
 
 `provider` 可为 `Github` 或 `Google`。Social 登录会使用固定 Social profile ARN。
 
+#### 企业 SSO（Microsoft 365 / Entra ID / Azure AD）
+
+```json
+{
+  "refreshToken": "xxx",
+  "accessToken": "xxx",
+  "expiresAt": "2026-12-31T00:00:00Z",
+  "authMethod": "external_idp",
+  "provider": "AzureAD",
+  "clientId": "11111111-2222-3333-4444-555555555555",
+  "tokenEndpoint": "https://login.microsoftonline.com/<tenant>/oauth2/v2.0/token",
+  "issuerUrl": "https://login.microsoftonline.com/<tenant>/v2.0",
+  "scopes": "openid profile offline_access <resource-scope>"
+}
+```
+
+适用于 Microsoft Entra ID / Azure AD 企业租户账号（既不是 AWS Builder ID 也不是 IAM Identity Center）。Token 刷新走 IdP 的 OAuth2 `refresh_token` grant（公共客户端，无 `clientSecret`）：`tokenEndpoint` 与 `clientId` 必填，`scopes` 需含 `offline_access` 才能拿到 refresh token。真实 `profileArn` 由 `ListAvailableProfiles` 懒解析回填——数据面与 Profile 请求会自动携带 `TokenType: EXTERNAL_IDP` 头。本版仅支持以 JSON 导入（不含浏览器门户登录）。
+
 #### Kiro API Key
 
 ```json
@@ -395,10 +413,11 @@ KIRO_API_KEY=ksk_xxx ./kiro-rs
 | `id` | 凭据 ID，Admin 管理时自动分配 |
 | `refreshToken` / `accessToken` | OAuth token |
 | `expiresAt` | RFC3339 过期时间 |
-| `authMethod` | `idc`、`social`、`api_key`。旧值 `builder-id`、`iam` 会规范化为 `idc` |
-| `provider` | `BuilderId`、`Enterprise`、`Github`、`Google`、`IAM_SSO` 等 |
-| `clientId` / `clientSecret` | IdC 刷新 token 所需 OIDC client |
+| `authMethod` | `idc`、`social`、`external_idp`、`api_key`。旧值 `builder-id`、`iam` 会规范化为 `idc` |
+| `provider` | `BuilderId`、`Enterprise`、`Github`、`Google`、`IAM_SSO`、`AzureAD` 等 |
+| `clientId` / `clientSecret` | IdC 刷新 token 所需 OIDC client；`external_idp` 仅需 `clientId` |
 | `startUrl` | Enterprise IAM Identity Center Start URL |
+| `tokenEndpoint` / `issuerUrl` / `scopes` | 外部 IdP（Entra ID / Azure AD）专用：刷新端点 / OIDC issuer（备注）/ 已授权 scope |
 | `profileArn` | 真实 profile ARN 或已知固定 ARN；通常由程序维护 |
 | `priority` | 数字越小优先级越高 |
 | `region` | 凭据级 Region，兼容旧配置 |

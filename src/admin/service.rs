@@ -358,24 +358,34 @@ fn credential_to_export_account(cred: KiroCredentials) -> Option<ExportedAccount
             .filter(|s| !s.is_empty())
     }
 
-    // authMethod 规范化："idc" → "IdC"，其余按 social 处理
+    // authMethod 规范化："idc" → "IdC"，"external_idp" 原样保留，其余按 social 处理
     let auth_method = non_empty(cred.auth_method.clone()).map(|m| {
         if m.eq_ignore_ascii_case("idc")
             || m.eq_ignore_ascii_case("builder-id")
             || m.eq_ignore_ascii_case("iam")
         {
             "IdC".to_string()
+        } else if m.eq_ignore_ascii_case("external_idp") {
+            "external_idp".to_string()
         } else {
             "social".to_string()
         }
     });
     let is_idc = auth_method.as_deref() == Some("IdC");
+    let is_external_idp = auth_method.as_deref() == Some("external_idp");
 
     let provider = non_empty(cred.provider.clone());
     // idp 与 provider 同义；缺失时按认证方式回退到合法的身份提供商
-    let idp = provider
-        .clone()
-        .unwrap_or_else(|| if is_idc { "BuilderId" } else { "Google" }.to_string());
+    let idp = provider.clone().unwrap_or_else(|| {
+        if is_external_idp {
+            "AzureAD"
+        } else if is_idc {
+            "BuilderId"
+        } else {
+            "Google"
+        }
+        .to_string()
+    });
 
     let status = if cred.disabled {
         "unknown".to_string()
@@ -417,6 +427,9 @@ fn credential_to_export_account(cred: KiroCredentials) -> Option<ExportedAccount
             .or_else(|| non_empty(cred.auth_region.clone()))
             .or_else(|| non_empty(cred.api_region.clone())),
         start_url: non_empty(cred.start_url.clone()),
+        token_endpoint: non_empty(cred.token_endpoint.clone()),
+        issuer_url: non_empty(cred.issuer_url.clone()),
+        scopes: non_empty(cred.scopes.clone()),
         expires_at: expires_at_ms,
         auth_method,
         provider: provider.clone(),
@@ -1010,6 +1023,26 @@ impl AdminService {
             }
         }
 
+        // external_idp（Microsoft Entra ID / Azure AD）刷新依赖 refreshToken + clientId +
+        // tokenEndpoint，缺失则刷新必然失败，提前拒绝并给出明确错误。
+        if req.auth_method.eq_ignore_ascii_case("external_idp") {
+            let missing: Vec<&str> = [
+                ("refreshToken", req.refresh_token.as_deref()),
+                ("clientId", req.client_id.as_deref()),
+                ("tokenEndpoint", req.token_endpoint.as_deref()),
+            ]
+            .into_iter()
+            .filter(|(_, v)| v.map(|s| s.trim().is_empty()).unwrap_or(true))
+            .map(|(name, _)| name)
+            .collect();
+            if !missing.is_empty() {
+                return Err(AdminServiceError::InvalidCredential(format!(
+                    "external_idp（Entra ID / Azure AD）凭据缺少必填字段: {}",
+                    missing.join(", ")
+                )));
+            }
+        }
+
         // 构建凭据对象
         let email = req.email.clone();
         let new_cred = KiroCredentials {
@@ -1023,6 +1056,9 @@ impl AdminService {
             client_id: req.client_id,
             client_secret: req.client_secret,
             start_url: req.start_url,
+            token_endpoint: req.token_endpoint,
+            issuer_url: req.issuer_url,
+            scopes: req.scopes,
             priority: req.priority,
             region: req.region,
             auth_region: req.auth_region,
