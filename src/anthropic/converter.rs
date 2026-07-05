@@ -730,8 +730,8 @@ fn extract_tool_result_content(
 
 /// 验证并过滤 tool_use/tool_result 配对
 ///
-/// 收集所有 tool_use_id，验证 tool_result 是否匹配
-/// 静默跳过孤立的 tool_use 和 tool_result，输出警告日志
+/// Bedrock 要求每个 assistant tool_use 必须由紧跟其后的 user 消息携带对应
+/// tool_result。历史中较晚才出现的 tool_result 不算配对，必须从历史里清掉。
 ///
 /// # Arguments
 /// * `history` - 历史消息引用
@@ -745,55 +745,85 @@ fn validate_tool_pairing(
 ) -> (Vec<ToolResult>, std::collections::HashSet<String>) {
     use std::collections::HashSet;
 
-    // 1. 收集所有历史中的 tool_use_id
     let mut all_tool_use_ids: HashSet<String> = HashSet::new();
-    // 2. 收集历史中已经有 tool_result 的 tool_use_id
-    let mut history_tool_result_ids: HashSet<String> = HashSet::new();
+    let mut adjacent_paired_tool_use_ids: HashSet<String> = HashSet::new();
 
-    for msg in history {
-        match msg {
-            Message::Assistant(assistant_msg) => {
-                if let Some(ref tool_uses) = assistant_msg.assistant_response_message.tool_uses {
-                    for tool_use in tool_uses {
-                        all_tool_use_ids.insert(tool_use.tool_use_id.clone());
-                    }
-                }
-            }
-            Message::User(user_msg) => {
-                // 收集历史 user 消息中的 tool_results
-                for result in &user_msg
-                    .user_input_message
-                    .user_input_message_context
-                    .tool_results
-                {
-                    history_tool_result_ids.insert(result.tool_use_id.clone());
-                }
+    for (idx, msg) in history.iter().enumerate() {
+        let Message::Assistant(assistant_msg) = msg else {
+            continue;
+        };
+
+        let Some(tool_uses) = assistant_msg.assistant_response_message.tool_uses.as_ref() else {
+            continue;
+        };
+
+        let assistant_tool_use_ids: HashSet<String> = tool_uses
+            .iter()
+            .map(|tool_use| tool_use.tool_use_id.clone())
+            .collect();
+        all_tool_use_ids.extend(assistant_tool_use_ids.iter().cloned());
+
+        let Some(Message::User(next_user_msg)) = history.get(idx + 1) else {
+            continue;
+        };
+
+        let next_tool_result_ids: HashSet<&str> = next_user_msg
+            .user_input_message
+            .user_input_message_context
+            .tool_results
+            .iter()
+            .map(|result| result.tool_use_id.as_str())
+            .collect();
+
+        for tool_use_id in assistant_tool_use_ids {
+            if next_tool_result_ids.contains(tool_use_id.as_str()) {
+                adjacent_paired_tool_use_ids.insert(tool_use_id);
             }
         }
     }
 
-    // 3. 计算真正未配对的 tool_use_ids（排除历史中已配对的）
     let mut unpaired_tool_use_ids: HashSet<String> = all_tool_use_ids
-        .difference(&history_tool_result_ids)
+        .difference(&adjacent_paired_tool_use_ids)
         .cloned()
         .collect();
 
-    // 4. 过滤并验证当前消息的 tool_results
+    // 当前消息只能补齐历史中最后一条 assistant 消息里的 tool_use。
+    let current_pairable_tool_use_ids: HashSet<String> =
+        if let Some(Message::Assistant(assistant_msg)) = history.last() {
+            assistant_msg
+                .assistant_response_message
+                .tool_uses
+                .as_ref()
+                .map(|tool_uses| {
+                    tool_uses
+                        .iter()
+                        .map(|tool_use| tool_use.tool_use_id.clone())
+                        .filter(|tool_use_id| unpaired_tool_use_ids.contains(tool_use_id))
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            HashSet::new()
+        };
+
+    let mut remaining_current_pairable_ids = current_pairable_tool_use_ids;
     let mut filtered_results = Vec::new();
 
     for result in tool_results {
-        if unpaired_tool_use_ids.contains(&result.tool_use_id) {
-            // 配对成功
+        if remaining_current_pairable_ids.remove(&result.tool_use_id) {
             filtered_results.push(result.clone());
             unpaired_tool_use_ids.remove(&result.tool_use_id);
-        } else if all_tool_use_ids.contains(&result.tool_use_id) {
-            // tool_use 存在但已经在历史中配对过了，这是重复的 tool_result
+        } else if adjacent_paired_tool_use_ids.contains(&result.tool_use_id) {
             tracing::warn!(
-                "跳过重复的 tool_result：该 tool_use 已在历史中配对，tool_use_id={}",
+                "跳过重复的 tool_result：该 tool_use 已在紧邻的历史 user 消息中配对，tool_use_id={}",
+                result.tool_use_id
+            );
+        } else if all_tool_use_ids.contains(&result.tool_use_id) {
+            tracing::warn!(
+                "跳过非相邻的 tool_result：对应 tool_use 不在当前消息的上一条 assistant 中，tool_use_id={}",
                 result.tool_use_id
             );
         } else {
-            // 孤立 tool_result - 找不到对应的 tool_use
             tracing::warn!(
                 "跳过孤立的 tool_result：找不到对应的 tool_use，tool_use_id={}",
                 result.tool_use_id
@@ -801,10 +831,9 @@ fn validate_tool_pairing(
         }
     }
 
-    // 5. 检测真正孤立的 tool_use（有 tool_use 但在历史和当前消息中都没有 tool_result）
     for orphaned_id in &unpaired_tool_use_ids {
         tracing::warn!(
-            "检测到孤立的 tool_use：找不到对应的 tool_result，将从历史中移除，tool_use_id={}",
+            "检测到未相邻配对的 tool_use：找不到紧跟其后的 tool_result，将从历史中移除，tool_use_id={}",
             orphaned_id
         );
     }
@@ -812,10 +841,10 @@ fn validate_tool_pairing(
     (filtered_results, unpaired_tool_use_ids)
 }
 
-/// 从历史消息中移除孤立的 tool_use
+/// 从历史消息中移除未相邻配对的 tool_use/tool_result
 ///
 /// Kiro API 要求每个 tool_use 必须有对应的 tool_result，否则返回 400 Bad Request。
-/// 此函数遍历历史中的 assistant 消息，移除没有对应 tool_result 的 tool_use。
+/// Bedrock 还要求 tool_result 必须紧跟对应 tool_use，因此同一个 id 的迟到结果也要移除。
 ///
 /// # Arguments
 /// * `history` - 可变的历史消息列表
@@ -824,12 +853,14 @@ fn remove_orphaned_tool_uses(
     history: &mut [Message],
     orphaned_ids: &std::collections::HashSet<String>,
 ) {
-    if orphaned_ids.is_empty() {
-        return;
-    }
+    use std::collections::HashSet;
 
-    for msg in history.iter_mut() {
-        if let Message::Assistant(assistant_msg) = msg {
+    if !orphaned_ids.is_empty() {
+        for msg in history.iter_mut() {
+            let Message::Assistant(assistant_msg) = msg else {
+                continue;
+            };
+
             if let Some(ref mut tool_uses) = assistant_msg.assistant_response_message.tool_uses {
                 let original_len = tool_uses.len();
                 tool_uses.retain(|tu| !orphaned_ids.contains(&tu.tool_use_id));
@@ -843,6 +874,51 @@ fn remove_orphaned_tool_uses(
                         original_len - tool_uses.len()
                     );
                 }
+            }
+        }
+    }
+
+    for idx in 0..history.len() {
+        let previous_tool_use_ids: HashSet<String> = if idx == 0 {
+            HashSet::new()
+        } else if let Message::Assistant(assistant_msg) = &history[idx - 1] {
+            assistant_msg
+                .assistant_response_message
+                .tool_uses
+                .as_ref()
+                .map(|tool_uses| {
+                    tool_uses
+                        .iter()
+                        .map(|tool_use| tool_use.tool_use_id.clone())
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            HashSet::new()
+        };
+
+        if let Message::User(user_msg) = &mut history[idx] {
+            let original_len = user_msg
+                .user_input_message
+                .user_input_message_context
+                .tool_results
+                .len();
+            user_msg
+                .user_input_message
+                .user_input_message_context
+                .tool_results
+                .retain(|result| previous_tool_use_ids.contains(&result.tool_use_id));
+
+            let new_len = user_msg
+                .user_input_message
+                .user_input_message_context
+                .tool_results
+                .len();
+            if new_len != original_len {
+                tracing::debug!(
+                    "从 user 消息中移除了 {} 个非相邻的 tool_result",
+                    original_len - new_len
+                );
             }
         }
     }
@@ -2145,6 +2221,74 @@ mod tests {
 
         // 重复的 tool_result 应该被过滤掉
         assert!(filtered.is_empty(), "重复的 tool_result 应该被过滤");
+    }
+
+    #[test]
+    fn test_validate_tool_pairing_rejects_non_adjacent_history_result() {
+        use crate::kiro::model::requests::tool::ToolUseEntry;
+
+        let mut assistant_msg = AssistantMessage::new("I'll run a tool.");
+        assistant_msg = assistant_msg.with_tool_uses(vec![
+            ToolUseEntry::new("tool-late", "read").with_input(serde_json::json!({})),
+        ]);
+
+        let mut late_user_msg = UserMessage::new("", "claude-sonnet-4.5");
+        let late_ctx = UserInputMessageContext::new()
+            .with_tool_results(vec![ToolResult::success("tool-late", "late result")]);
+        late_user_msg = late_user_msg.with_context(late_ctx);
+
+        let mut history = vec![
+            Message::User(HistoryUserMessage::new("Run the tool", "claude-sonnet-4.5")),
+            Message::Assistant(HistoryAssistantMessage {
+                assistant_response_message: assistant_msg,
+            }),
+            Message::User(HistoryUserMessage::new(
+                "This is not a tool result",
+                "claude-sonnet-4.5",
+            )),
+            Message::Assistant(HistoryAssistantMessage::new("Continuing.")),
+            Message::User(HistoryUserMessage {
+                user_input_message: late_user_msg,
+            }),
+            Message::Assistant(HistoryAssistantMessage::new("Done")),
+        ];
+
+        let tool_results = vec![ToolResult::success("tool-late", "current duplicate")];
+
+        let (filtered, orphaned) = validate_tool_pairing(&history, &tool_results);
+
+        assert!(
+            filtered.is_empty(),
+            "非相邻历史 tool_use 不能被当前消息补配"
+        );
+        assert!(
+            orphaned.contains("tool-late"),
+            "非相邻历史 tool_result 不应算作已配对"
+        );
+
+        remove_orphaned_tool_uses(&mut history, &orphaned);
+
+        if let Message::Assistant(ref assistant_msg) = history[1] {
+            assert!(
+                assistant_msg.assistant_response_message.tool_uses.is_none(),
+                "非相邻配对的 tool_use 应被移除"
+            );
+        } else {
+            panic!("应该是 Assistant 消息");
+        }
+
+        if let Message::User(ref user_msg) = history[4] {
+            assert!(
+                user_msg
+                    .user_input_message
+                    .user_input_message_context
+                    .tool_results
+                    .is_empty(),
+                "迟到的历史 tool_result 也应被移除"
+            );
+        } else {
+            panic!("应该是 User 消息");
+        }
     }
 
     #[test]
