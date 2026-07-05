@@ -85,6 +85,8 @@ impl KiroEndpoint for RuntimeEndpoint {
 
         if ctx.credentials.is_api_key_credential() {
             req = req.header("tokentype", "API_KEY");
+        } else if ctx.credentials.is_external_idp() {
+            req = req.header("tokentype", "EXTERNAL_IDP");
         }
         req
     }
@@ -103,6 +105,8 @@ impl KiroEndpoint for RuntimeEndpoint {
         }
         if ctx.credentials.is_api_key_credential() {
             req = req.header("tokentype", "API_KEY");
+        } else if ctx.credentials.is_external_idp() {
+            req = req.header("tokentype", "EXTERNAL_IDP");
         }
         req
     }
