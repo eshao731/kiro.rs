@@ -78,6 +78,9 @@ pub struct CredentialStatusItem {
     /// 普通 429 动态并发上限
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rate_limit_concurrency_limit: Option<u32>,
+    /// 进程内已判定该凭据不支持的模型列表
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unsupported_models: Vec<String>,
     /// 端点名称（决定该凭据走哪套 Kiro API，已回退到默认端点）
     pub endpoint: String,
     /// 账号所属分组（可属于多个分组）

@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex as TokioMutex;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -911,6 +911,8 @@ struct CredentialEntry {
     rate_limit_concurrency_limit: Option<u32>,
     /// 动态并发上限恢复用的成功计数。
     rate_limit_success_streak: u32,
+    /// 当前凭据已被上游确认不支持的模型。仅保存在进程内，重启后重新探测。
+    unsupported_models: HashSet<String>,
     /// 运行中（in-flight）请求计数。least_conn 负载均衡用。
     in_flight: u32,
 }
@@ -1001,6 +1003,9 @@ pub struct CredentialEntrySnapshot {
     /// 普通 429 自适应并发上限；存在时表示该账号正在收缩并发
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rate_limit_concurrency_limit: Option<u32>,
+    /// 进程内已判定该凭据不支持的模型列表
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unsupported_models: Vec<String>,
     /// 端点名称（未显式配置时返回 None，由 Admin 层回退到默认值）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
@@ -1108,7 +1113,7 @@ fn base_schedulable(
 ) -> bool {
     !entry.disabled
         && !hard_throttled(entry, now)
-        && credential_matches_request(&entry.credentials, model, group)
+        && credential_matches_request(entry, model, group)
 }
 
 fn schedulable(
@@ -1170,10 +1175,11 @@ fn group_matches(cred_groups: &[String], group: Option<&str>) -> bool {
 }
 
 fn credential_matches_request(
-    credentials: &KiroCredentials,
+    entry: &CredentialEntry,
     model: Option<&str>,
     group: Option<&str>,
 ) -> bool {
+    let credentials = &entry.credentials;
     let is_opus = model
         .map(|m| m.to_ascii_lowercase().contains("opus"))
         .unwrap_or(false);
@@ -1182,7 +1188,19 @@ fn credential_matches_request(
         return false;
     }
 
+    if model
+        .map(normalize_model_for_support)
+        .map(|m| entry.unsupported_models.contains(&m))
+        .unwrap_or(false)
+    {
+        return false;
+    }
+
     group_matches(&credentials.groups, group)
+}
+
+fn normalize_model_for_support(model: &str) -> String {
+    model.trim().to_ascii_lowercase()
 }
 
 impl MultiTokenManager {
@@ -1246,6 +1264,7 @@ impl MultiTokenManager {
                     rate_limit_count: 0,
                     rate_limit_concurrency_limit: None,
                     rate_limit_success_streak: 0,
+                    unsupported_models: HashSet::new(),
                     in_flight: 0,
                 }
             })
@@ -2467,6 +2486,11 @@ impl MultiTokenManager {
                         .filter(|s| *s > 0),
                     rate_limit_count: (e.rate_limit_count > 0).then_some(e.rate_limit_count),
                     rate_limit_concurrency_limit: e.rate_limit_concurrency_limit,
+                    unsupported_models: {
+                        let mut models: Vec<_> = e.unsupported_models.iter().cloned().collect();
+                        models.sort();
+                        models
+                    },
                     endpoint: e.credentials.endpoint.clone(),
                     groups: e.credentials.groups.clone(),
                     source_channel: e.credentials.source_channel.clone(),
@@ -2512,10 +2536,43 @@ impl MultiTokenManager {
         self.report_temporary_cooldown(id, cooldown, "账号级风控")
     }
 
+    /// 记录当前凭据不支持指定模型，并返回同一请求范围内仍可调度的凭据数。
+    ///
+    /// 这是模型级避让，不是账号级冷却：该凭据仍可继续服务其它模型。
+    pub fn report_model_unsupported(
+        &self,
+        id: u64,
+        model: &str,
+        group: Option<&str>,
+    ) -> usize {
+        let normalized_model = normalize_model_for_support(model);
+        let now = Instant::now();
+        {
+            let mut entries = self.entries.lock();
+            if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+                let inserted = entry.unsupported_models.insert(normalized_model.clone());
+                entry.total_failure_count += 1;
+                entry.last_used_at = Some(Utc::now().to_rfc3339());
+                if inserted {
+                    tracing::warn!(
+                        "凭据 #{} 已标记为不支持模型 {}，该模型后续将避让此凭据",
+                        id,
+                        normalized_model
+                    );
+                }
+            }
+
+            entries
+                .iter()
+                .filter(|e| schedulable(e, now, Some(&normalized_model), group))
+                .count()
+        }
+    }
+
     /// 标记凭据进入临时冷却期。
     ///
-    /// 用于账号级风控、账号不支持当前模型等“换账号即可恢复”的场景。不同于
-    /// `report_failure`，这里不增加连续失败计数，避免短期/模型级问题导致永久禁用。
+    /// 用于账号级风控等“短期换账号即可恢复”的场景。不同于 `report_failure`，
+    /// 这里不增加连续失败计数，避免短期问题导致永久禁用。
     pub fn report_temporary_cooldown(
         &self,
         id: u64,
@@ -3256,6 +3313,7 @@ impl MultiTokenManager {
                 rate_limit_count: 0,
                 rate_limit_concurrency_limit: None,
                 rate_limit_success_streak: 0,
+                unsupported_models: HashSet::new(),
                 in_flight: 0,
             });
         }
@@ -4810,6 +4868,54 @@ mod tests {
         assert_eq!(
             opus.id, 2,
             "priority current_id must not bypass Opus subscription filtering"
+        );
+    }
+
+    #[test]
+    fn test_model_unsupported_skips_only_that_model() {
+        let mut first = grouped_cred("first", &[]);
+        first.priority = 0;
+        let mut second = grouped_cred("second", &[]);
+        second.priority = 1;
+
+        let manager =
+            MultiTokenManager::new(Config::default(), vec![first, second], None, None, false)
+                .unwrap();
+
+        assert_eq!(
+            manager
+                .select_next_credential(Some("claude-sonnet-5"), None)
+                .map(|(id, _)| id),
+            Some(1)
+        );
+
+        let remaining = manager.report_model_unsupported(1, "Claude-Sonnet-5", None);
+        assert_eq!(remaining, 1);
+
+        assert_eq!(
+            manager
+                .select_next_credential(Some("claude-sonnet-5"), None)
+                .map(|(id, _)| id),
+            Some(2),
+            "unsupported model should fail over to another credential"
+        );
+        assert_eq!(
+            manager
+                .select_next_credential(Some("claude-sonnet-4.5"), None)
+                .map(|(id, _)| id),
+            Some(1),
+            "other models should still be schedulable on the original credential"
+        );
+
+        let first_snapshot = manager
+            .snapshot()
+            .entries
+            .into_iter()
+            .find(|entry| entry.id == 1)
+            .unwrap();
+        assert_eq!(
+            first_snapshot.unsupported_models,
+            vec!["claude-sonnet-5".to_string()]
         );
     }
 

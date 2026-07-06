@@ -600,19 +600,27 @@ impl KiroProvider {
                 continue;
             }
 
-            // 400 Bad Request - 请求问题，重试/切换凭据无意义
+            // 400 Bad Request - 大多数请求问题重试无意义；模型不支持是凭据级能力差异，
+            // 需记录模型级避让并切换到其它凭据尝试。
             if status.as_u16() == 400 {
                 if endpoint.is_model_unsupported(&body) {
-                    let cooldown_secs = self
-                        .token_manager
-                        .get_account_throttle_cooldown_secs()
-                        .max(1);
-                    let cooldown = std::time::Duration::from_secs(cooldown_secs);
+                    let Some(model_id) = model.as_deref() else {
+                        Self::emit_attempt(
+                            sink,
+                            attempt,
+                            ctx.id,
+                            endpoint_name,
+                            Some(400),
+                            outcome::MODEL_UNSUPPORTED,
+                            Some(&body),
+                            attempt_start,
+                        );
+                        anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
+                    };
                     tracing::warn!(
-                        "API 请求失败（凭据 #{} 不支持模型 {:?}，冷却 {}s 并切换，尝试 {}/{}）: {}",
+                        "API 请求失败（凭据 #{} 不支持模型 {}，本模型后续避让该凭据并切换，尝试 {}/{}）: {}",
                         ctx.id,
-                        model,
-                        cooldown_secs,
+                        model_id,
                         attempt + 1,
                         max_retries,
                         body
@@ -627,16 +635,13 @@ impl KiroProvider {
                         Some(&body),
                         attempt_start,
                     );
-                    let remaining = self.token_manager.report_temporary_cooldown(
-                        ctx.id,
-                        cooldown,
-                        "账号不支持当前模型",
-                    );
+                    let remaining =
+                        self.token_manager
+                            .report_model_unsupported(ctx.id, model_id, group);
                     last_error = Some(anyhow::anyhow!(
-                        "{} API 请求失败（凭据 #{} 不支持当前模型，已冷却 {} 分钟）: {} {}",
+                        "{} API 请求失败（凭据 #{} 不支持当前模型，已记录模型级避让）: {} {}",
                         api_type,
                         ctx.id,
-                        cooldown_secs / 60,
                         status,
                         body
                     ));

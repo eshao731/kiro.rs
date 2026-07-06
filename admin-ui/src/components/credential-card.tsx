@@ -15,6 +15,7 @@ import {
   ScrollText,
   Boxes,
   Wallet,
+  Ban,
 } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -384,6 +385,7 @@ export function CredentialCard({
     !credential.disabled && credential.rateLimitConcurrencyLimit != null;
   const isRateLimited =
     !credential.disabled && (rateLimitRemaining > 0 || hasDynamicRateLimit);
+  const unsupportedModels = credential.unsupportedModels ?? [];
 
   // 卡片与列表行共用的状态描边 / 灰化（活跃 · 超额 · 冷却 · 禁用）
   const stateClasses = [
@@ -452,6 +454,16 @@ export function CredentialCard({
           {rateLimitRemaining > 0
             ? `限流 ${formatThrottleCountdown(rateLimitRemaining)}`
             : `限并发 ${credential.rateLimitConcurrencyLimit}`}
+        </Badge>
+      )}
+      {unsupportedModels.length > 0 && (
+        <Badge
+          variant="outline"
+          className="max-w-full truncate border-red-500/30 bg-red-500/10 text-red-700 dark:text-red-300"
+          title={`该凭据已被上游判定不支持这些模型：${unsupportedModels.join(", ")}`}
+        >
+          <Ban className="mr-1 h-3 w-3" />
+          避让 {unsupportedModels.length} 模型
         </Badge>
       )}
       {credential.authMethod && <Badge variant="secondary">{authLabel}</Badge>}
@@ -1020,6 +1032,16 @@ export function CredentialCard({
                 <dt className="shrink-0 text-muted-foreground">代理</dt>
                 <dd className="min-w-0 truncate text-right font-mono text-xs">
                   {maskProxyUrl(credential.proxyUrl ?? "")}
+                </dd>
+              </div>
+            )}
+            {unsupportedModels.length > 0 && (
+              <div className="flex min-w-0 items-start justify-between gap-2 min-[420px]:col-span-2">
+                <dt className="shrink-0 text-muted-foreground">模型避让</dt>
+                <dd className="min-w-0 text-right">
+                  <span className="line-clamp-2 break-words font-mono text-xs text-red-700 dark:text-red-300">
+                    {unsupportedModels.join(", ")}
+                  </span>
                 </dd>
               </div>
             )}

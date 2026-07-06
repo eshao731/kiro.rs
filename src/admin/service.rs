@@ -584,6 +584,7 @@ impl AdminService {
                     rate_limit_remaining_secs: entry.rate_limit_remaining_secs,
                     rate_limit_count: entry.rate_limit_count,
                     rate_limit_concurrency_limit: entry.rate_limit_concurrency_limit,
+                    unsupported_models: entry.unsupported_models,
                     endpoint: entry.endpoint.unwrap_or_else(|| default_endpoint.clone()),
                     groups: entry.groups,
                     source_channel: entry.source_channel,

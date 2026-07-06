@@ -37,6 +37,8 @@ export interface CredentialStatusItem {
   rateLimitCount?: number
   /** 普通 429 动态并发上限 */
   rateLimitConcurrencyLimit?: number
+  /** 进程内已判定该凭据不支持的模型列表 */
+  unsupportedModels?: string[]
   endpoint: string
   /** 账号所属分组（可属于多个分组） */
   groups?: string[]
