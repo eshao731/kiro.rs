@@ -267,6 +267,7 @@ async fn main() {
     let anthropic_app = anthropic::create_router(
         Some(kiro_provider),
         config.extract_thinking,
+        config.tool_compatibility_mode,
         Some(client_key_manager.clone()),
         Some(usage_recorder.clone()),
         Some(usage_aggregator.clone()),

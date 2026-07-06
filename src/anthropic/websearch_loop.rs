@@ -26,10 +26,11 @@ use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::kiro::provider::KiroProvider;
 use crate::token;
 
-use super::converter::{ConversionError, convert_request, get_context_window_size};
 use super::cache_metering::SharedCacheMeter;
+use super::converter::{ConversionError, convert_request_with_mode, get_context_window_size};
+use crate::model::config::ToolCompatibilityMode;
 use super::handlers::{UsageRecordHook, map_provider_error};
-use super::stream::SseEvent;
+use super::stream::{CompletedToolUse, SseEvent};
 use super::types::{ErrorResponse, Message, MessagesRequest};
 use super::websearch::{self, WebSearchResults};
 
@@ -58,7 +59,7 @@ struct RoundOutcome {
     /// clients never see (and never replay) an unsigned thinking block.
     thinking: String,
     /// The complete tool_use for this round (name already restored via tool_name_map)
-    tool_uses: Vec<DecodedToolUse>,
+    tool_uses: Vec<CompletedToolUse>,
     /// Actual input tokens computed from contextUsageEvent
     context_input_tokens: Option<i32>,
     /// Cumulative credits from meteringEvent
@@ -79,28 +80,20 @@ struct RoundOutcome {
     tool_name_map: std::collections::HashMap<String, String>,
 }
 
-/// A fully decoded tool_use
-struct DecodedToolUse {
-    id: String,
-    name: String,
-    input: Value,
-}
-
-impl DecodedToolUse {
-    fn query(&self) -> String {
-        self.input
-            .get("query")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string()
-    }
+/// 提取工具调用入参里的 `query` 字段（web_search 专用便捷函数）。
+fn tool_query(tu: &CompletedToolUse) -> String {
+    tu.input
+        .get("query")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string()
 }
 
 /// Decides whether this round should keep searching (enter the next loop round)
 ///
 /// Continue condition: every tool_use this round is web_search (at least one) and the round limit has not been reached.
 /// As soon as a client tool such as exec is mixed in, there is no tool_use at all, or the limit is reached, it stops and flushes (exec is never swallowed).
-fn should_search_round(round_idx: usize, tool_uses: &[DecodedToolUse]) -> bool {
+fn should_search_round(round_idx: usize, tool_uses: &[CompletedToolUse]) -> bool {
     let only_web_search =
         !tool_uses.is_empty() && tool_uses.iter().all(|t| t.name == "web_search");
     only_web_search && round_idx < MAX_WEB_SEARCH_ROUNDS
@@ -157,7 +150,7 @@ async fn decode_round(
     let mut buffers: std::collections::HashMap<String, (String, String)> =
         std::collections::HashMap::new();
     let mut order: Vec<String> = Vec::new();
-    let mut tool_uses: Vec<DecodedToolUse> = Vec::new();
+    let mut tool_uses: Vec<CompletedToolUse> = Vec::new();
     let mut context_input_tokens: Option<i32> = None;
     let mut credits = 0.0;
     let mut stop_reason_override: Option<String> = None;
@@ -234,14 +227,13 @@ async fn decode_round(
                     json!({})
                 })
             };
-            let original_name = tool_name_map.get(&name).cloned().unwrap_or(name);
-            tool_uses.push(DecodedToolUse {
-                id,
-                name: original_name,
-                input,
-            });
+            // 统一还原入口（名字 + 入参），与流式 / 非流式路径同口径。
+            tool_uses.push(CompletedToolUse::from_kiro(id, &name, input, tool_name_map));
         }
     }
+
+    // 剥离混入文本的字面 <tool_use> XML 泄漏（与非流式同口径）。
+    let text = crate::kiro::model::events::strip_tool_use_xml_leaks(&text);
 
     RoundOutcome {
         text,
@@ -267,8 +259,9 @@ async fn run_round(
     hook: &UsageRecordHook,
     fallback_input_tokens: i32,
     group: Option<&str>,
+    tool_compatibility_mode: ToolCompatibilityMode,
 ) -> Result<(RoundOutcome, u64), Response> {
-    let conversion = match convert_request(payload) {
+    let conversion = match convert_request_with_mode(payload, tool_compatibility_mode) {
         Ok(c) => c,
         Err(e) => {
             let (et, msg) = match &e {
@@ -278,6 +271,10 @@ async fn run_round(
                 ConversionError::EmptyMessages => {
                     ("invalid_request_error", "message list is empty".to_string())
                 }
+                ConversionError::UnsupportedToolMapping(reason) => (
+                    "invalid_request_error",
+                    format!("unsupported tool mapping: {}", reason),
+                ),
             };
             hook.record(0, 0, 0, 0, 0, 0.0, "error");
             return Err((StatusCode::BAD_REQUEST, Json(ErrorResponse::new(et, msg))).into_response());
@@ -348,9 +345,7 @@ fn append_search_round(
         assistant_content.push(json!({"type": "text", "text": round.text}));
     }
     for tu in &round.tool_uses {
-        assistant_content.push(json!({
-            "type": "tool_use", "id": tu.id, "name": tu.name, "input": tu.input
-        }));
+        assistant_content.push(tu.to_anthropic_block());
     }
     payload.messages.push(Message {
         role: "assistant".to_string(),
@@ -360,7 +355,7 @@ fn append_search_round(
     // user: each web_search tool_use is paired with a tool_result (content = search summary, shown to the upstream)
     let mut user_content: Vec<Value> = Vec::new();
     for (tu, results) in round.tool_uses.iter().zip(searched.iter()) {
-        let query = tu.query();
+        let query = tool_query(tu);
         let summary = websearch::generate_search_summary(&query, results);
         user_content.push(json!({
             "type": "tool_result", "tool_use_id": tu.id, "content": summary
@@ -414,8 +409,8 @@ fn build_result_block(results: &Option<WebSearchResults>) -> Vec<Value> {
 /// as a raw tool_use": every flush path partitions first, then handles each
 /// group differently (web_search -> presentation blocks, client tools -> raw).
 fn partition_tool_uses(
-    tool_uses: &[DecodedToolUse],
-) -> (Vec<&DecodedToolUse>, Vec<&DecodedToolUse>) {
+    tool_uses: &[CompletedToolUse],
+) -> (Vec<&CompletedToolUse>, Vec<&CompletedToolUse>) {
     let mut web = Vec::new();
     let mut client = Vec::new();
     for tu in tool_uses {
@@ -497,7 +492,7 @@ fn canonical_input_key(input: &Value) -> String {
 fn build_flush_content(
     presentation: Vec<Value>,
     text: &str,
-    tool_uses: &[DecodedToolUse],
+    tool_uses: &[CompletedToolUse],
     searched: &[Option<WebSearchResults>],
     known_tool_names: &std::collections::HashSet<String>,
     tool_name_map: &std::collections::HashMap<String, String>,
@@ -556,7 +551,7 @@ fn build_flush_content(
         if tu.name == "web_search" {
             // INVARIANT: present as server_tool_use + web_search_tool_result,
             // never as a raw tool_use.
-            let query = tu.query();
+            let query = tool_query(tu);
             let (srv_id, _mcp) = websearch::create_mcp_request(&query);
             content.push(json!({
                 "type": "server_tool_use", "id": srv_id, "name": "web_search",
@@ -569,9 +564,7 @@ fn build_flush_content(
             }));
         } else {
             // Client tool (exec, get_time, ...): returned to the client verbatim.
-            content.push(json!({
-                "type": "tool_use", "id": tu.id, "name": tu.name, "input": tu.input
-            }));
+            content.push(tu.to_anthropic_block());
         }
     }
     content
@@ -588,6 +581,7 @@ pub(super) async fn run_web_search_loop(
     group: Option<String>,
     cache_meter: Option<SharedCacheMeter>,
     key_id: u64,
+    tool_compatibility_mode: ToolCompatibilityMode,
 ) -> Response {
     let fallback_input_tokens = token::count_all_tokens(
         payload.model.clone(),
@@ -619,6 +613,7 @@ pub(super) async fn run_web_search_loop(
                     &hook,
                     fallback_input_tokens,
                     group.as_deref(),
+                    tool_compatibility_mode,
                 )
                 .await
                 {
@@ -684,7 +679,7 @@ pub(super) async fn run_web_search_loop(
             // Real search: if any one fails -> propagate the error, never silently turn it into "No results found"
             let mut searched: Vec<Option<WebSearchResults>> = Vec::with_capacity(round.tool_uses.len());
             for tu in &round.tool_uses {
-                let (_id, mcp_request) = websearch::create_mcp_request(&tu.query());
+                let (_id, mcp_request) = websearch::create_mcp_request(&tool_query(tu));
                 match websearch::call_mcp_api(&provider, &mcp_request).await {
                     Ok(resp) => searched.push(websearch::parse_search_results(&resp)),
                     Err(e) => {
@@ -723,7 +718,7 @@ pub(super) async fn run_web_search_loop(
         let mut searched: Vec<Option<WebSearchResults>> = Vec::with_capacity(round.tool_uses.len());
         for tu in &round.tool_uses {
             if tu.name == "web_search" {
-                let (_id, mcp_request) = websearch::create_mcp_request(&tu.query());
+                let (_id, mcp_request) = websearch::create_mcp_request(&tool_query(tu));
                 match websearch::call_mcp_api(&provider, &mcp_request).await {
                     Ok(resp) => searched.push(websearch::parse_search_results(&resp)),
                     Err(e) => {
@@ -982,8 +977,8 @@ mod tests {
     use super::*;
     use crate::anthropic::websearch::{WebSearchResult, WebSearchResults};
 
-    fn tu(name: &str) -> DecodedToolUse {
-        DecodedToolUse {
+    fn tu(name: &str) -> CompletedToolUse {
+        CompletedToolUse {
             id: format!("toolu_{}", name),
             name: name.to_string(),
             input: json!({"query": "rust 2026"}),
@@ -1023,7 +1018,7 @@ mod tests {
     #[test]
     fn round_with_no_tool_use_does_not_enter_loop() {
         // Skip: no tool_use at all (plain-text answer) -> terminate
-        let empty: Vec<DecodedToolUse> = vec![];
+        let empty: Vec<CompletedToolUse> = vec![];
         assert!(!should_search_round(0, &empty));
     }
 
@@ -1676,7 +1671,7 @@ mod tests {
         // The reclaimed-from-text tool_use must be suppressed when an identical
         // (name + canonical input) structured tool_use already exists in this round.
         let leaked = "call\n<invoke name=\"exec_command\">\n<parameter name=\"cmd\">rm -rf build</parameter>\n</invoke>";
-        let structured = vec![DecodedToolUse {
+        let structured = vec![CompletedToolUse {
             id: "toolu_dup".to_string(),
             name: "exec_command".to_string(),
             input: json!({"cmd": "rm -rf build"}),
@@ -1705,7 +1700,7 @@ mod tests {
         // Dedup must only collapse TRUE duplicates: a reclaimed tool_use with a
         // different input than the structured one is a distinct action and must be kept.
         let leaked = "call\n<invoke name=\"exec_command\">\n<parameter name=\"cmd\">ls</parameter>\n</invoke>";
-        let structured = vec![DecodedToolUse {
+        let structured = vec![CompletedToolUse {
             id: "toolu_other".to_string(),
             name: "exec_command".to_string(),
             input: json!({"cmd": "pwd"}),

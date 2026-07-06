@@ -22,6 +22,121 @@ use crate::kiro::model::events::Event;
 /// signature，因此该占位字符串只在客户端 ↔ kiro.rs 之间存在，不会影响转发。
 pub(super) const THINKING_SIGNATURE_PLACEHOLDER: &str = "kiro-rs-thinking-signature";
 
+const TOOL_USE_XML_PREFIX: &str = "<tool_use";
+const TOOL_USE_XML_CLOSE: &str = "</tool_use>";
+
+/// 跨 chunk 过滤字面 `<tool_use ...>...</tool_use>` XML 泄漏（见
+/// [`crate::kiro::model::events::strip_tool_use_xml_leaks`] 的语义）。
+///
+/// 流式下一个 `<tool_use>` 块可能跨多个 chunk，故用状态机：`stripping` 表示已进入
+/// 一个未闭合的 `<tool_use>`，持续吞字直到遇到 `</tool_use>`；chunk 末尾若残留可能是
+/// `<tool_use` 前缀的后缀，则缓冲到下个 chunk 再判定。
+#[derive(Debug, Default)]
+struct ToolUseXmlLeakFilter {
+    buffer: String,
+    stripping: bool,
+}
+
+impl ToolUseXmlLeakFilter {
+    fn filter(&mut self, content: &str) -> String {
+        self.buffer.push_str(content);
+        let mut out = String::with_capacity(self.buffer.len());
+        let mut rest = self.buffer.as_str();
+
+        loop {
+            if self.stripping {
+                if let Some(close_start) = rest.find(TOOL_USE_XML_CLOSE) {
+                    rest = &rest[close_start + TOOL_USE_XML_CLOSE.len()..];
+                    self.stripping = false;
+                    continue;
+                }
+                // 仍未闭合：丢弃已吞内容，但保留末尾可能是 `</tool_use>` 前缀的后缀，
+                // 以正确处理闭合标签被切分到多个 chunk 的情形。
+                let keep = longest_prefix_suffix(rest, TOOL_USE_XML_CLOSE);
+                self.buffer = rest[rest.len() - keep..].to_string();
+                return out;
+            }
+
+            let Some(start) = rest.find(TOOL_USE_XML_PREFIX) else {
+                // 无 `<tool_use`：全部输出，但保留末尾可能是 `<tool_use` 前缀的后缀。
+                let keep = longest_prefix_suffix(rest, TOOL_USE_XML_PREFIX);
+                let emit_len = rest.len().saturating_sub(keep);
+                out.push_str(&rest[..emit_len]);
+                self.buffer = rest[emit_len..].to_string();
+                return out;
+            };
+
+            out.push_str(&rest[..start]);
+            let after_start = &rest[start..];
+            let Some(open_end) = after_start.find('>') else {
+                // 开标签尚未见到 `>`：可能是真标签的开头 → 进入 stripping 缓冲等闭合；
+                // 否则原样输出 `<tool_use` 继续。
+                if is_potential_tool_use_tag_start(after_start) {
+                    self.stripping = true;
+                    self.buffer.clear();
+                    return out;
+                }
+                out.push_str(&after_start[..TOOL_USE_XML_PREFIX.len()]);
+                rest = &after_start[TOOL_USE_XML_PREFIX.len()..];
+                continue;
+            };
+
+            let tag_head = &after_start[..open_end];
+            if !tag_head
+                .get(TOOL_USE_XML_PREFIX.len()..)
+                .is_some_and(|suffix| suffix.is_empty() || suffix.starts_with(char::is_whitespace))
+            {
+                // 形似但非真标签（如 `<tool_user>`）：保留 `<tool_use` 继续扫描。
+                out.push_str(&after_start[..TOOL_USE_XML_PREFIX.len()]);
+                rest = &after_start[TOOL_USE_XML_PREFIX.len()..];
+                continue;
+            }
+
+            let after_open = &after_start[open_end + 1..];
+            if let Some(close_start) = after_open.find(TOOL_USE_XML_CLOSE) {
+                rest = &after_open[close_start + TOOL_USE_XML_CLOSE.len()..];
+            } else {
+                // 开标签完整但闭合未到：进入 stripping，保留末尾可能是 `</tool_use>`
+                // 前缀的后缀（处理闭合标签被切分到多个 chunk）。
+                self.stripping = true;
+                let keep = longest_prefix_suffix(after_open, TOOL_USE_XML_CLOSE);
+                self.buffer = after_open[after_open.len() - keep..].to_string();
+                return out;
+            }
+        }
+    }
+
+    /// 收尾：对残留缓冲做一次性剥离（截断的未闭合块会被丢弃）。
+    fn finish(&mut self) -> String {
+        self.stripping = false;
+        let remaining = std::mem::take(&mut self.buffer);
+        if remaining.is_empty() {
+            String::new()
+        } else {
+            crate::kiro::model::events::strip_tool_use_xml_leaks(&remaining)
+        }
+    }
+}
+
+/// `s` 是否可能是 `<tool_use` 真标签的开头（用于开标签尚未闭合时的跨 chunk 判定）。
+fn is_potential_tool_use_tag_start(s: &str) -> bool {
+    TOOL_USE_XML_PREFIX.starts_with(s)
+        || s.get(TOOL_USE_XML_PREFIX.len()..)
+            .is_some_and(|suffix| suffix.is_empty() || suffix.starts_with(char::is_whitespace))
+}
+
+/// 返回 `s` 末尾「恰好是 `needle` 某个前缀」的最长长度（chunk 边界保留用）。
+/// 用于把可能被切断的 `<tool_use` / `</tool_use>` 标签保留到下个 chunk 再判定。
+fn longest_prefix_suffix(s: &str, needle: &str) -> usize {
+    let max = s.len().min(needle.len().saturating_sub(1));
+    for len in (1..=max).rev() {
+        if s.is_char_boundary(s.len() - len) && needle.starts_with(&s[s.len() - len..]) {
+            return len;
+        }
+    }
+    0
+}
+
 /// 找到小于等于目标位置的最近有效UTF-8字符边界
 ///
 /// UTF-8字符可能占用1-4个字节，直接按字节位置切片可能会切在多字节字符中间导致panic。
@@ -661,7 +776,7 @@ pub(crate) fn extract_thinking_from_complete_text(text: &str) -> (Option<String>
 /// 文本块按需合并相邻片段；空文本片段不产出。`input` 解析失败时 fall back 成 `{}`。
 ///
 /// `tool_name_map`（短名 → 原始名）用于把捞回的工具名还原成客户端可识别的原始名，
-/// 与流式 `synthesize_tool_use` 一致；映射为空或命中失败时按原名返回。
+/// 经统一入口 `CompletedToolUse::from_kiro`；映射为空或命中失败时按原名返回。
 pub(crate) fn extract_invoke_content_blocks(
     text: &str,
     known_tool_names: &std::collections::HashSet<String>,
@@ -723,17 +838,10 @@ pub(crate) fn extract_invoke_content_blocks(
             let (name, input_json) = parsed.expect("parsed is Some when name_known");
             let input: serde_json::Value =
                 serde_json::from_str(&input_json).unwrap_or_else(|_| serde_json::json!({}));
-            // Restore the original (client-facing) tool name: long names (>63) are shortened
-            // before being sent upstream, so the model may leak the SHORT name. The host
-            // matches on the original name — mirror synthesize_tool_use's restoration.
-            let name = tool_name_map.get(&name).cloned().unwrap_or(name);
+            // 统一还原（名字 + 入参）并统一拼块，与结构化 / websearch 路径同口径。
             let tool_use_id = format!("toolu_{}", Uuid::new_v4().to_string().replace('-', ""));
-            blocks.push(serde_json::json!({
-                "type": "tool_use",
-                "id": tool_use_id,
-                "name": name,
-                "input": input,
-            }));
+            let completed = CompletedToolUse::from_kiro(tool_use_id, &name, input, tool_name_map);
+            blocks.push(completed.to_anthropic_block());
         } else {
             // 不捞（句中 / 围栏内 / 工具名未知 / 解析失败）→ 整块（含 before）当文本，推进围栏。
             let chunk = &rest[..end];
@@ -745,6 +853,189 @@ pub(crate) fn extract_invoke_content_blocks(
 
     push_text(&mut blocks, &mut pending_text);
     blocks
+}
+
+/// 累积完成的工具调用（`ToolUseEvent` 的所有分片拼接、解析成功后的结果）。
+#[derive(Debug, Clone)]
+pub struct CompletedToolUse {
+    pub id: String,
+    pub name: String,
+    pub input: serde_json::Value,
+}
+
+impl CompletedToolUse {
+    /// 从 Kiro 侧 (name, input) 还原为客户端可见的完整工具调用。
+    ///
+    /// 这是**唯一的还原入口**：名字按 `tool_name_map` 还原、入参按 Kiro 名反向重写
+    /// （见 `converter::restore_tool_use_for_client`）。结构化事件、`<invoke>` 文本捞回、
+    /// websearch 三条来源都经此收敛，避免各站点各自调用还原逻辑。
+    pub fn from_kiro(
+        id: String,
+        kiro_name: &str,
+        input: serde_json::Value,
+        tool_name_map: &HashMap<String, String>,
+    ) -> Self {
+        let (name, input) =
+            super::converter::restore_tool_use_for_client(kiro_name, input, tool_name_map);
+        Self { id, name, input }
+    }
+
+    /// 产出非流式 Anthropic `tool_use` 内容块。**唯一的非流式块拼装点。**
+    pub fn to_anthropic_block(&self) -> serde_json::Value {
+        json!({
+            "type": "tool_use",
+            "id": self.id,
+            "name": self.name,
+            "input": self.input,
+        })
+    }
+}
+
+/// 工具调用 JSON 累积过程中的错误。
+///
+/// - `InvalidJson`：上游把某个 tool_use 的完整 `input` 拼出来后，仍不是合法 JSON。
+/// - `IncompleteJson`：整条流结束时仍有 tool_use 从未收到 `stop=true`，即上游在
+///   工具参数写到一半时截断（“流式半截 JSON”）。
+///
+/// 两种情况都**不能**把半截 / 非法 JSON 当成完整工具调用转发给客户端——那会让
+/// 客户端拿到无法解析或语义错误的参数去执行工具。这里显式暴露为错误，由上层
+/// 决定回 502（非流式 / 缓冲流）或在 SSE 里补一个 `error` 事件（实时流）。
+#[derive(Debug, Clone)]
+pub enum ToolJsonAccumulatorError {
+    InvalidJson {
+        tool_use_id: String,
+        name: String,
+        message: String,
+    },
+    IncompleteJson {
+        tool_use_id: String,
+        name: String,
+        bytes: usize,
+    },
+}
+
+impl ToolJsonAccumulatorError {
+    /// Anthropic error 事件里统一的 error.type。
+    pub fn error_type(&self) -> &'static str {
+        "upstream_tool_json_error"
+    }
+
+    pub fn message(&self) -> String {
+        match self {
+            Self::InvalidJson {
+                tool_use_id,
+                name,
+                message,
+            } => format!(
+                "Upstream returned invalid JSON for tool_use {} ({}): {}",
+                tool_use_id, name, message
+            ),
+            Self::IncompleteJson {
+                tool_use_id,
+                name,
+                bytes,
+            } => format!(
+                "Upstream ended before completing tool_use {} ({}) JSON input; buffered {} bytes. The tool call was not forwarded to the client.",
+                tool_use_id, name, bytes
+            ),
+        }
+    }
+}
+
+impl std::fmt::Display for ToolJsonAccumulatorError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message())
+    }
+}
+
+impl std::error::Error for ToolJsonAccumulatorError {}
+
+/// 工具调用参数（JSON）累积器。
+///
+/// Kiro 把 tool_use 的 `input` JSON 拆成多个 `toolUseEvent` 分片下发，最后一片
+/// 带 `stop=true`。分片可能切在 JSON 的任意字节位置（甚至 token 中间），因此
+/// **不能**逐片当作 `input_json_delta` 直接转发——必须按 `tool_use_id` 累积，
+/// 只在收到 `stop=true` 时整体解析，成功后一次性发出完整的工具调用。
+#[derive(Debug, Default)]
+pub struct ToolJsonAccumulator {
+    /// tool_use_id -> (工具名, 已累积的 JSON 分片)
+    buffers: HashMap<String, (String, String)>,
+}
+
+impl ToolJsonAccumulator {
+    pub fn new() -> Self {
+        Self {
+            buffers: HashMap::new(),
+        }
+    }
+
+    /// 累积一个 `toolUseEvent` 分片。
+    ///
+    /// - 未收到 `stop` 时返回 `Ok(None)`（继续缓冲，不发出任何事件）。
+    /// - 收到 `stop` 时把累积的 JSON 整体解析：成功返回 `Ok(Some(CompletedToolUse))`，
+    ///   失败返回 `Err(InvalidJson)`。空参数按 `{}` 处理。
+    /// - 工具名按 `tool_name_map` 还原为客户端原始名（短名 → 原名）。
+    pub fn push(
+        &mut self,
+        tool_use: &crate::kiro::model::events::ToolUseEvent,
+        tool_name_map: &HashMap<String, String>,
+    ) -> Result<Option<CompletedToolUse>, ToolJsonAccumulatorError> {
+        let entry = self
+            .buffers
+            .entry(tool_use.tool_use_id.clone())
+            .or_insert_with(|| (tool_use.name.clone(), String::new()));
+        if entry.0.is_empty() {
+            entry.0 = tool_use.name.clone();
+        }
+        entry.1.push_str(&tool_use.input);
+
+        if !tool_use.stop {
+            return Ok(None);
+        }
+
+        let (kiro_name, input_json) = self
+            .buffers
+            .remove(&tool_use.tool_use_id)
+            .unwrap_or_else(|| (tool_use.name.clone(), tool_use.input.clone()));
+        let input = if input_json.trim().is_empty() {
+            serde_json::json!({})
+        } else {
+            serde_json::from_str::<serde_json::Value>(&input_json).map_err(|e| {
+                ToolJsonAccumulatorError::InvalidJson {
+                    tool_use_id: tool_use.tool_use_id.clone(),
+                    name: kiro_name.clone(),
+                    message: e.to_string(),
+                }
+            })?
+        };
+
+        // 通过统一入口还原客户端工具名 + 入参。
+        Ok(Some(CompletedToolUse::from_kiro(
+            tool_use.tool_use_id.clone(),
+            &kiro_name,
+            input,
+            tool_name_map,
+        )))
+    }
+
+    /// 流结束时收尾：若仍有从未收到 `stop=true` 的缓冲，说明上游在工具参数
+    /// 写到一半时截断，返回 `IncompleteJson`（取字节数最多的那个作代表）。
+    pub fn finish(&mut self) -> Result<(), ToolJsonAccumulatorError> {
+        if let Some((tool_use_id, (name, input))) = self
+            .buffers
+            .iter()
+            .max_by_key(|(_, (_, input))| input.len())
+            .map(|(id, (name, input))| (id.clone(), (name.clone(), input.clone())))
+        {
+            self.buffers.remove(&tool_use_id);
+            return Err(ToolJsonAccumulatorError::IncompleteJson {
+                tool_use_id,
+                name,
+                bytes: input.len(),
+            });
+        }
+        Ok(())
+    }
 }
 
 /// SSE 事件
@@ -1096,6 +1387,14 @@ pub struct StreamContext {
     repeat_guard_run: u32,
     /// 复读熔断：是否已经触发过熔断（触发后本轮后续文本一律丢弃，不再吐、不写历史）。
     repeat_guard_tripped: bool,
+    /// 工具调用参数 JSON 累积器：按 tool_use_id 缓冲分片，`stop` 时整体解析，
+    /// 避免把“流式半截 JSON”当成完整工具调用转发。
+    tool_json_accumulator: ToolJsonAccumulator,
+    /// 工具调用 JSON 错误（非法 / 半截）。一旦置位，收尾时补发 `error` 事件，
+    /// 上层据此把本次请求记为 error 而非 success。
+    tool_json_error: Option<ToolJsonAccumulatorError>,
+    /// 跨 chunk 过滤混入 assistant 文本的字面 `<tool_use>` XML 泄漏。
+    tool_use_xml_filter: ToolUseXmlLeakFilter,
 }
 
 impl StreamContext {
@@ -1107,6 +1406,13 @@ impl StreamContext {
         let total_real = self.context_input_tokens.unwrap_or(self.input_tokens);
         self.cache_usage.split_against_total(total_real)
     }
+
+    /// 工具调用 JSON 错误信息（非法 / 半截）。上层据此把本次请求记为 error、
+    /// 或在非流式路径返回 502。无错误时返回 `None`。
+    pub fn tool_json_error_message(&self) -> Option<String> {
+        self.tool_json_error.as_ref().map(|err| err.message())
+    }
+
     /// 创建 StreamContext
     pub fn new_with_thinking(
         model: impl Into<String>,
@@ -1141,6 +1447,9 @@ impl StreamContext {
             repeat_guard_last_line: String::new(),
             repeat_guard_run: 0,
             repeat_guard_tripped: false,
+            tool_json_accumulator: ToolJsonAccumulator::new(),
+            tool_json_error: None,
+            tool_use_xml_filter: ToolUseXmlLeakFilter::default(),
         }
     }
 
@@ -1261,9 +1570,14 @@ impl StreamContext {
 
     /// 处理助手响应事件
     fn process_assistant_response(&mut self, content: &str) -> Vec<SseEvent> {
+        // 先过滤字面 <tool_use> XML 泄漏（跨 chunk）。过滤后为空可能是过滤器在缓冲
+        // 半个标签，直接返回；后续 token 估算与文本处理都用过滤后内容
+        // （被剥离的 XML 因此不计入 output_tokens）。
+        let content = self.tool_use_xml_filter.filter(content);
         if content.is_empty() {
             return Vec::new();
         }
+        let content = content.as_str();
 
         let mut events = Vec::new();
         if self.is_thinking_block_open() && !self.in_thinking_block {
@@ -1496,7 +1810,18 @@ impl StreamContext {
                                 }
                                 // parsed 在上面已确认是 Some 且 name_known
                                 let (name, input_json) = parsed.expect("parsed is Some when name_known");
-                                events.extend(self.synthesize_tool_use(name, input_json));
+                                // 解析完整入参 → 统一还原 → 统一发出（与结构化 toolUseEvent 同一发出口）。
+                                let input: serde_json::Value =
+                                    serde_json::from_str(&input_json).unwrap_or_else(|_| json!({}));
+                                let tool_use_id =
+                                    format!("toolu_{}", Uuid::new_v4().to_string().replace('-', ""));
+                                let completed = CompletedToolUse::from_kiro(
+                                    tool_use_id,
+                                    &name,
+                                    input,
+                                    &self.tool_name_map,
+                                );
+                                events.extend(self.emit_completed_tool_use(completed));
                             } else {
                                 // 不捞回（嵌句中 / 围栏内 / 工具名未知 / 解析失败）→ 整段当普通文本吐出
                                 events.extend(self.emit_text_delta_raw(&buf[..end]));
@@ -1568,52 +1893,6 @@ impl StreamContext {
                     break;
                 }
             }
-        }
-        events
-    }
-
-    /// 合成一组结构化 tool_use 事件（照抄 process_tool_use 的 6 步）
-    fn synthesize_tool_use(&mut self, parsed_name: String, input_json: String) -> Vec<SseEvent> {
-        let mut events = Vec::new();
-        self.state_manager.set_has_tool_use(true);
-        let block_index = self.state_manager.next_block_index();
-        let tool_use_id = format!("toolu_{}", Uuid::new_v4().to_string().replace('-', ""));
-        self.tool_block_indices
-            .insert(tool_use_id.clone(), block_index);
-        let name = self
-            .tool_name_map
-            .get(&parsed_name)
-            .cloned()
-            .unwrap_or(parsed_name);
-        events.extend(self.state_manager.handle_content_block_start(
-            block_index,
-            "tool_use",
-            json!({
-                "type": "content_block_start",
-                "index": block_index,
-                "content_block": {
-                    "type": "tool_use",
-                    "id": tool_use_id,
-                    "name": name,
-                    "input": {}
-                }
-            }),
-        ));
-        if let Some(d) = self.state_manager.handle_content_block_delta(
-            block_index,
-            json!({
-                "type": "content_block_delta",
-                "index": block_index,
-                "delta": {
-                    "type": "input_json_delta",
-                    "partial_json": input_json
-                }
-            }),
-        ) {
-            events.push(d);
-        }
-        if let Some(s) = self.state_manager.handle_content_block_stop(block_index) {
-            events.push(s);
         }
         events
     }
@@ -1921,6 +2200,60 @@ impl StreamContext {
         )
     }
 
+    /// 统一的工具调用流式发出口：结构化 `toolUseEvent` 与 `<invoke>` 文本捞回都经此发出。
+    ///
+    /// 块索引按 `completed.id` 复用/分配（结构化按 tool_use_id 复用；invoke 合成用新 id 故新分配），
+    /// 依次发 `content_block_start{name, input:{}}` → 单个完整 `input_json_delta` → `content_block_stop`。
+    fn emit_completed_tool_use(&mut self, completed: CompletedToolUse) -> Vec<SseEvent> {
+        let mut events = Vec::new();
+        self.state_manager.set_has_tool_use(true);
+
+        let block_index = if let Some(&idx) = self.tool_block_indices.get(&completed.id) {
+            idx
+        } else {
+            let idx = self.state_manager.next_block_index();
+            self.tool_block_indices.insert(completed.id.clone(), idx);
+            idx
+        };
+
+        events.extend(self.state_manager.handle_content_block_start(
+            block_index,
+            "tool_use",
+            json!({
+                "type": "content_block_start",
+                "index": block_index,
+                "content_block": {
+                    "type": "tool_use",
+                    "id": completed.id,
+                    "name": completed.name,
+                    "input": {}
+                }
+            }),
+        ));
+
+        // 一次性发出完整参数 JSON（来源已保证是合法 JSON）。
+        self.output_tokens += estimate_tokens(&completed.input.to_string());
+        if let Some(delta_event) = self.state_manager.handle_content_block_delta(
+            block_index,
+            json!({
+                "type": "content_block_delta",
+                "index": block_index,
+                "delta": {
+                    "type": "input_json_delta",
+                    "partial_json": serde_json::to_string(&completed.input).unwrap_or_else(|_| "{}".to_string())
+                }
+            }),
+        ) {
+            events.push(delta_event);
+        }
+
+        if let Some(stop_event) = self.state_manager.handle_content_block_stop(block_index) {
+            events.push(stop_event);
+        }
+
+        events
+    }
+
     /// 处理工具使用事件
     fn process_tool_use(
         &mut self,
@@ -1988,72 +2321,39 @@ impl StreamContext {
             events.extend(self.create_text_delta_events(&buffered));
         }
 
-        // 获取或分配块索引
-        let block_index = if let Some(&idx) = self.tool_block_indices.get(&tool_use.tool_use_id) {
-            idx
-        } else {
-            let idx = self.state_manager.next_block_index();
-            self.tool_block_indices
-                .insert(tool_use.tool_use_id.clone(), idx);
-            idx
+        // 通过累积器缓冲工具参数 JSON 分片：只有收到 stop=true 且解析成功时才
+        // 发出完整的工具调用；半截 / 非法 JSON 记为错误，交由收尾（generate_final_events）
+        // 统一补发 error 事件，避免把无法解析的参数当成完整调用转发给客户端。
+        let completed = match self.tool_json_accumulator.push(tool_use, &self.tool_name_map) {
+            Ok(Some(completed)) => completed,
+            Ok(None) => return events,
+            Err(e) => {
+                tracing::error!("{}", e);
+                self.tool_json_error = Some(e);
+                self.state_manager.set_stop_reason("error");
+                return events;
+            }
         };
 
-        // 还原工具名称（如果有映射）
-        let original_name = self
-            .tool_name_map
-            .get(&tool_use.name)
-            .cloned()
-            .unwrap_or_else(|| tool_use.name.clone());
-
-        // 发送 content_block_start
-        let start_events = self.state_manager.handle_content_block_start(
-            block_index,
-            "tool_use",
-            json!({
-                "type": "content_block_start",
-                "index": block_index,
-                "content_block": {
-                    "type": "tool_use",
-                    "id": tool_use.tool_use_id,
-                    "name": original_name,
-                    "input": {}
-                }
-            }),
-        );
-        events.extend(start_events);
-
-        // 发送参数增量 (ToolUseEvent.input 是 String 类型)
-        if !tool_use.input.is_empty() {
-            self.output_tokens += (tool_use.input.len() as i32 + 3) / 4; // 估算 token
-
-            if let Some(delta_event) = self.state_manager.handle_content_block_delta(
-                block_index,
-                json!({
-                    "type": "content_block_delta",
-                    "index": block_index,
-                    "delta": {
-                        "type": "input_json_delta",
-                        "partial_json": tool_use.input
-                    }
-                }),
-            ) {
-                events.push(delta_event);
-            }
-        }
-
-        // 如果是完整的工具调用（stop=true），发送 content_block_stop
-        if tool_use.stop {
-            if let Some(stop_event) = self.state_manager.handle_content_block_stop(block_index) {
-                events.push(stop_event);
-            }
-        }
-
+        // 统一发出（与 <invoke> 文本捞回路径共用同一发出口）。
+        events.extend(self.emit_completed_tool_use(completed));
         events
     }
 
     /// 生成最终事件序列
     pub fn generate_final_events(&mut self) -> Vec<SseEvent> {
         let mut events = Vec::new();
+
+        // 收尾：flush <tool_use> XML 过滤器的残留（截断的未闭合块会被丢弃），
+        // 走同一文本路径，交由后续 thinking / invoke 缓冲一并 flush。
+        let leftover = self.tool_use_xml_filter.finish();
+        if !leftover.is_empty() {
+            if self.thinking_enabled {
+                events.extend(self.process_content_with_thinking(&leftover));
+            } else {
+                events.extend(self.create_text_delta_events(&leftover));
+            }
+        }
 
         if self.is_thinking_block_open() && !self.in_thinking_block {
             events.extend(self.close_open_thinking_block());
@@ -2142,16 +2442,42 @@ impl StreamContext {
             events.extend(self.drain_invoke_sniff_buffer(true));
         }
 
+        // 收尾检查工具调用累积器：若仍有 tool_use 从未收到 stop=true（上游在参数
+        // 写到一半时截断），记为错误。process_tool_use 中已置位的错误保持不变。
+        if self.tool_json_error.is_none()
+            && let Err(e) = self.tool_json_accumulator.finish()
+        {
+            tracing::error!("{}", e);
+            self.tool_json_error = Some(e);
+            self.state_manager.set_stop_reason("error");
+        }
+
         // 互斥口径：total 真值（contextUsage 优先）− 缓存覆盖 = 未缓存的 input。
         let (final_input_tokens, cache_creation, cache_read) = self.resolved_usage();
 
-        // 生成最终事件
+        // 生成最终事件（message_delta + message_stop）
         events.extend(self.state_manager.generate_final_events(
             final_input_tokens,
             self.output_tokens,
             cache_creation,
             cache_read,
         ));
+
+        // 工具调用 JSON 错误：在最终事件之后补一个 Anthropic `error` 事件，明确告知
+        // 客户端本次工具调用因上游半截 / 非法 JSON 未被转发（实时流已返回 200，无法再改状态码）。
+        if let Some(err) = &self.tool_json_error {
+            events.push(SseEvent::new(
+                "error",
+                json!({
+                    "type": "error",
+                    "error": {
+                        "type": err.error_type(),
+                        "message": err.message()
+                    }
+                }),
+            ));
+        }
+
         events
     }
 }
@@ -2269,6 +2595,11 @@ impl BufferedStreamContext {
             self.inner.credits,
         )
     }
+
+    /// 工具调用 JSON 错误信息（转发内部 StreamContext）。缓冲流据此记 error。
+    pub fn tool_json_error_message(&self) -> Option<String> {
+        self.inner.tool_json_error_message()
+    }
 }
 
 /// 简单的 token 估算（中英文字符混合）
@@ -2297,6 +2628,216 @@ pub fn estimate_tokens(text: &str) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- ToolJsonAccumulator: 流式半截 / 非法工具调用 JSON ----
+
+    fn tool_evt(
+        id: &str,
+        name: &str,
+        input: &str,
+        stop: bool,
+    ) -> crate::kiro::model::events::ToolUseEvent {
+        crate::kiro::model::events::ToolUseEvent {
+            name: name.to_string(),
+            tool_use_id: id.to_string(),
+            input: input.to_string(),
+            stop,
+        }
+    }
+
+    #[test]
+    fn tool_json_accumulator_reassembles_split_fragments() {
+        let mut acc = ToolJsonAccumulator::new();
+        let map = HashMap::new();
+        // 用非内置工具名，专注验证分片重组本身（内置名的双向映射另有专项测试）。
+        // JSON 被切成三片（切在 token 中间），只有最后一片带 stop。
+        assert!(
+            acc.push(&tool_evt("t1", "custom_tool", "{\"pa", false), &map)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            acc.push(&tool_evt("t1", "custom_tool", "th\":\"/a", false), &map)
+                .unwrap()
+                .is_none()
+        );
+        let completed = acc
+            .push(&tool_evt("t1", "custom_tool", ".txt\"}", true), &map)
+            .unwrap()
+            .unwrap();
+        assert_eq!(completed.id, "t1");
+        assert_eq!(completed.name, "custom_tool");
+        assert_eq!(completed.input, serde_json::json!({"path": "/a.txt"}));
+    }
+
+    #[test]
+    fn tool_json_accumulator_empty_input_is_empty_object() {
+        let mut acc = ToolJsonAccumulator::new();
+        let completed = acc
+            .push(&tool_evt("t1", "noop", "", true), &HashMap::new())
+            .unwrap()
+            .unwrap();
+        assert_eq!(completed.input, serde_json::json!({}));
+    }
+
+    #[test]
+    fn tool_json_accumulator_invalid_json_errors() {
+        let mut acc = ToolJsonAccumulator::new();
+        let err = acc
+            .push(&tool_evt("t1", "read_file", "{not json", true), &HashMap::new())
+            .unwrap_err();
+        assert_eq!(err.error_type(), "upstream_tool_json_error");
+        assert!(matches!(err, ToolJsonAccumulatorError::InvalidJson { .. }));
+    }
+
+    #[test]
+    fn tool_json_accumulator_incomplete_on_missing_stop() {
+        let mut acc = ToolJsonAccumulator::new();
+        // 只来了半截、从未 stop → finish() 报 IncompleteJson。
+        assert!(
+            acc.push(
+                &tool_evt("t1", "read_file", "{\"path\":\"/a", false),
+                &HashMap::new()
+            )
+            .unwrap()
+            .is_none()
+        );
+        let err = acc.finish().unwrap_err();
+        assert!(matches!(err, ToolJsonAccumulatorError::IncompleteJson { .. }));
+        // 已取出残留后再 finish() 应成功。
+        assert!(acc.finish().is_ok());
+    }
+
+    #[test]
+    fn tool_json_accumulator_restores_short_tool_name() {
+        let mut acc = ToolJsonAccumulator::new();
+        let mut map = HashMap::new();
+        map.insert(
+            "short_abc123".to_string(),
+            "the_original_very_long_tool_name".to_string(),
+        );
+        let completed = acc
+            .push(&tool_evt("t1", "short_abc123", "{}", true), &map)
+            .unwrap()
+            .unwrap();
+        assert_eq!(completed.name, "the_original_very_long_tool_name");
+    }
+
+    /// 防回归：统一管道的两个去向（流式 emit_completed_tool_use 与非流式 to_anthropic_block）
+    /// 对同一 CompletedToolUse 产出一致的 id / name / input。
+    #[test]
+    fn emit_and_block_agree_on_shape() {
+        let completed = CompletedToolUse {
+            id: "toolu_1".to_string(),
+            name: "read_file".to_string(),
+            input: serde_json::json!({"path": "/a"}),
+        };
+
+        // 非流式块
+        let block = completed.to_anthropic_block();
+        assert_eq!(block["type"], "tool_use");
+        assert_eq!(block["id"], "toolu_1");
+        assert_eq!(block["name"], "read_file");
+        assert_eq!(block["input"], serde_json::json!({"path": "/a"}));
+
+        // 流式发出：start 的 id/name 与块一致；delta 的 partial_json 解析后与块 input 一致。
+        let mut ctx = StreamContext::new_with_thinking(
+            "m",
+            1,
+            false,
+            HashMap::new(),
+            std::collections::HashSet::new(),
+        );
+        let events = ctx.emit_completed_tool_use(completed);
+        let start = events
+            .iter()
+            .find(|e| {
+                e.event == "content_block_start"
+                    && e.data["content_block"]["type"] == "tool_use"
+            })
+            .expect("应有 tool_use content_block_start");
+        assert_eq!(start.data["content_block"]["id"], block["id"]);
+        assert_eq!(start.data["content_block"]["name"], block["name"]);
+        let delta = events
+            .iter()
+            .find(|e| e.event == "content_block_delta")
+            .expect("应有 input_json_delta");
+        let partial = delta.data["delta"]["partial_json"].as_str().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(partial).unwrap();
+        assert_eq!(parsed, block["input"], "流式增量拼出的 input 应与非流式块一致");
+        assert!(events.iter().any(|e| e.event == "content_block_stop"));
+    }
+
+    // ---- <tool_use> XML 泄漏过滤 ----
+
+    #[test]
+    fn tool_use_xml_filter_strips_single_chunk_block() {
+        let mut f = ToolUseXmlLeakFilter::default();
+        let out = f.filter("before <tool_use id=\"t\" name=\"Write\">{\"path\":\"/a\"}</tool_use> after")
+            + &f.finish();
+        assert!(!out.contains("<tool_use"));
+        assert!(out.contains("before") && out.contains("after"));
+    }
+
+    #[test]
+    fn tool_use_xml_filter_strips_cross_chunk_open_split() {
+        let mut f = ToolUseXmlLeakFilter::default();
+        let mut out = f.filter("before <tool");
+        out.push_str(&f.filter("_use id=\"t\">{\"a\":1}</tool_use>after"));
+        out.push_str(&f.finish());
+        assert!(!out.contains("<tool_use"), "out={out:?}");
+        assert!(out.contains("before") && out.contains("after"));
+    }
+
+    /// 优化点：闭合标签 `</tool_use>` 被切分到多个 chunk 时也应完整剥离，
+    /// 且其后文本不被吞（参考实现在此会漏）。
+    #[test]
+    fn tool_use_xml_filter_strips_cross_chunk_close_split() {
+        let mut f = ToolUseXmlLeakFilter::default();
+        let mut out = f.filter("x <tool_use name=\"W\">{\"a\":1}</tool");
+        out.push_str(&f.filter("_use>y"));
+        out.push_str(&f.finish());
+        assert!(!out.contains("<tool_use"), "out={out:?}");
+        assert!(out.contains('x') && out.contains('y'), "闭合跨 chunk 时其后文本不应被吞: {out:?}");
+    }
+
+    #[test]
+    fn tool_use_xml_filter_keeps_similar_text() {
+        let mut f = ToolUseXmlLeakFilter::default();
+        let out = f.filter("use <tool_user> here") + &f.finish();
+        assert_eq!(out, "use <tool_user> here");
+    }
+
+    #[test]
+    fn tool_use_xml_filter_drops_unclosed_at_finish() {
+        let mut f = ToolUseXmlLeakFilter::default();
+        let mut out = f.filter("keep <tool_use name=\"W\">partial...");
+        out.push_str(&f.finish());
+        assert!(out.contains("keep"));
+        assert!(!out.contains("<tool_use") && !out.contains("partial"));
+    }
+
+    #[test]
+    fn stream_context_filters_tool_use_xml_leak() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "m",
+            1,
+            false,
+            HashMap::new(),
+            std::collections::HashSet::new(),
+        );
+        let mut events = ctx.generate_initial_events();
+        events.extend(ctx.process_assistant_response("hello <tool"));
+        events.extend(ctx.process_assistant_response("_use name=\"W\">{\"a\":1}</tool_use> world"));
+        events.extend(ctx.generate_final_events());
+        let text: String = events
+            .iter()
+            .filter(|e| e.event == "content_block_delta" && e.data["delta"]["type"] == "text_delta")
+            .filter_map(|e| e.data["delta"]["text"].as_str())
+            .collect();
+        assert!(!text.contains("<tool_use"), "泄漏未被过滤: {text:?}");
+        assert!(text.contains("hello") && text.contains("world"));
+    }
 
     /// 测试用的「已知工具表」：包含 invoke 测试里会合成的工具名，
     /// 让 🅳 工具表校验放行这些名字，从而能验证捞回逻辑本身。
@@ -2499,7 +3040,7 @@ mod tests {
             name: "test_tool".to_string(),
             tool_use_id: "tool_1".to_string(),
             input: "{}".to_string(),
-            stop: false,
+            stop: true, // 累积器仅在 stop=true 时整体发出工具调用（含关闭前一个块）
         });
         assert!(
             tool_events.iter().any(|e| {
@@ -2561,7 +3102,7 @@ mod tests {
             name: "Write".to_string(),
             tool_use_id: "tool_1".to_string(),
             input: "{}".to_string(),
-            stop: false,
+            stop: true, // 累积器仅在 stop=true 时整体发出工具调用（含关闭前一个块）
         });
 
         let text_start_index = events.iter().find_map(|e| {
@@ -2760,7 +3301,7 @@ mod tests {
             name: "Write".to_string(),
             tool_use_id: "tool_1".to_string(),
             input: "{}".to_string(),
-            stop: false,
+            stop: true, // 累积器仅在 stop=true 时整体发出工具调用（含关闭前一个块）
         });
         all_events.extend(tool_events);
 

@@ -500,7 +500,12 @@ fn extract_segments(req: &MessagesRequest, key_id: u64, cache: &CacheMeter) -> (
     )
     .max(0) as u32;
 
-    let salt = format!("key:{key_id}");
+    // Prefer the Claude Code session id when available so separate sessions never
+    // share simulated cache state. The system key (id=0) may be shared by many
+    // users, so without a session identifier we deliberately disable simulation.
+    let Some(salt) = isolation_seed(req, key_id) else {
+        return (Vec::new(), prompt_total_est);
+    };
     if let Some(system) = req.system.as_ref() {
         if let Ok(value) = serde_json::to_value(system) {
             push_segment(
@@ -602,6 +607,28 @@ fn extract_segments(req: &MessagesRequest, key_id: u64, cache: &CacheMeter) -> (
     }
 
     (segments, prompt_total_est)
+}
+
+fn isolation_seed(req: &MessagesRequest, key_id: u64) -> Option<String> {
+    if let Some(session) = req
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.user_id.as_deref())
+        .and_then(extract_session_id)
+    {
+        return Some(format!("session:{session}"));
+    }
+    if key_id == 0 {
+        return None;
+    }
+    Some(format!("key:{key_id}"))
+}
+
+fn extract_session_id(user_id: &str) -> Option<String> {
+    user_id
+        .split_once("_session_")
+        .map(|(_, session)| session.trim().to_string())
+        .filter(|session| !session.is_empty())
 }
 
 fn push_segment(
@@ -1197,9 +1224,9 @@ mod tests {
         assert!(c.cache_read > 0, "同一 key_id 应命中自己的前缀");
     }
 
-    /// metadata.user_id 里 session 变化不应打碎同一 client key 的技术缓存命中。
+    /// metadata.user_id 中的 session 是缓存隔离边界。
     #[test]
-    fn metadata_session_does_not_fragment_cache() {
+    fn metadata_session_isolates_cache() {
         use super::super::types::{Message, MessagesRequest, Metadata};
         let body = "conversation prefix that stays stable ".repeat(20);
         let make = |session: &str| MessagesRequest {
@@ -1233,10 +1260,27 @@ mod tests {
         let s1a = compute_cache_usage(&cache, &make("aaa"), 0);
         assert_eq!(s1a.cache_read, 0);
         let s2 = compute_cache_usage(&cache, &make("bbb"), 0);
-        assert!(
-            s2.cache_read > 0,
-            "session 变化不应阻止同一 key 的稳定前缀命中"
-        );
+        assert_eq!(s2.cache_read, 0, "不同 session 不应互相命中");
+        let s1b = compute_cache_usage(&cache, &make("aaa"), 0);
+        assert!(s1b.cache_read > 0, "相同 session 应命中自己的缓存");
+    }
+
+    #[test]
+    fn system_key_without_session_does_not_simulate_shared_cache() {
+        let cache = CacheMeter::new(None);
+        let body = "shared system-key prompt without a session ".repeat(20);
+        let messages = || {
+            vec![
+                msg_with_cc("user", &body, false),
+                msg_with_cc("assistant", &body, false),
+                msg_with_cc("user", &body, false),
+            ]
+        };
+        let first = compute_cache_usage(&cache, &req_with_messages(messages()), 0);
+        let second = compute_cache_usage(&cache, &req_with_messages(messages()), 0);
+        assert_eq!(first.cache_covered_est, 0);
+        assert_eq!(second.cache_covered_est, 0);
+        assert_eq!(second.cache_read, 0);
     }
 
     /// 含图片的历史段：covered 应计入图片的 Anthropic 口径 token，且跨轮稳定命中。

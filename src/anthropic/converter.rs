@@ -15,6 +15,7 @@ use crate::kiro::model::requests::kiro::{AdditionalModelRequestFields, KiroOutpu
 use crate::kiro::model::requests::tool::{
     InputSchema, Tool, ToolResult, ToolSpecification, ToolUseEntry,
 };
+use crate::model::config::ToolCompatibilityMode;
 
 use super::types::{ContentBlock, ImageSource, MessagesRequest};
 
@@ -129,6 +130,9 @@ const WRITE_TOOL_DESCRIPTION_SUFFIX: &str = "- IMPORTANT: If the content to writ
 /// 追加到 Edit 工具 description 末尾的内容
 const EDIT_TOOL_DESCRIPTION_SUFFIX: &str = "- IMPORTANT: If the `new_string` content exceeds 50 lines, you MUST split it into multiple Edit calls, each replacing no more than 50 lines at a time. If used to append content, leave a unique placeholder to help append content. On the final chunk, do NOT include the placeholder.";
 
+/// 追加到 Bash 工具 description 末尾的内容（上游可能在超大命令处截断）
+const BASH_TOOL_DESCRIPTION_SUFFIX: &str = "- IMPORTANT: Do not send very large commands, inline scripts, or heredocs. If a command would exceed 100 lines or ~8000 characters, first create/modify a script file with chunked Write/Edit calls, then run a short command that executes it. Do not retry the same oversized command after a failure; split it smaller.";
+
 /// 追加到系统提示词的分块写入策略
 const SYSTEM_CHUNKED_POLICY: &str = "\
 When the Write or Edit tool has content size limits, always comply silently. \
@@ -203,17 +207,74 @@ pub fn get_context_window_size(model: &str) -> i32 {
     }
 }
 
-/// Whether this request should use `additionalModelRequestFields.output_config`.
+/// 是否为已确认接受 `additionalModelRequestFields.output_config` 的模型。
 ///
-/// The field is currently only known to be accepted by the Opus 4.6 adaptive-thinking path.
-/// Sending it to other models causes upstream 400 responses such as
-/// `additionalModelRequestFields is not supported for this model`.
-fn should_emit_output_config(req: &MessagesRequest, model_id: &str) -> bool {
-    model_id == "claude-opus-4.6"
-        && req
+/// Kiro `ListAvailableModels`（2026-06）确认：Opus 4.6/4.7/4.8、Sonnet 4.6 接受
+/// `output_config`。Claude 5 系（fable-5 / mythos-5 / sonnet-5 / opus-5 / claude-5）
+/// 与 xhigh 能力一致，一并视为支持。其余（4.5 系、haiku、sonnet-4.8 等）保守视为
+/// 不支持——向它们下发会触发上游 400（`additionalModelRequestFields is not supported`）。
+/// 若后续实测某模型 400，从这里去除即可。
+fn model_supports_native_reasoning(model_id: &str) -> bool {
+    let m = model_id.to_ascii_lowercase();
+    matches!(
+        m.as_str(),
+        "claude-opus-4.6" | "claude-opus-4.7" | "claude-opus-4.8" | "claude-sonnet-4.6"
+    ) || m.contains("fable-5")
+        || m.contains("mythos-5")
+        || m.contains("sonnet-5")
+        || m.contains("opus-5")
+        || m.contains("claude-5")
+}
+
+/// 本次请求是否请求了原生 reasoning。
+///
+/// Opus 4.6 有历史约束：上游只在 **adaptive** thinking 下接受 `output_config`
+/// （普通 enabled / 纯 effort 会 400），故单独判定；其余支持模型放宽为
+/// 「thinking 启用（enabled/adaptive） **或** 显式 `output_config.effort`」即算请求。
+fn native_reasoning_requested(req: &MessagesRequest, model_id: &str) -> bool {
+    if model_id == "claude-opus-4.6" {
+        return req
             .thinking
             .as_ref()
-            .is_some_and(|t| t.thinking_type == "adaptive")
+            .is_some_and(|t| t.thinking_type == "adaptive");
+    }
+    req.thinking.as_ref().is_some_and(|t| t.is_enabled())
+        || req
+            .output_config
+            .as_ref()
+            .is_some_and(|oc| !oc.effort.trim().is_empty())
+}
+
+/// 由 Anthropic `thinking.budget_tokens` 推导 effort 档位。
+///
+/// 当客户端只发标准 `thinking:{type:"enabled",budget_tokens:N}`、不带 `output_config`
+/// 时，用它把「思考预算」映射到 Kiro 的 effort。（本项目 budget_tokens 上限 24576，
+/// 故经此推导实际最高到 `high`；`xhigh` 仍需客户端显式 `output_config.effort`。）
+fn effort_from_budget_tokens(tokens: i32) -> &'static str {
+    match tokens {
+        i32::MIN..=4_000 => "low",
+        4_001..=16_000 => "medium",
+        16_001..=64_000 => "high",
+        _ => "xhigh",
+    }
+}
+
+/// 选定最终下发的 effort：优先显式 `output_config.effort`；否则据 `budget_tokens`
+/// 推导；再统一过 [`normalize_effort_for_model`]（按模型把 xhigh 安全降级等）。
+fn select_native_reasoning_effort(req: &MessagesRequest, model_id: &str) -> String {
+    let raw = req
+        .output_config
+        .as_ref()
+        .map(|oc| oc.effort.trim().to_string())
+        .filter(|e| !e.is_empty())
+        .or_else(|| {
+            req.thinking
+                .as_ref()
+                .filter(|t| t.is_enabled())
+                .map(|t| effort_from_budget_tokens(t.budget_tokens).to_string())
+        })
+        .unwrap_or_else(|| "high".to_string());
+    normalize_effort_for_model(model_id, &raw).unwrap_or_else(|| "high".to_string())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -316,12 +377,17 @@ fn build_additional_model_request_fields(
     req: &MessagesRequest,
     model_id: &str,
 ) -> Option<AdditionalModelRequestFields> {
-    let output_config = if should_emit_output_config(req, model_id) {
-        req.output_config.as_ref().and_then(|oc| {
-            normalize_effort_for_model(model_id, &oc.effort)
-                .map(|effort| KiroOutputConfig { effort })
-        })
-    } else {
+    // 显式关闭 thinking：不下发任何 reasoning 字段。
+    if req
+        .thinking
+        .as_ref()
+        .is_some_and(|t| t.thinking_type == "disabled")
+    {
+        return None;
+    }
+
+    // 仅对确认接受 output_config 的模型下发，避免上游 400。
+    if !model_supports_native_reasoning(model_id) {
         if let Some(oc) = &req.output_config
             && !oc.effort.trim().is_empty()
         {
@@ -330,11 +396,17 @@ fn build_additional_model_request_fields(
                 "skipping unsupported additionalModelRequestFields.output_config for model"
             );
         }
-        None
-    };
+        return None;
+    }
 
-    output_config.map(|output_config| AdditionalModelRequestFields {
-        output_config: Some(output_config),
+    // 需要客户端确实请求了 reasoning（thinking 启用或显式 effort；opus 4.6 需 adaptive）。
+    if !native_reasoning_requested(req, model_id) {
+        return None;
+    }
+
+    let effort = select_native_reasoning_effort(req, model_id);
+    Some(AdditionalModelRequestFields {
+        output_config: Some(KiroOutputConfig { effort }),
     })
 }
 
@@ -359,6 +431,8 @@ pub struct ConversionResult {
 pub enum ConversionError {
     UnsupportedModel(String),
     EmptyMessages,
+    /// Claude Code 工具无法映射到 Kiro 内置工具（如 Read.pages 无对应、内置缺 schema）。
+    UnsupportedToolMapping(String),
 }
 
 impl std::fmt::Display for ConversionError {
@@ -366,6 +440,9 @@ impl std::fmt::Display for ConversionError {
         match self {
             ConversionError::UnsupportedModel(model) => write!(f, "模型不支持: {}", model),
             ConversionError::EmptyMessages => write!(f, "消息列表为空"),
+            ConversionError::UnsupportedToolMapping(reason) => {
+                write!(f, "工具映射不支持: {}", reason)
+            }
         }
     }
 }
@@ -445,7 +522,16 @@ fn create_placeholder_tool(name: &str) -> Tool {
 }
 
 /// 将 Anthropic 请求转换为 Kiro 请求
+/// 便捷入口（测试用）：默认按 ClaudeCode 模式转换。
+#[cfg(test)]
 pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, ConversionError> {
+    convert_request_with_mode(req, ToolCompatibilityMode::ClaudeCode)
+}
+
+pub fn convert_request_with_mode(
+    req: &MessagesRequest,
+    tool_compatibility_mode: ToolCompatibilityMode,
+) -> Result<ConversionResult, ConversionError> {
     // 1. 映射模型
     let model_id = map_model(&req.model)
         .ok_or_else(|| ConversionError::UnsupportedModel(req.model.clone()))?;
@@ -486,9 +572,9 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
     let last_message = messages.last().unwrap();
     let (mut text_content, images, tool_results) = process_message_content(&last_message.content)?;
 
-    // 6. 转换工具定义（超长名称自动缩短并记录映射）
+    // 6. 转换工具定义（超长名称自动缩短并记录映射；ClaudeCode 模式做内置工具适配）
     let mut tool_name_map = HashMap::new();
-    let mut tools = convert_tools(&req.tools, &mut tool_name_map);
+    let mut tools = convert_tools(&req.tools, &mut tool_name_map, tool_compatibility_mode)?;
 
     // 收集本次请求声明的所有工具名（原始 client 名），供 `<invoke>` 容错的工具表校验。
     let mut known_tool_names: std::collections::HashSet<String> = req
@@ -503,7 +589,13 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
     }
 
     // 7. 构建历史消息（需要先构建，以便收集历史中使用的工具）
-    let mut history = build_history(req, messages, &model_id, &mut tool_name_map)?;
+    let mut history = build_history(
+        req,
+        messages,
+        &model_id,
+        &mut tool_name_map,
+        tool_compatibility_mode,
+    )?;
 
     // 8. 验证并过滤 tool_use/tool_result 配对
     // 移除孤立的 tool_result（没有对应的 tool_use）
@@ -1063,49 +1155,453 @@ fn map_tool_name(name: &str, tool_name_map: &mut HashMap<String, String>) -> Str
 }
 
 /// 转换工具定义
-fn convert_tools(tools: &Option<Vec<super::types::Tool>>, tool_name_map: &mut HashMap<String, String>) -> Vec<Tool> {
-    let Some(tools) = tools else {
-        return Vec::new();
+/// Claude Code 内置工具名 → Kiro 内置工具名。
+fn claude_code_tool_name_to_kiro(name: &str) -> Option<&'static str> {
+    match name {
+        "Write" => Some("fs_write"),
+        "Edit" => Some("str_replace"),
+        "Bash" => Some("execute_bash"),
+        "Read" => Some("read_file"),
+        "Glob" => Some("file_search"),
+        "Grep" => Some("grep_search"),
+        "LS" => Some("list_directory"),
+        "WebSearch" => Some("web_search"),
+        _ => None,
+    }
+}
+
+fn is_claude_code_mode(mode: ToolCompatibilityMode) -> bool {
+    mode == ToolCompatibilityMode::ClaudeCode
+}
+
+/// 出站工具名映射：ClaudeCode 模式命中内置则改名并记录 `kiro名 → 客户端名`；
+/// 否则回退到长名缩短逻辑（map_tool_name）。
+fn map_client_tool_name_to_kiro(
+    name: &str,
+    tool_name_map: &mut HashMap<String, String>,
+    mode: ToolCompatibilityMode,
+) -> String {
+    if is_claude_code_mode(mode)
+        && let Some(kiro_name) = claude_code_tool_name_to_kiro(name)
+    {
+        tool_name_map
+            .entry(kiro_name.to_string())
+            .or_insert_with(|| name.to_string());
+        return kiro_name.to_string();
+    }
+    map_tool_name(name, tool_name_map)
+}
+
+fn optional_number(value: &serde_json::Value) -> Option<i64> {
+    value.as_i64().or_else(|| value.as_u64().map(|v| v as i64))
+}
+
+fn take_first(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    keys: &[&str],
+) -> Option<serde_json::Value> {
+    keys.iter().find_map(|key| obj.get(*key).cloned())
+}
+
+fn maybe_insert(
+    out: &mut serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    value: Option<serde_json::Value>,
+) {
+    if let Some(value) = value
+        && !value.is_null()
+    {
+        out.insert(key.to_string(), value);
+    }
+}
+
+fn default_explanation(tool_name: &str) -> serde_json::Value {
+    serde_json::Value::String(format!("Mapped from Claude Code {} tool.", tool_name))
+}
+
+/// 出站入参重写（Anthropic → Kiro 内置工具入参键）。Raw / 非内置直通。
+fn map_tool_input_to_kiro(
+    client_name: &str,
+    input: serde_json::Value,
+    mode: ToolCompatibilityMode,
+) -> Result<serde_json::Value, ConversionError> {
+    if !is_claude_code_mode(mode) {
+        return Ok(input);
+    }
+    let Some(kiro_name) = claude_code_tool_name_to_kiro(client_name) else {
+        return Ok(input);
+    };
+    let serde_json::Value::Object(obj) = input else {
+        return Ok(input);
     };
 
-    tools
-        .iter()
-        .map(|t| {
-            let mut description = t.description.clone();
+    let mut out = serde_json::Map::new();
+    match (client_name, kiro_name) {
+        ("Write", "fs_write") => {
+            maybe_insert(&mut out, "path", take_first(&obj, &["file_path", "path"]));
+            maybe_insert(&mut out, "text", take_first(&obj, &["content", "text"]));
+        }
+        ("Edit", "str_replace") => {
+            maybe_insert(&mut out, "path", take_first(&obj, &["file_path", "path"]));
+            maybe_insert(&mut out, "oldStr", take_first(&obj, &["old_string", "oldStr"]));
+            maybe_insert(&mut out, "newStr", take_first(&obj, &["new_string", "newStr"]));
+        }
+        ("Bash", "execute_bash") => {
+            maybe_insert(&mut out, "command", take_first(&obj, &["command"]));
+            maybe_insert(&mut out, "timeout", take_first(&obj, &["timeout"]));
+        }
+        ("Read", "read_file") => {
+            if obj.contains_key("pages") && !obj.get("pages").is_some_and(|v| v.is_null()) {
+                return Err(ConversionError::UnsupportedToolMapping(
+                    "Claude Code Read.pages has no Kiro read_file equivalent".to_string(),
+                ));
+            }
+            maybe_insert(&mut out, "path", take_first(&obj, &["file_path", "path"]));
+            let offset = obj.get("offset").and_then(optional_number);
+            let limit = obj.get("limit").and_then(optional_number);
+            if let Some(start) = offset {
+                out.insert("start_line".to_string(), serde_json::json!(start));
+            }
+            if let Some(limit) = limit {
+                let end = offset.map(|start| start + limit - 1).unwrap_or(limit);
+                out.insert("end_line".to_string(), serde_json::json!(end));
+            }
+            maybe_insert(&mut out, "explanation", take_first(&obj, &["explanation"]));
+            out.entry("explanation".to_string())
+                .or_insert_with(|| default_explanation(client_name));
+        }
+        ("Glob", "file_search") => {
+            maybe_insert(&mut out, "query", take_first(&obj, &["pattern", "query"]));
+            maybe_insert(
+                &mut out,
+                "excludePattern",
+                take_first(&obj, &["excludePattern", "exclude"]),
+            );
+            if let Some(v) = take_first(&obj, &["includeIgnoredFiles", "include_ignored"]) {
+                let mapped = match v {
+                    serde_json::Value::Bool(true) => serde_json::json!("yes"),
+                    serde_json::Value::Bool(false) => serde_json::json!("no"),
+                    other => other,
+                };
+                out.insert("includeIgnoredFiles".to_string(), mapped);
+            }
+            maybe_insert(&mut out, "explanation", take_first(&obj, &["explanation"]));
+            out.entry("explanation".to_string())
+                .or_insert_with(|| default_explanation(client_name));
+        }
+        ("Grep", "grep_search") => {
+            maybe_insert(&mut out, "query", take_first(&obj, &["pattern", "query"]));
+            maybe_insert(
+                &mut out,
+                "includePattern",
+                take_first(&obj, &["glob", "includePattern"]),
+            );
+            maybe_insert(
+                &mut out,
+                "excludePattern",
+                take_first(&obj, &["excludePattern", "exclude"]),
+            );
+            maybe_insert(
+                &mut out,
+                "caseSensitive",
+                take_first(&obj, &["caseSensitive", "case_sensitive"]),
+            );
+            maybe_insert(&mut out, "explanation", take_first(&obj, &["explanation"]));
+        }
+        ("LS", "list_directory") => {
+            maybe_insert(&mut out, "path", take_first(&obj, &["path"]));
+            maybe_insert(&mut out, "depth", take_first(&obj, &["depth"]));
+            maybe_insert(&mut out, "explanation", take_first(&obj, &["explanation"]));
+            out.entry("explanation".to_string())
+                .or_insert_with(|| default_explanation(client_name));
+        }
+        ("WebSearch", "web_search") => {
+            maybe_insert(&mut out, "query", take_first(&obj, &["query"]));
+        }
+        _ => return Ok(serde_json::Value::Object(obj)),
+    }
+    Ok(serde_json::Value::Object(out))
+}
 
-            // 对 Write/Edit 工具追加自定义描述后缀
+/// 入站入参还原（Kiro 内置工具入参键 → Anthropic）。**以 Kiro 名匹配**，故自动只在
+/// 出站确实映射过（ClaudeCode）时生效；Raw 模式 / 长名缩短 / 透传工具一律直通。
+///
+/// 这是相对参考实现的一处修正：参考以“客户端名”匹配，导致 Raw 模式下客户端自带的、
+/// 恰好叫 `Read` 的工具入参也会被误改写。以 Kiro 名匹配避免了该误伤，且入站无需穿透 mode。
+fn map_tool_input_from_kiro(kiro_name: &str, input: serde_json::Value) -> serde_json::Value {
+    let serde_json::Value::Object(obj) = input else {
+        return input;
+    };
+    let mut out = serde_json::Map::new();
+    match kiro_name {
+        "fs_write" => {
+            maybe_insert(&mut out, "file_path", take_first(&obj, &["path", "file_path"]));
+            maybe_insert(&mut out, "content", take_first(&obj, &["text", "content"]));
+        }
+        "str_replace" => {
+            maybe_insert(&mut out, "file_path", take_first(&obj, &["path", "file_path"]));
+            maybe_insert(
+                &mut out,
+                "old_string",
+                take_first(&obj, &["oldStr", "old_string"]),
+            );
+            maybe_insert(
+                &mut out,
+                "new_string",
+                take_first(&obj, &["newStr", "new_string"]),
+            );
+        }
+        "execute_bash" => {
+            maybe_insert(&mut out, "command", take_first(&obj, &["command"]));
+            maybe_insert(&mut out, "timeout", take_first(&obj, &["timeout"]));
+        }
+        "read_file" => {
+            maybe_insert(&mut out, "file_path", take_first(&obj, &["path", "file_path"]));
+            let start = obj.get("start_line").and_then(optional_number);
+            let end = obj.get("end_line").and_then(optional_number);
+            if let Some(start) = start {
+                out.insert("offset".to_string(), serde_json::json!(start));
+            }
+            if let Some(end) = end {
+                let limit = start.map(|s| end - s + 1).unwrap_or(end);
+                if limit > 0 {
+                    out.insert("limit".to_string(), serde_json::json!(limit));
+                }
+            }
+        }
+        "file_search" => {
+            maybe_insert(&mut out, "pattern", take_first(&obj, &["query", "pattern"]));
+        }
+        "grep_search" => {
+            maybe_insert(&mut out, "pattern", take_first(&obj, &["query", "pattern"]));
+            maybe_insert(&mut out, "glob", take_first(&obj, &["includePattern", "glob"]));
+            maybe_insert(
+                &mut out,
+                "case_sensitive",
+                take_first(&obj, &["caseSensitive", "case_sensitive"]),
+            );
+        }
+        "list_directory" => {
+            maybe_insert(&mut out, "path", take_first(&obj, &["path"]));
+        }
+        "web_search" => {
+            maybe_insert(&mut out, "query", take_first(&obj, &["query"]));
+        }
+        _ => return serde_json::Value::Object(obj),
+    }
+    serde_json::Value::Object(out)
+}
+
+/// 入站还原工具名 + 入参给客户端。名字从 `tool_name_map`（kiro名→客户端名）还原；
+/// 入参按 kiro_name 反向重写（对非内置 / 长名缩短是 no-op）。
+pub fn restore_tool_use_for_client(
+    kiro_name: &str,
+    input: serde_json::Value,
+    tool_name_map: &HashMap<String, String>,
+) -> (String, serde_json::Value) {
+    let client_name = tool_name_map
+        .get(kiro_name)
+        .cloned()
+        .unwrap_or_else(|| kiro_name.to_string());
+    let client_input = map_tool_input_from_kiro(kiro_name, input);
+    (client_name, client_input)
+}
+
+fn optional_schema(schema: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({ "anyOf": [schema, {"type": "null"}] })
+}
+
+/// Kiro 内置工具的描述（含防截断后缀）。
+fn kiro_builtin_tool_description(kiro_name: &str, fallback: &str) -> String {
+    match kiro_name {
+        "fs_write" => format!(
+            "Write text content to a file.\n{}",
+            WRITE_TOOL_DESCRIPTION_SUFFIX
+        ),
+        "str_replace" => format!(
+            "Replace an exact string in a file.\n{}",
+            EDIT_TOOL_DESCRIPTION_SUFFIX
+        ),
+        "execute_bash" => format!(
+            "Execute the specified bash command.\n{}",
+            BASH_TOOL_DESCRIPTION_SUFFIX
+        ),
+        "read_file" => "Read a single file with optional line range specification.".to_string(),
+        "file_search" => "Search for files by fuzzy file path query.".to_string(),
+        "grep_search" => "Search file contents using a regex pattern.".to_string(),
+        "list_directory" => "List directory contents.".to_string(),
+        "web_search" => "Search the web for up-to-date information.".to_string(),
+        _ if fallback.trim().is_empty() => kiro_name.to_string(),
+        _ => fallback.to_string(),
+    }
+}
+
+/// Kiro 内置工具的硬编码 input schema（Draft-07 子集）。
+fn kiro_builtin_tool_schema(kiro_name: &str) -> Option<serde_json::Value> {
+    Some(match kiro_name {
+        "fs_write" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Absolute path to file."},
+                "text": {"type": "string", "description": "Contents to write into the file."}
+            },
+            "required": ["path", "text"],
+            "additionalProperties": false
+        }),
+        "str_replace" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Absolute path to file."},
+                "oldStr": {"type": "string", "description": "Exact string to replace."},
+                "newStr": {"type": "string", "description": "Replacement string."}
+            },
+            "required": ["path", "oldStr", "newStr"],
+            "additionalProperties": false
+        }),
+        "execute_bash" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "command": {"type": "string", "description": "Bash command to execute."},
+                "timeout": optional_schema(serde_json::json!({"type": "number", "description": "Optional timeout in milliseconds."}))
+            },
+            "required": ["command"],
+            "additionalProperties": false
+        }),
+        "read_file" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Path to file to read."},
+                "start_line": optional_schema(serde_json::json!({"type": "number", "description": "Starting line number."})),
+                "end_line": optional_schema(serde_json::json!({"type": "number", "description": "Ending line number."})),
+                "explanation": {"type": "string", "description": "Why this file is being read."}
+            },
+            "required": ["path", "explanation"],
+            "additionalProperties": false
+        }),
+        "file_search" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Fuzzy filename query."},
+                "explanation": {"type": "string", "description": "Why this search is being performed."},
+                "excludePattern": optional_schema(serde_json::json!({"type": "string", "description": "Glob pattern for files to exclude."})),
+                "includeIgnoredFiles": optional_schema(serde_json::json!({"type": "string", "description": "Whether to include ignored files, yes or no."}))
+            },
+            "required": ["query", "explanation"],
+            "additionalProperties": false
+        }),
+        "grep_search" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "minLength": 1, "description": "Regex pattern to search for."},
+                "caseSensitive": optional_schema(serde_json::json!({"type": "boolean", "description": "Whether the search should be case sensitive."})),
+                "includePattern": optional_schema(serde_json::json!({"type": "string", "description": "Glob pattern for files to include."})),
+                "excludePattern": optional_schema(serde_json::json!({"type": "string", "description": "Glob pattern for files to exclude."})),
+                "explanation": optional_schema(serde_json::json!({"type": "string", "description": "Why this search is being performed."}))
+            },
+            "required": ["query"],
+            "additionalProperties": false
+        }),
+        "list_directory" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Path to directory."},
+                "depth": optional_schema(serde_json::json!({"type": "number", "description": "Depth of recursive listing."})),
+                "explanation": {"type": "string", "description": "Why this directory is being listed."}
+            },
+            "required": ["path", "explanation"],
+            "additionalProperties": false
+        }),
+        "web_search" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Search query."}
+            },
+            "required": ["query"],
+            "additionalProperties": false
+        }),
+        _ => return None,
+    })
+}
+
+fn convert_tools(
+    tools: &Option<Vec<super::types::Tool>>,
+    tool_name_map: &mut HashMap<String, String>,
+    mode: ToolCompatibilityMode,
+) -> Result<Vec<Tool>, ConversionError> {
+    let Some(tools) = tools else {
+        return Ok(Vec::new());
+    };
+
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+
+    for t in tools {
+        // ClaudeCode 模式隐藏 Kiro 不支持的 fs_append。
+        if is_claude_code_mode(mode) && t.name == "fs_append" {
+            tracing::debug!("Claude Code 兼容模式隐藏 fs_append 工具");
+            continue;
+        }
+
+        let mapped_name = map_client_tool_name_to_kiro(&t.name, tool_name_map, mode);
+        // 按小写名去重（Kiro 工具名大小写不敏感），首个出现者胜出。
+        if !seen.insert(mapped_name.to_lowercase()) {
+            tracing::debug!("跳过重复的映射工具名: {}", mapped_name);
+            continue;
+        }
+
+        let is_builtin =
+            is_claude_code_mode(mode) && claude_code_tool_name_to_kiro(&t.name).is_some();
+
+        let description = if is_builtin {
+            kiro_builtin_tool_description(&mapped_name, &t.description)
+        } else {
+            let mut description = t.description.clone();
+            // 非内置（或 Raw 模式）：保留旧的 Write/Edit/Bash 后缀（按原始名匹配）。
             let suffix = match t.name.as_str() {
                 "Write" => WRITE_TOOL_DESCRIPTION_SUFFIX,
                 "Edit" => EDIT_TOOL_DESCRIPTION_SUFFIX,
+                "Bash" => BASH_TOOL_DESCRIPTION_SUFFIX,
                 _ => "",
             };
             if !suffix.is_empty() {
                 description.push('\n');
                 description.push_str(suffix);
             }
-
             // kiro API 不接受空描述，填充占位符
-            let description = if description.trim().is_empty() {
+            if description.trim().is_empty() {
                 t.name.clone()
             } else {
                 description
-            };
-
-            // 限制描述长度为 10000 字符（安全截断 UTF-8，单次遍历）
-            let description = match description.char_indices().nth(10000) {
-                Some((idx, _)) => description[..idx].to_string(),
-                None => description,
-            };
-
-            Tool {
-                tool_specification: ToolSpecification {
-                    name: map_tool_name(&t.name, tool_name_map),
-                    description,
-                    input_schema: InputSchema::from_json(normalize_json_schema(serde_json::json!(t.input_schema))),
-                },
             }
-        })
-        .collect()
+        };
+
+        // 限制描述长度为 10000 字符（安全截断 UTF-8，单次遍历）
+        let description = match description.char_indices().nth(10000) {
+            Some((idx, _)) => description[..idx].to_string(),
+            None => description,
+        };
+
+        let schema = if is_builtin {
+            kiro_builtin_tool_schema(&mapped_name).ok_or_else(|| {
+                ConversionError::UnsupportedToolMapping(format!(
+                    "{} 无法映射到 Kiro 工具 schema",
+                    t.name
+                ))
+            })?
+        } else {
+            normalize_json_schema(serde_json::json!(t.input_schema))
+        };
+
+        out.push(Tool {
+            tool_specification: ToolSpecification {
+                name: mapped_name,
+                description,
+                input_schema: InputSchema::from_json(schema),
+            },
+        });
+    }
+
+    Ok(out)
 }
 
 /// 生成thinking标签前缀
@@ -1144,7 +1640,7 @@ fn has_thinking_tags(content: &str) -> bool {
 ///   注意：该切片与 `req.messages` 可能不同（prefill 时会截断末尾的 assistant 消息），
 ///   调用方应始终使用此参数而非 `req.messages`。
 /// * `model_id` - 已映射的 Kiro 模型 ID
-fn build_history(req: &MessagesRequest, messages: &[super::types::Message], model_id: &str, tool_name_map: &mut HashMap<String, String>) -> Result<Vec<Message>, ConversionError> {
+fn build_history(req: &MessagesRequest, messages: &[super::types::Message], model_id: &str, tool_name_map: &mut HashMap<String, String>, mode: ToolCompatibilityMode) -> Result<Vec<Message>, ConversionError> {
     let mut history = Vec::new();
 
     // 生成thinking前缀（如果需要）
@@ -1206,7 +1702,7 @@ fn build_history(req: &MessagesRequest, messages: &[super::types::Message], mode
         if msg.role == "user" {
             // 先处理累积的 assistant 消息
             if !assistant_buffer.is_empty() {
-                let merged = merge_assistant_messages(&assistant_buffer, tool_name_map)?;
+                let merged = merge_assistant_messages(&assistant_buffer, tool_name_map, mode)?;
                 history.push(Message::Assistant(merged));
                 assistant_buffer.clear();
             }
@@ -1225,7 +1721,7 @@ fn build_history(req: &MessagesRequest, messages: &[super::types::Message], mode
 
     // 处理末尾累积的 assistant 消息
     if !assistant_buffer.is_empty() {
-        let merged = merge_assistant_messages(&assistant_buffer, tool_name_map)?;
+        let merged = merge_assistant_messages(&assistant_buffer, tool_name_map, mode)?;
         history.push(Message::Assistant(merged));
     }
 
@@ -1285,6 +1781,7 @@ fn merge_user_messages(
 fn convert_assistant_message(
     msg: &super::types::Message,
     tool_name_map: &mut HashMap<String, String>,
+    mode: ToolCompatibilityMode,
 ) -> Result<HistoryAssistantMessage, ConversionError> {
     let mut thinking_content = String::new();
     let mut text_content = String::new();
@@ -1311,8 +1808,11 @@ fn convert_assistant_message(
                         "tool_use" => {
                             if let (Some(id), Some(name)) = (block.id, block.name) {
                                 let input = block.input.unwrap_or(serde_json::json!({}));
-                                let mapped_name = map_tool_name(&name, tool_name_map);
-                                tool_uses.push(ToolUseEntry::new(id, mapped_name).with_input(input));
+                                let mapped_name =
+                                    map_client_tool_name_to_kiro(&name, tool_name_map, mode);
+                                let input = map_tool_input_to_kiro(&name, input, mode)?;
+                                tool_uses
+                                    .push(ToolUseEntry::new(id, mapped_name).with_input(input));
                             }
                         }
                         _ => {}
@@ -1356,17 +1856,18 @@ fn convert_assistant_message(
 fn merge_assistant_messages(
     messages: &[&super::types::Message],
     tool_name_map: &mut HashMap<String, String>,
+    mode: ToolCompatibilityMode,
 ) -> Result<HistoryAssistantMessage, ConversionError> {
     assert!(!messages.is_empty());
     if messages.len() == 1 {
-        return convert_assistant_message(messages[0], tool_name_map);
+        return convert_assistant_message(messages[0], tool_name_map, mode);
     }
 
     let mut all_tool_uses: Vec<ToolUseEntry> = Vec::new();
     let mut content_parts: Vec<String> = Vec::new();
 
     for msg in messages {
-        let converted = convert_assistant_message(msg, tool_name_map)?;
+        let converted = convert_assistant_message(msg, tool_name_map, mode)?;
         let am = converted.assistant_response_message;
         if !am.content.trim().is_empty() {
             content_parts.push(am.content);
@@ -1759,6 +2260,109 @@ mod tests {
         );
     }
 
+    // ---- Fix 3: 原生 thinking effort 下发拓宽 + budget 推导 ----
+
+    #[test]
+    fn effort_from_budget_tokens_maps_tiers() {
+        assert_eq!(effort_from_budget_tokens(2_000), "low");
+        assert_eq!(effort_from_budget_tokens(4_000), "low");
+        assert_eq!(effort_from_budget_tokens(10_000), "medium");
+        assert_eq!(effort_from_budget_tokens(16_000), "medium");
+        assert_eq!(effort_from_budget_tokens(20_000), "high");
+        assert_eq!(effort_from_budget_tokens(64_000), "high");
+        assert_eq!(effort_from_budget_tokens(100_000), "xhigh");
+    }
+
+    #[test]
+    fn model_supports_native_reasoning_allows_confirmed_and_5_family() {
+        for m in [
+            "claude-opus-4.6",
+            "claude-opus-4.7",
+            "claude-opus-4.8",
+            "claude-sonnet-4.6",
+            "claude-fable-5",
+            "claude-sonnet-5",
+        ] {
+            assert!(model_supports_native_reasoning(m), "{m} 应支持原生 reasoning");
+        }
+        for m in [
+            "claude-sonnet-4.8",
+            "claude-sonnet-4.5",
+            "claude-opus-4.5",
+            "claude-haiku-4.5",
+        ] {
+            assert!(
+                !model_supports_native_reasoning(m),
+                "{m} 未确认支持，不应下发 output_config"
+            );
+        }
+    }
+
+    #[test]
+    fn enabled_thinking_emits_output_config_for_opus_4_7() {
+        // 标准 Anthropic thinking:{type:"enabled"}（无 output_config）→ 由 budget 推导 effort。
+        let req = minimal_thinking_request("claude-opus-4-7", "enabled");
+        let result = convert_request(&req).unwrap();
+        let fields = result
+            .additional_model_request_fields
+            .expect("opus 4.7 enabled thinking should emit output_config");
+        // 默认 budget_tokens=20000 → high。
+        assert_eq!(fields.output_config.unwrap().effort, "high");
+    }
+
+    #[test]
+    fn enabled_thinking_emits_output_config_for_sonnet_4_6() {
+        let req = minimal_thinking_request("claude-sonnet-4-6", "enabled");
+        let result = convert_request(&req).unwrap();
+        assert!(
+            result.additional_model_request_fields.is_some(),
+            "sonnet 4.6 enabled thinking should emit output_config"
+        );
+    }
+
+    #[test]
+    fn budget_tokens_derive_effort_for_opus_4_8() {
+        use super::super::types::Thinking;
+        let mut req = minimal_thinking_request("claude-opus-4-8", "enabled");
+        req.thinking = Some(Thinking {
+            thinking_type: "enabled".into(),
+            budget_tokens: 3_000,
+        });
+        let result = convert_request(&req).unwrap();
+        assert_eq!(
+            result
+                .additional_model_request_fields
+                .unwrap()
+                .output_config
+                .unwrap()
+                .effort,
+            "low",
+            "budget_tokens=3000 应推导为 low"
+        );
+    }
+
+    #[test]
+    fn disabled_thinking_emits_nothing_even_for_supported_model() {
+        let req = minimal_thinking_request("claude-opus-4-8", "disabled");
+        let result = convert_request(&req).unwrap();
+        assert!(
+            result.additional_model_request_fields.is_none(),
+            "thinking disabled 不应下发任何字段"
+        );
+    }
+
+    #[test]
+    fn explicit_effort_emits_for_fable_5_without_thinking() {
+        // 仅 output_config.effort（无 thinking）在 5 系模型上也算请求了 reasoning。
+        let req = minimal_request_with_effort("claude-fable-5", "xhigh");
+        let result = convert_request(&req).unwrap();
+        let fields = result
+            .additional_model_request_fields
+            .expect("fable-5 显式 effort 应下发");
+        // fable-5 支持 xhigh（model_supports_xhigh_effort），不降级。
+        assert_eq!(fields.output_config.unwrap().effort, "xhigh");
+    }
+
     #[test]
     fn test_determine_chat_trigger_type() {
         // 无工具时返回 MANUAL
@@ -1853,6 +2457,213 @@ mod tests {
         let result = map_tool_name(long_name, &mut map);
         assert!(result.len() <= TOOL_NAME_MAX_LEN);
         assert_eq!(map.get(&result), Some(&long_name.to_string()));
+    }
+
+    // ---- Tool Call 双向兼容（ClaudeCode 内置工具名/入参映射）----
+
+    fn cc_tool(name: &str) -> super::super::types::Tool {
+        let mut schema = std::collections::BTreeMap::new();
+        schema.insert("type".to_string(), serde_json::json!("object"));
+        schema.insert("properties".to_string(), serde_json::json!({}));
+        super::super::types::Tool {
+            name: name.to_string(),
+            description: String::new(),
+            input_schema: schema,
+            tool_type: None,
+            max_uses: None,
+            cache_control: None,
+        }
+    }
+
+    #[test]
+    fn cc_builtin_name_table() {
+        assert_eq!(claude_code_tool_name_to_kiro("Write"), Some("fs_write"));
+        assert_eq!(claude_code_tool_name_to_kiro("Edit"), Some("str_replace"));
+        assert_eq!(claude_code_tool_name_to_kiro("Bash"), Some("execute_bash"));
+        assert_eq!(claude_code_tool_name_to_kiro("Read"), Some("read_file"));
+        assert_eq!(claude_code_tool_name_to_kiro("Glob"), Some("file_search"));
+        assert_eq!(claude_code_tool_name_to_kiro("Grep"), Some("grep_search"));
+        assert_eq!(claude_code_tool_name_to_kiro("LS"), Some("list_directory"));
+        assert_eq!(claude_code_tool_name_to_kiro("WebSearch"), Some("web_search"));
+        assert_eq!(claude_code_tool_name_to_kiro("MyTool"), None);
+    }
+
+    #[test]
+    fn cc_kiro_builtin_schema_covers_all_eight() {
+        for k in [
+            "fs_write",
+            "str_replace",
+            "execute_bash",
+            "read_file",
+            "file_search",
+            "grep_search",
+            "list_directory",
+            "web_search",
+        ] {
+            assert!(kiro_builtin_tool_schema(k).is_some(), "{k} 应有内置 schema");
+        }
+        assert!(kiro_builtin_tool_schema("fs_append").is_none());
+    }
+
+    #[test]
+    fn cc_convert_tools_maps_names_hides_fs_append_and_dedups() {
+        let mut map = HashMap::new();
+        // Write 与 fs_write 都映射/命中 fs_write（小写去重）；fs_append 被隐藏。
+        let tools = Some(vec![
+            cc_tool("Write"),
+            cc_tool("Read"),
+            cc_tool("fs_append"),
+            cc_tool("fs_write"),
+        ]);
+        let out = convert_tools(&tools, &mut map, ToolCompatibilityMode::ClaudeCode).unwrap();
+        let names: Vec<&str> = out
+            .iter()
+            .map(|t| t.tool_specification.name.as_str())
+            .collect();
+        assert!(names.contains(&"fs_write"), "Write 应映射为 fs_write");
+        assert!(names.contains(&"read_file"), "Read 应映射为 read_file");
+        assert!(!names.contains(&"fs_append"), "fs_append 应被隐藏");
+        assert_eq!(
+            names.iter().filter(|n| **n == "fs_write").count(),
+            1,
+            "Write 与 fs_write 应按小写去重为一个"
+        );
+        assert_eq!(map.get("read_file").map(|s| s.as_str()), Some("Read"));
+    }
+
+    #[test]
+    fn cc_convert_tools_substitutes_builtin_schema() {
+        let mut map = HashMap::new();
+        let out = convert_tools(
+            &Some(vec![cc_tool("Write")]),
+            &mut map,
+            ToolCompatibilityMode::ClaudeCode,
+        )
+        .unwrap();
+        // 硬编码 fs_write schema：包含 path/text。
+        let s = serde_json::to_string(&out[0]).unwrap();
+        assert!(s.contains("\"path\""), "内置 schema 应含 path");
+        assert!(s.contains("\"text\""), "内置 schema 应含 text");
+    }
+
+    #[test]
+    fn cc_raw_mode_keeps_client_tool_names() {
+        let mut map = HashMap::new();
+        let out = convert_tools(
+            &Some(vec![cc_tool("Write")]),
+            &mut map,
+            ToolCompatibilityMode::Raw,
+        )
+        .unwrap();
+        assert_eq!(out[0].tool_specification.name, "Write", "Raw 模式不改名");
+        assert!(map.is_empty(), "Raw 模式不记录内置映射");
+    }
+
+    #[test]
+    fn cc_outbound_input_write_and_read() {
+        let out = map_tool_input_to_kiro(
+            "Write",
+            serde_json::json!({"file_path": "/a.txt", "content": "hi"}),
+            ToolCompatibilityMode::ClaudeCode,
+        )
+        .unwrap();
+        assert_eq!(out, serde_json::json!({"path": "/a.txt", "text": "hi"}));
+
+        let read = map_tool_input_to_kiro(
+            "Read",
+            serde_json::json!({"file_path": "/a", "offset": 10, "limit": 5}),
+            ToolCompatibilityMode::ClaudeCode,
+        )
+        .unwrap();
+        assert_eq!(read["path"], serde_json::json!("/a"));
+        assert_eq!(read["start_line"], serde_json::json!(10));
+        assert_eq!(read["end_line"], serde_json::json!(14)); // 10 + 5 - 1
+        assert!(read.get("explanation").is_some(), "Read 缺省注入 explanation");
+    }
+
+    #[test]
+    fn cc_outbound_read_pages_errors() {
+        let err = map_tool_input_to_kiro(
+            "Read",
+            serde_json::json!({"file_path": "/a", "pages": "1-3"}),
+            ToolCompatibilityMode::ClaudeCode,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ConversionError::UnsupportedToolMapping(_)));
+    }
+
+    #[test]
+    fn cc_raw_mode_input_passthrough() {
+        let input = serde_json::json!({"file_path": "/a.txt", "content": "hi"});
+        let out = map_tool_input_to_kiro("Write", input.clone(), ToolCompatibilityMode::Raw).unwrap();
+        assert_eq!(out, input, "Raw 模式入参原样透传");
+    }
+
+    #[test]
+    fn cc_roundtrip_write_out_then_in() {
+        let client = serde_json::json!({"file_path": "/a.txt", "content": "hello"});
+        let kiro =
+            map_tool_input_to_kiro("Write", client.clone(), ToolCompatibilityMode::ClaudeCode)
+                .unwrap();
+        assert_eq!(kiro, serde_json::json!({"path": "/a.txt", "text": "hello"}));
+        let mut map = HashMap::new();
+        map.insert("fs_write".to_string(), "Write".to_string());
+        let (name, restored) = restore_tool_use_for_client("fs_write", kiro, &map);
+        assert_eq!(name, "Write");
+        assert_eq!(restored, client, "出入站往返应还原客户端入参");
+    }
+
+    #[test]
+    fn cc_inbound_restore_read_file() {
+        let mut map = HashMap::new();
+        map.insert("read_file".to_string(), "Read".to_string());
+        let (name, restored) = restore_tool_use_for_client(
+            "read_file",
+            serde_json::json!({"path": "/a", "start_line": 10, "end_line": 14}),
+            &map,
+        );
+        assert_eq!(name, "Read");
+        assert_eq!(restored["file_path"], serde_json::json!("/a"));
+        assert_eq!(restored["offset"], serde_json::json!(10));
+        assert_eq!(restored["limit"], serde_json::json!(5)); // 14 - 10 + 1
+    }
+
+    /// 优化点回归：入站还原以 **Kiro 名** 匹配，故 Raw 模式下客户端自带、恰好叫
+    /// "Read" 的工具，其入参不会被误改写（tool_name_map 无该条目，"Read" 非 Kiro 内置名）。
+    #[test]
+    fn cc_inbound_restore_keyed_on_kiro_name_not_client_name() {
+        let map = HashMap::new();
+        let input = serde_json::json!({"offset": 3, "custom_field": true});
+        let (name, restored) = restore_tool_use_for_client("Read", input.clone(), &map);
+        assert_eq!(name, "Read");
+        assert_eq!(
+            restored, input,
+            "客户端自带 Read 工具在 Raw 下入参必须原样保留（不被误映射）"
+        );
+    }
+
+    #[test]
+    fn cc_convert_request_default_maps_builtin_names() {
+        use super::super::types::Message as AnthropicMessage;
+        let req = MessagesRequest {
+            model: "claude-sonnet-4.5".to_string(),
+            max_tokens: 1024,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("hi"),
+            }],
+            system: None,
+            stream: false,
+            tools: Some(vec![cc_tool("Write"), cc_tool("Read")]),
+            thinking: None,
+            tool_choice: None,
+            output_config: None,
+            metadata: None,
+        };
+        // convert_request 测试垫片默认 ClaudeCode 模式。
+        let result = convert_request(&req).unwrap();
+        assert_eq!(result.tool_name_map.get("fs_write").map(|s| s.as_str()), Some("Write"));
+        assert_eq!(result.tool_name_map.get("read_file").map(|s| s.as_str()), Some("Read"));
     }
 
     #[test]
@@ -2425,7 +3236,7 @@ mod tests {
             ]),
         };
 
-        let result = convert_assistant_message(&msg, &mut HashMap::new()).expect("应该成功转换");
+        let result = convert_assistant_message(&msg, &mut HashMap::new(), ToolCompatibilityMode::Raw).expect("应该成功转换");
 
         // 验证 content 不为空（使用占位符）
         assert!(
@@ -2460,7 +3271,7 @@ mod tests {
             ]),
         };
 
-        let result = convert_assistant_message(&msg, &mut HashMap::new()).expect("应该成功转换");
+        let result = convert_assistant_message(&msg, &mut HashMap::new(), ToolCompatibilityMode::Raw).expect("应该成功转换");
 
         // 验证 content 使用原始文本（不是占位符）
         assert_eq!(
@@ -2573,7 +3384,7 @@ mod tests {
         };
 
         let messages: Vec<&AnthropicMessage> = vec![&msg1, &msg2];
-        let result = merge_assistant_messages(&messages, &mut HashMap::new()).expect("合并应成功");
+        let result = merge_assistant_messages(&messages, &mut HashMap::new(), ToolCompatibilityMode::Raw).expect("合并应成功");
 
         let content = &result.assistant_response_message.content;
         assert!(content.contains("<thinking>"), "应包含 thinking 标签");
