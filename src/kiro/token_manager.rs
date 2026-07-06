@@ -1775,7 +1775,13 @@ impl MultiTokenManager {
             None => return Ok(false),
         };
 
-        // 收集所有凭据
+        // 持 persist_lock 覆盖「快照 + 序列化 + 写盘」整个临界区：并发 persist 严格串行，
+        // 最后写盘者必在其临界区内重新快照到最新内存，杜绝陈旧快照覆盖已轮换的 token
+        // （issue #23 根因）。entries.lock 仅在快照期短暂持有、不跨磁盘 I/O，故不阻塞请求路由。
+        // 注：persist_lock 全仓仅此一处获取，且顺序恒为 persist_lock → entries.lock，无死锁。
+        let _write_guard = self.persist_lock.lock();
+
+        // 收集所有凭据（在 persist_lock 保护下拍快照，保证与随后的写盘原子）
         let credentials: Vec<KiroCredentials> = {
             let entries = self.entries.lock();
             entries
@@ -1793,14 +1799,20 @@ impl MultiTokenManager {
         // 序列化为 pretty JSON
         let json = serde_json::to_string_pretty(&credentials).context("序列化凭据失败")?;
 
-        // 写入文件（在 Tokio runtime 内使用 block_in_place 避免阻塞 worker）
-        // 持 persist_lock 串行化整文件覆写，避免批量导入等并发场景下写盘互相踩踏。
-        let _write_guard = self.persist_lock.lock();
-        if tokio::runtime::Handle::try_current().is_ok() {
-            tokio::task::block_in_place(|| std::fs::write(path, &json))
-                .with_context(|| format!("回写凭据文件失败: {:?}", path))?;
+        // 原子落盘：先写临时文件再 rename（同目录 rename 原子），避免崩溃 / 并发导致半截文件。
+        let tmp = path.with_extension("json.tmp");
+        let write_atomic = || -> std::io::Result<()> {
+            std::fs::write(&tmp, &json)?;
+            std::fs::rename(&tmp, path)
+        };
+        let write_result = if tokio::runtime::Handle::try_current().is_ok() {
+            tokio::task::block_in_place(write_atomic)
         } else {
-            std::fs::write(path, &json).with_context(|| format!("回写凭据文件失败: {:?}", path))?;
+            write_atomic()
+        };
+        if let Err(e) = write_result {
+            let _ = std::fs::remove_file(&tmp); // 清理可能残留的临时文件
+            return Err(e).with_context(|| format!("回写凭据文件失败: {:?}", path));
         }
 
         tracing::debug!("已回写凭据到文件: {:?}", path);
@@ -4849,6 +4861,37 @@ mod tests {
         let actual_id = manager.snapshot().entries[0].id;
         let reloaded = manager.try_reload_credential_from_file(actual_id);
         assert!(reloaded, "单凭据无 ID 时仍应能匹配并 reload");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// issue #23 修复：persist_credentials 原子落盘——写盘成功、内容为合法 JSON、
+    /// 且不残留临时文件（tmp+rename）。
+    #[test]
+    fn persist_credentials_writes_atomically_no_tmp_residue() {
+        let path = tmp_creds_path("persist_atomic");
+        let mut cred = KiroCredentials::default();
+        cred.id = Some(1);
+        cred.refresh_token = Some("tok_aaaa".repeat(5));
+        std::fs::write(&path, serde_json::to_vec_pretty(&[&cred]).unwrap()).unwrap();
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![cred],
+            None,
+            Some(path.clone()),
+            true,
+        )
+        .unwrap();
+
+        assert!(manager.persist_credentials().unwrap(), "persist 应写盘成功");
+
+        // 文件为合法 JSON 数组
+        let content = std::fs::read_to_string(&path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert!(parsed.is_array(), "凭据文件应为 JSON 数组");
+        // 原子落盘后不应残留临时文件
+        let tmp = path.with_extension("json.tmp");
+        assert!(!tmp.exists(), "原子落盘后不应残留临时文件");
 
         let _ = std::fs::remove_file(&path);
     }
