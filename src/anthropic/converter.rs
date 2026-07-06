@@ -40,9 +40,26 @@ fn normalize_json_schema(schema: serde_json::Value) -> serde_json::Value {
     // 移除 $schema（kiro API 不接受此字段，且 Draft 2020-12 声明会触发校验失败）
     obj.remove("$schema");
 
-    // type（必须是字符串）
-    if !obj.get("type").and_then(|v| v.as_str()).is_some_and(|s| !s.is_empty()) {
-        obj.insert("type".to_string(), serde_json::Value::String("object".to_string()));
+    // 剥离顶层 oneOf/allOf/anyOf：Bedrock/Kiro 的 ToolInputSchema 不支持顶层组合关键字，
+    // 否则返回 TOOL_SCHEMA_INVALID 400（常见于 Claude Code workflow 并行子代理携带的 MCP tools）。
+    strip_top_level_combinators(&mut obj);
+
+    // type 顶层必须是 "object"（Bedrock ToolInputSchema 硬约束）；非 object 一律强制修正。
+    let current_type = obj
+        .get("type")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    if current_type.as_deref() != Some("object") {
+        if let Some(ref original) = current_type {
+            tracing::warn!(
+                original_type = %original,
+                "tool inputSchema 顶层 type 不是 object，已强制修正（Bedrock 硬约束）"
+            );
+        }
+        obj.insert(
+            "type".to_string(),
+            serde_json::Value::String("object".to_string()),
+        );
     }
 
     // properties（必须是 object）；递归规范化每个 property 的子 schema
@@ -75,6 +92,42 @@ fn normalize_json_schema(schema: serde_json::Value) -> serde_json::Value {
     }
 
     serde_json::Value::Object(obj)
+}
+
+/// 剥离顶层 `oneOf`/`anyOf`/`allOf`，并尽量从 variant 中恢复语义字段。
+///
+/// Bedrock/Kiro 的 ToolInputSchema 不支持顶层组合关键字（AWS 文档 + Anthropic API 均如此）。
+/// 若原 schema 没有 `properties`，则遍历各 combinator，取第一个 `type=object` 的 variant，
+/// 提取其 `properties`/`required`/`additionalProperties`/`description`（避免退化成空对象丢掉全部入参）。
+fn strip_top_level_combinators(obj: &mut serde_json::Map<String, serde_json::Value>) {
+    let has_properties_initially = obj.contains_key("properties");
+
+    for combinator in &["oneOf", "anyOf", "allOf"] {
+        let Some(serde_json::Value::Array(variants)) = obj.remove(*combinator) else {
+            continue;
+        };
+
+        // 原始 schema 已有 properties，或前一个 combinator 已提取过 → 纯剥离，不再恢复。
+        if has_properties_initially || obj.contains_key("properties") {
+            continue;
+        }
+
+        // 从 variants 中找第一个 type=object 的变体，提取关键字段。
+        for variant in variants {
+            let serde_json::Value::Object(m) = variant else {
+                continue;
+            };
+            if m.get("type").and_then(|v| v.as_str()) != Some("object") {
+                continue;
+            }
+            for key in &["properties", "required", "additionalProperties", "description"] {
+                if let Some(val) = m.get(*key) {
+                    obj.entry(key.to_string()).or_insert_with(|| val.clone());
+                }
+            }
+            break;
+        }
+    }
 }
 
 /// 规范化 property 级别的子 schema（非顶层 inputSchema）
@@ -2361,6 +2414,44 @@ mod tests {
             .expect("fable-5 显式 effort 应下发");
         // fable-5 支持 xhigh（model_supports_xhigh_effort），不降级。
         assert_eq!(fields.output_config.unwrap().effort, "xhigh");
+    }
+
+    // ---- normalize_json_schema: 顶层 type / 组合关键字（PR#6）----
+
+    #[test]
+    fn normalize_schema_forces_top_level_type_object() {
+        let s = normalize_json_schema(serde_json::json!({
+            "type": "array",
+            "items": {"type": "string"}
+        }));
+        assert_eq!(s["type"], "object", "顶层 type 非 object 应被强制修正");
+    }
+
+    #[test]
+    fn normalize_schema_strips_top_level_oneof_and_recovers_fields() {
+        let s = normalize_json_schema(serde_json::json!({
+            "oneOf": [
+                {"type": "object", "properties": {"locs": {"type": "array"}}, "required": ["locs"]},
+                {"type": "object", "properties": {"labels": {"type": "array"}}, "required": ["labels"]}
+            ]
+        }));
+        assert_eq!(s["type"], "object");
+        assert!(s.get("oneOf").is_none(), "顶层 oneOf 应被剥离");
+        assert!(
+            s["properties"].get("locs").is_some(),
+            "应从首个 object variant 恢复 properties"
+        );
+        assert_eq!(s["required"], serde_json::json!(["locs"]));
+    }
+
+    #[test]
+    fn normalize_schema_strips_top_level_anyof_without_object_variant() {
+        let s = normalize_json_schema(serde_json::json!({
+            "anyOf": [{"type": "string"}, {"type": "number"}]
+        }));
+        assert_eq!(s["type"], "object");
+        assert!(s.get("anyOf").is_none());
+        assert_eq!(s["properties"], serde_json::json!({}));
     }
 
     #[test]
