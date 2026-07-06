@@ -433,6 +433,27 @@ export interface OverviewStats {
   weekCredits: number
   activeClientKeys: number
   activeCredentials: number
+  traffic?: TrafficStats
+}
+
+export interface TrafficModelStats {
+  model: string
+  requestsLast5m: number
+  currentConcurrent: number
+}
+
+export interface TrafficStats {
+  currentConcurrent: number
+  peakConcurrent60s: number
+  peakConcurrent5m: number
+  requestsLast60s: number
+  requestsLast5m: number
+  streamingRequestsLast5m: number
+  qpsLast60s: number
+  qpsLast5m: number
+  topModelsLast5m: TrafficModelStats[]
+  totalStarted: number
+  updatedAt: string
 }
 
 export interface TimeSeriesPoint {

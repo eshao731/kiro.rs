@@ -17,6 +17,7 @@ use crate::common::auth;
 use crate::kiro::provider::KiroProvider;
 
 use super::cache_metering::SharedCacheMeter;
+use super::traffic_metrics::{SharedTrafficMetrics, global_traffic_metrics};
 use super::types::ErrorResponse;
 
 /// 命中的鉴权上下文（注入到请求扩展，供 handler 记录用量）
@@ -48,6 +49,8 @@ pub struct AppState {
     pub cache_meter: Option<SharedCacheMeter>,
     /// 请求链路追踪存储（SQLite，可选）
     pub trace_store: Option<SharedTraceStore>,
+    /// 入口流量观测（QPS / 并发）
+    pub traffic_metrics: SharedTrafficMetrics,
 }
 
 impl AppState {
@@ -62,6 +65,7 @@ impl AppState {
             usage_aggregator: None,
             cache_meter: None,
             trace_store: None,
+            traffic_metrics: global_traffic_metrics(),
         }
     }
 

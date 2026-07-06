@@ -15,6 +15,7 @@ import type {
   StatsRange,
   StatsTimeFilter,
   TimeSeriesPoint,
+  TrafficStats,
 } from '@/types/api'
 import { TimeSeriesChart } from '@/components/charts/time-series-chart'
 import { ModelPieChart } from '@/components/charts/model-pie-chart'
@@ -99,6 +100,7 @@ export function OverviewPage() {
         stats={rangeStats}
         timeText={timeLabel(filters.timeFilter)}
       />
+      <TrafficPanel traffic={overview?.traffic} />
       <KeyFilterCard
         keyFilter={filters.keyFilter}
         keys={keysData?.keys ?? []}
@@ -270,6 +272,105 @@ function StatsCards({
         <StatCard key={card.label} meta={card.meta ?? timeText} {...card} />
       ))}
     </div>
+  )
+}
+
+function formatQps(value: number | undefined): string {
+  return (value ?? 0).toLocaleString('zh-CN', {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  })
+}
+
+function TrafficPanel({ traffic }: { traffic?: TrafficStats }) {
+  const topModels = traffic?.topModelsLast5m ?? []
+  const items = [
+    {
+      label: '当前并发',
+      value: formatNumber(traffic?.currentConcurrent ?? 0),
+      meta: '实时 in-flight',
+    },
+    {
+      label: '峰值并发',
+      value: formatNumber(traffic?.peakConcurrent5m ?? 0),
+      meta: '近 5 分钟',
+    },
+    {
+      label: 'QPS 1m',
+      value: formatQps(traffic?.qpsLast60s),
+      meta: `${formatNumber(traffic?.requestsLast60s ?? 0)} 次`,
+    },
+    {
+      label: 'QPS 5m',
+      value: formatQps(traffic?.qpsLast5m),
+      meta: `${formatNumber(traffic?.requestsLast5m ?? 0)} 次 · 流式 ${formatNumber(
+        traffic?.streamingRequestsLast5m ?? 0,
+      )}`,
+    },
+  ]
+
+  return (
+    <Card className="mb-6">
+      <CardContent className="p-4 sm:p-5">
+        <div className="mb-4 flex flex-col gap-1 sm:flex-row sm:items-center sm:justify-between">
+          <div>
+            <h2 className="text-base font-semibold tracking-tight">实时流量</h2>
+            <p className="text-[12px] text-muted-foreground">入口 QPS、并发与近 5 分钟模型分布</p>
+          </div>
+          <span className="inline-flex items-center gap-1 text-[11px] text-muted-foreground">
+            <Activity className="h-3 w-3" />
+            累计 {formatNumber(traffic?.totalStarted ?? 0)}
+          </span>
+        </div>
+        <div className="grid gap-3 lg:grid-cols-[minmax(0,1fr)_minmax(280px,0.85fr)]">
+          <div className="grid grid-cols-2 gap-2 max-[360px]:grid-cols-1 sm:grid-cols-4">
+            {items.map((item) => (
+              <div key={item.label} className="rounded-md border border-border/60 px-3 py-2.5">
+                <div className="text-[11px] text-muted-foreground">{item.label}</div>
+                <div className="mt-1 text-xl font-semibold tabular-nums leading-none">{item.value}</div>
+                <div className="mt-1 truncate text-[11px] text-muted-foreground">{item.meta}</div>
+              </div>
+            ))}
+          </div>
+          <div className="min-w-0 rounded-md border border-border/60 px-3 py-2.5">
+            <div className="mb-2 flex items-center justify-between gap-2">
+              <span className="text-[12px] font-medium">Top 模型</span>
+              <span className="text-[11px] text-muted-foreground">近 5 分钟</span>
+            </div>
+            {topModels.length > 0 ? (
+              <div className="max-h-32 overflow-auto text-[12px]">
+                <table className="w-full min-w-[320px]">
+                  <thead className="text-muted-foreground">
+                    <tr>
+                      <th className="pb-1 text-left font-medium">模型</th>
+                      <th className="pb-1 text-right font-medium">调用</th>
+                      <th className="pb-1 text-right font-medium">并发</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {topModels.map((model) => (
+                      <tr key={model.model} className="border-t border-border/40">
+                        <td className="max-w-[180px] truncate py-1">{model.model}</td>
+                        <td className="py-1 text-right tabular-nums">
+                          {formatNumber(model.requestsLast5m)}
+                        </td>
+                        <td className="py-1 text-right tabular-nums">
+                          {formatNumber(model.currentConcurrent)}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            ) : (
+              <div className="flex h-[72px] items-center justify-center rounded-md bg-muted/30 text-[12px] text-muted-foreground">
+                暂无近 5 分钟请求
+              </div>
+            )}
+          </div>
+        </div>
+      </CardContent>
+    </Card>
   )
 }
 

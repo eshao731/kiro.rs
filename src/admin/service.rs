@@ -580,6 +580,7 @@ impl AdminService {
                     proxy_url: entry.proxy_url,
                     refresh_failure_count: entry.refresh_failure_count,
                     disabled_reason: entry.disabled_reason,
+                    throttled_remaining_secs: entry.throttled_remaining_secs,
                     endpoint: entry.endpoint.unwrap_or_else(|| default_endpoint.clone()),
                     groups: entry.groups,
                     source_channel: entry.source_channel,

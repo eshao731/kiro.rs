@@ -28,6 +28,7 @@ mod middleware;
 pub mod cache_metering;
 mod router;
 pub mod stream;
+pub mod traffic_metrics;
 pub mod types;
 mod websearch;
 mod websearch_loop;

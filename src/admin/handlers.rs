@@ -1221,6 +1221,7 @@ fn stats_bad_request(message: String) -> axum::response::Response {
 /// GET /api/admin/stats/overview
 pub async fn stats_overview(State(state): State<AdminState>) -> impl IntoResponse {
     let overview = state.usage_aggregator.overview();
+    let traffic = crate::anthropic::traffic_metrics::global_traffic_metrics().snapshot();
     // 附加：当前活跃 Key / 凭据数
     let active_keys = state.client_keys.active_count() as u64;
     let snapshot = state.service.get_all_credentials();
@@ -1237,6 +1238,7 @@ pub async fn stats_overview(State(state): State<AdminState>) -> impl IntoRespons
         "weekCredits": overview.week_credits,
         "activeClientKeys": active_keys,
         "activeCredentials": active_credentials,
+        "traffic": traffic,
     });
     Json(response)
 }
