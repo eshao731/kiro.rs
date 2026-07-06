@@ -40,6 +40,8 @@ interface KamAccount {
     clientId?: string
     clientSecret?: string
     region?: string
+    authRegion?: string
+    apiRegion?: string
     authMethod?: string
     provider?: string
     startUrl?: string
@@ -108,6 +110,8 @@ function normalizeKamAccount(item: unknown): unknown {
     const clientId = typeof obj.clientId === 'string' ? obj.clientId : undefined
     const clientSecret = typeof obj.clientSecret === 'string' ? obj.clientSecret : undefined
     const region = typeof obj.region === 'string' ? obj.region : undefined
+    const authRegion = typeof obj.authRegion === 'string' ? obj.authRegion : undefined
+    const apiRegion = typeof obj.apiRegion === 'string' ? obj.apiRegion : undefined
     const authMethod = typeof obj.authMethod === 'string' ? obj.authMethod : undefined
     const provider = typeof obj.provider === 'string' ? obj.provider : undefined
     const startUrl = typeof obj.startUrl === 'string' ? obj.startUrl : undefined
@@ -130,6 +134,8 @@ function normalizeKamAccount(item: unknown): unknown {
         clientId,
         clientSecret,
         region,
+        authRegion,
+        apiRegion,
         authMethod,
         provider,
         startUrl,
@@ -419,7 +425,8 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
             expiresAt: normalizeExpiresAt(cred.expiresAt),
             authMethod,
             provider,
-            authRegion: cred.region?.trim() || undefined,
+            authRegion: cred.authRegion?.trim() || cred.region?.trim() || undefined,
+            apiRegion: cred.apiRegion?.trim() || undefined,
             startUrl: cred.startUrl?.trim() || undefined,
             clientId,
             // external_idp 为公共客户端，不携带 clientSecret

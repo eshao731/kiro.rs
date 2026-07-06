@@ -299,10 +299,11 @@ impl KiroCredentials {
     }
 
     /// 获取有效的 API Region（用于 API 请求）
-    /// 优先级：凭据.api_region > config.api_region > config.region
+    /// 优先级：凭据.api_region > profileArn.region > config.api_region > config.region
     pub fn effective_api_region<'a>(&'a self, config: &'a Config) -> &'a str {
         self.api_region
             .as_deref()
+            .or_else(|| self.effective_profile_arn().and_then(profile_arn_region))
             .unwrap_or(config.effective_api_region())
     }
 
@@ -447,6 +448,17 @@ impl KiroCredentials {
 /// 判断给定 profileArn 是否为 BuilderID 占位符（非真实可用的 profile）。
 pub fn is_placeholder_profile_arn(arn: &str) -> bool {
     arn == BUILDER_ID_PROFILE_ARN
+}
+
+/// 从 CodeWhisperer profile ARN 中提取区域。
+pub fn profile_arn_region(arn: &str) -> Option<&str> {
+    let mut parts = arn.split(':');
+    match (parts.next(), parts.next(), parts.next(), parts.next()) {
+        (Some("arn"), Some(_partition), Some("codewhisperer"), Some(region)) => {
+            (!region.is_empty()).then_some(region)
+        }
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -1090,6 +1102,33 @@ mod tests {
     }
 
     #[test]
+    fn test_effective_api_region_fallback_to_profile_arn_region() {
+        let mut config = Config::default();
+        config.region = "us-east-1".to_string();
+
+        let mut creds = KiroCredentials::default();
+        creds.profile_arn = Some(
+            "arn:aws:codewhisperer:eu-central-1:060031001274:profile/D9ADKXPAK74G".to_string(),
+        );
+
+        assert_eq!(creds.effective_api_region(&config), "eu-central-1");
+    }
+
+    #[test]
+    fn test_effective_api_region_explicit_value_overrides_profile_arn_region() {
+        let mut config = Config::default();
+        config.region = "us-east-1".to_string();
+
+        let mut creds = KiroCredentials::default();
+        creds.api_region = Some("us-east-1".to_string());
+        creds.profile_arn = Some(
+            "arn:aws:codewhisperer:eu-central-1:060031001274:profile/D9ADKXPAK74G".to_string(),
+        );
+
+        assert_eq!(creds.effective_api_region(&config), "us-east-1");
+    }
+
+    #[test]
     fn test_effective_api_region_fallback_to_config_region() {
         let mut config = Config::default();
         config.region = "config-region".to_string();
@@ -1109,6 +1148,17 @@ mod tests {
         creds.region = Some("cred-region".to_string());
 
         assert_eq!(creds.effective_api_region(&config), "config-region");
+    }
+
+    #[test]
+    fn test_profile_arn_region() {
+        assert_eq!(
+            profile_arn_region(
+                "arn:aws:codewhisperer:eu-central-1:060031001274:profile/D9ADKXPAK74G"
+            ),
+            Some("eu-central-1")
+        );
+        assert_eq!(profile_arn_region("not-an-arn"), None);
     }
 
     #[test]

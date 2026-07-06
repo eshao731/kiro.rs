@@ -21,7 +21,7 @@ use crate::kiro::kiro_version::USAGE_API_KIRO_VERSION;
 use crate::kiro::machine_id;
 use crate::kiro::model::available_models::ListAvailableModelsResponse;
 use crate::kiro::model::available_profiles::ListAvailableProfilesResponse;
-use crate::kiro::model::credentials::KiroCredentials;
+use crate::kiro::model::credentials::{KiroCredentials, profile_arn_region};
 use crate::kiro::model::token_refresh::{
     ExternalIdpRefreshResponse, IdcRefreshRequest, IdcRefreshResponse, RefreshRequest,
     RefreshResponse,
@@ -465,6 +465,14 @@ fn rest_api_region_candidates(sso_region: &str) -> [&'static str; 2] {
     }
 }
 
+fn rest_api_primary_region<'a>(credentials: &'a KiroCredentials, config: &'a Config) -> &'a str {
+    if credentials.effective_profile_arn().is_some() {
+        credentials.effective_api_region(config)
+    } else {
+        credentials.effective_auth_region(config)
+    }
+}
+
 /// 获取使用额度信息
 pub(crate) async fn get_usage_limits(
     credentials: &KiroCredentials,
@@ -474,10 +482,10 @@ pub(crate) async fn get_usage_limits(
 ) -> anyhow::Result<UsageLimitsResponse> {
     tracing::debug!("正在获取使用额度信息...");
 
-    // getUsageLimits 仅在 us-east-1 / eu-central-1 提供服务，
-    // 依据凭据 SSO 区域选择主端点，403 时回退到另一个端点。
-    let sso_region = credentials.effective_auth_region(config);
-    let candidates = rest_api_region_candidates(sso_region);
+    // getUsageLimits 仅在 us-east-1 / eu-central-1 提供服务。若携带真实
+    // profileArn，优先按 profile 所属区域选择端点；否则按 SSO/Auth 区域选择。
+    let primary_region = rest_api_primary_region(credentials, config);
+    let candidates = rest_api_region_candidates(primary_region);
     let machine_id = machine_id::generate_from_credentials(credentials, config);
     // 用量类接口固定用 USAGE_API_KIRO_VERSION：新版 IDE 会强制要求 profileArn，
     // 对 Enterprise/IdC 账号失败；该版本无需 profileArn。
@@ -577,10 +585,10 @@ pub(crate) async fn get_available_models(
 ) -> anyhow::Result<ListAvailableModelsResponse> {
     tracing::debug!("正在获取可用模型列表...");
 
-    // ListAvailableModels 仅在 us-east-1 / eu-central-1 提供服务，
-    // 依据凭据 SSO 区域选择主端点，403 时回退到另一个端点。
-    let sso_region = credentials.effective_auth_region(config);
-    let candidates = rest_api_region_candidates(sso_region);
+    // ListAvailableModels 仅在 us-east-1 / eu-central-1 提供服务。若携带真实
+    // profileArn，优先按 profile 所属区域选择端点；否则按 SSO/Auth 区域选择。
+    let primary_region = rest_api_primary_region(credentials, config);
+    let candidates = rest_api_region_candidates(primary_region);
     let machine_id = machine_id::generate_from_credentials(credentials, config);
     let kiro_version = USAGE_API_KIRO_VERSION;
     let os_name = &config.system_version;
@@ -773,10 +781,10 @@ pub(crate) async fn set_user_preference(
 ) -> anyhow::Result<()> {
     tracing::debug!("正在设置用户偏好 overageStatus={}", overage_status);
 
-    // setUserPreference 仅在 us-east-1 / eu-central-1 提供服务，
-    // 依据凭据 SSO 区域选择主端点，403 时回退到另一个端点。
-    let sso_region = credentials.effective_auth_region(config);
-    let candidates = rest_api_region_candidates(sso_region);
+    // setUserPreference 仅在 us-east-1 / eu-central-1 提供服务。若携带真实
+    // profileArn，优先按 profile 所属区域选择端点；否则按 SSO/Auth 区域选择。
+    let primary_region = rest_api_primary_region(credentials, config);
+    let candidates = rest_api_region_candidates(primary_region);
     let machine_id = machine_id::generate_from_credentials(credentials, config);
     let kiro_version = USAGE_API_KIRO_VERSION;
     let os_name = &config.system_version;
@@ -2703,17 +2711,34 @@ impl MultiTokenManager {
             return Ok(None);
         };
 
-        // 写回真实 ARN 并持久化
+        let inferred_api_region = profile_arn_region(&arn).map(|region| region.to_string());
+
+        // 写回真实 ARN / 推导出的 API 区域并持久化
         {
             let mut entries = self.entries.lock();
             if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
                 entry.credentials.profile_arn = Some(arn.clone());
+                if entry.credentials.api_region.is_none() {
+                    entry.credentials.api_region = inferred_api_region.clone();
+                }
             }
         }
         if let Err(e) = self.persist_credentials() {
-            tracing::warn!("profileArn 回填后持久化失败（不影响本次请求）: {}", e);
+            tracing::warn!(
+                "profileArn/API Region 回填后持久化失败（不影响本次请求）: {}",
+                e
+            );
         }
-        tracing::info!("凭据 #{} 已解析并回填真实 profileArn: {}", id, arn);
+        if let Some(api_region) = inferred_api_region {
+            tracing::info!(
+                "凭据 #{} 已解析并回填真实 profileArn: {}，apiRegion={}",
+                id,
+                arn,
+                api_region
+            );
+        } else {
+            tracing::info!("凭据 #{} 已解析并回填真实 profileArn: {}", id, arn);
+        }
 
         Ok(Some(arn))
     }
