@@ -16,7 +16,7 @@ use crate::http_client::{ProxyConfig, build_client};
 use crate::kiro::endpoint::{KiroEndpoint, RequestContext};
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
-use crate::kiro::token_manager::MultiTokenManager;
+use crate::kiro::token_manager::{MultiTokenManager, RateLimitSoftThrottleError};
 use crate::model::config::TlsBackend;
 use parking_lot::Mutex;
 
@@ -494,6 +494,9 @@ impl KiroProvider {
                         sink, attempt, 0, "", None, outcome::UNKNOWN,
                         Some(&e.to_string()), attempt_start,
                     );
+                    if e.downcast_ref::<RateLimitSoftThrottleError>().is_some() {
+                        return Err(e);
+                    }
                     last_error = Some(e);
                     continue;
                 }
@@ -907,6 +910,16 @@ impl KiroProvider {
                         outcome::TRANSIENT,
                         Some(&body),
                         attempt_start,
+                    );
+                } else {
+                    let report = self.token_manager.report_rate_limited(ctx.id);
+                    tracing::warn!(
+                        "凭据 #{} 普通 429 软限流已生效：冷却 {}s，连续 {} 次，动态并发上限 {}，剩余可调度账号 {}",
+                        ctx.id,
+                        report.cooldown_secs,
+                        report.consecutive_count,
+                        report.concurrency_limit,
+                        report.remaining_available
                     );
                 }
                 last_error = Some(anyhow::anyhow!(

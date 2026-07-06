@@ -120,13 +120,13 @@ pub async fn reset_failure_count(
 }
 
 /// POST /api/admin/credentials/:id/clear-throttle
-/// 手动解除凭据的账号级风控冷却
+/// 手动解除凭据的账号级风控冷却 / 普通 429 软限流
 pub async fn clear_throttle(
     State(state): State<AdminState>,
     Path(id): Path<u64>,
 ) -> impl IntoResponse {
     match state.service.clear_throttle(id) {
-        Ok(_) => Json(SuccessResponse::new(format!("凭据 #{} 风控冷却已解除", id))).into_response(),
+        Ok(_) => Json(SuccessResponse::new(format!("凭据 #{} 冷却/限流已解除", id))).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
 }

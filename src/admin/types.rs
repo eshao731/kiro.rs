@@ -69,6 +69,15 @@ pub struct CredentialStatusItem {
     /// 429/风控后的本地冷却剩余秒数
     #[serde(skip_serializing_if = "Option::is_none")]
     pub throttled_remaining_secs: Option<u64>,
+    /// 普通 429 软限流剩余秒数
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rate_limit_remaining_secs: Option<u64>,
+    /// 连续普通 429 次数
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rate_limit_count: Option<u32>,
+    /// 普通 429 动态并发上限
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rate_limit_concurrency_limit: Option<u32>,
     /// 端点名称（决定该凭据走哪套 Kiro API，已回退到默认端点）
     pub endpoint: String,
     /// 账号所属分组（可属于多个分组）

@@ -28,6 +28,7 @@ use crate::kiro::model::token_refresh::{
 };
 use crate::kiro::model::usage_limits::UsageLimitsResponse;
 use crate::model::config::Config;
+use tokio::time::sleep;
 
 /// 检查 Token 是否在指定时间内过期
 pub(crate) fn is_token_expiring_within(
@@ -106,6 +107,27 @@ impl fmt::Display for RefreshTokenInvalidError {
 }
 
 impl std::error::Error for RefreshTokenInvalidError {}
+
+/// 普通 429 软限流错误。
+///
+/// 当所有候选凭据都因 `USER_REQUEST_RATE_EXCEEDED` 等普通 429 进入短冷却，
+/// 且服务端不适合继续等待时抛出。外层会映射成 429 + Retry-After。
+#[derive(Debug)]
+pub(crate) struct RateLimitSoftThrottleError {
+    pub retry_after_secs: u64,
+}
+
+impl fmt::Display for RateLimitSoftThrottleError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "所有凭据均处于普通 429 软限流中，请 {} 秒后重试",
+            self.retry_after_secs
+        )
+    }
+}
+
+impl std::error::Error for RateLimitSoftThrottleError {}
 
 /// 刷新 Token
 pub(crate) async fn refresh_token(
@@ -872,6 +894,15 @@ struct CredentialEntry {
     /// `Some(t)` 且 `t > now()` 时视为不可用；`t <= now()` 时自动恢复。
     /// 不持久化，进程重启后清空。
     throttled_until: Option<Instant>,
+    /// 普通 429 软限流到期时间（USER_REQUEST_RATE_EXCEEDED 等非 suspicious 429）。
+    /// 到期自动恢复；不同于 `throttled_until`，这不是账号级风控硬冷却。
+    rate_limit_until: Option<Instant>,
+    /// 连续普通 429 次数，用于指数短冷却。
+    rate_limit_count: u32,
+    /// 普通 429 触发后的动态并发上限。None 表示不限制。
+    rate_limit_concurrency_limit: Option<u32>,
+    /// 动态并发上限恢复用的成功计数。
+    rate_limit_success_streak: u32,
     /// 运行中（in-flight）请求计数。least_conn 负载均衡用。
     in_flight: u32,
 }
@@ -953,6 +984,15 @@ pub struct CredentialEntrySnapshot {
     /// 临时冷却剩余秒数（账号级 429 风控）；冷却中且 `> 0` 才返回
     #[serde(skip_serializing_if = "Option::is_none")]
     pub throttled_remaining_secs: Option<u64>,
+    /// 普通 429 软限流剩余秒数；冷却中且 `> 0` 才返回
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rate_limit_remaining_secs: Option<u64>,
+    /// 连续普通 429 次数；`> 0` 才返回
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rate_limit_count: Option<u32>,
+    /// 普通 429 自适应并发上限；存在时表示该账号正在收缩并发
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rate_limit_concurrency_limit: Option<u32>,
     /// 端点名称（未显式配置时返回 None，由 Admin 层回退到默认值）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
@@ -1016,8 +1056,70 @@ pub struct MultiTokenManager {
 
 /// 每个凭据最大 API 调用失败次数
 const MAX_FAILURES_PER_CREDENTIAL: u32 = 3;
+/// 普通 429 软冷却：首次 5s，之后指数增长。
+const RATE_LIMIT_SOFT_COOLDOWN_BASE_SECS: u64 = 5;
+/// 普通 429 软冷却封顶，避免一次普通限流把账号长时间踢出调度。
+const RATE_LIMIT_SOFT_COOLDOWN_MAX_SECS: u64 = 60;
+/// 所有账号都处于普通 429 软冷却时，最多在服务端等待这么久。
+const RATE_LIMIT_LOCAL_WAIT_MAX_SECS: u64 = 10;
+/// 动态并发上限每多少次成功恢复 1。
+const RATE_LIMIT_SUCCESS_STEP: u32 = 20;
+/// 动态并发上限恢复到该值后解除限制。
+const RATE_LIMIT_CONCURRENCY_CLEAR_AT: u32 = 64;
 /// 统计数据持久化防抖间隔
 const STATS_SAVE_DEBOUNCE: StdDuration = StdDuration::from_secs(30);
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RateLimitSoftThrottleReport {
+    pub cooldown_secs: u64,
+    pub consecutive_count: u32,
+    pub concurrency_limit: u32,
+    pub remaining_available: usize,
+}
+
+fn hard_throttled(entry: &CredentialEntry, now: Instant) -> bool {
+    entry.throttled_until.map(|t| t > now).unwrap_or(false)
+}
+
+fn rate_limited(entry: &CredentialEntry, now: Instant) -> bool {
+    entry.rate_limit_until.map(|t| t > now).unwrap_or(false)
+}
+
+fn dynamic_concurrency_limited(entry: &CredentialEntry) -> bool {
+    entry
+        .rate_limit_concurrency_limit
+        .map(|limit| entry.in_flight >= limit)
+        .unwrap_or(false)
+}
+
+fn base_schedulable(
+    entry: &CredentialEntry,
+    now: Instant,
+    model: Option<&str>,
+    group: Option<&str>,
+) -> bool {
+    !entry.disabled
+        && !hard_throttled(entry, now)
+        && credential_matches_request(&entry.credentials, model, group)
+}
+
+fn schedulable(
+    entry: &CredentialEntry,
+    now: Instant,
+    model: Option<&str>,
+    group: Option<&str>,
+) -> bool {
+    base_schedulable(entry, now, model, group)
+        && !rate_limited(entry, now)
+        && !dynamic_concurrency_limited(entry)
+}
+
+fn rate_limit_remaining(entry: &CredentialEntry, now: Instant) -> Option<StdDuration> {
+    entry
+        .rate_limit_until
+        .and_then(|t| t.checked_duration_since(now))
+        .filter(|d| !d.is_zero())
+}
 
 /// API 调用上下文
 ///
@@ -1132,6 +1234,10 @@ impl MultiTokenManager {
                     success_count: 0,
                     last_used_at: None,
                     throttled_until: None,
+                    rate_limit_until: None,
+                    rate_limit_count: 0,
+                    rate_limit_concurrency_limit: None,
+                    rate_limit_success_streak: 0,
                     in_flight: 0,
                 }
             })
@@ -1265,8 +1371,30 @@ impl MultiTokenManager {
         self.entries
             .lock()
             .iter()
-            .filter(|e| !e.disabled && !e.throttled_until.map(|t| t > now).unwrap_or(false))
+            .filter(|e| schedulable(e, now, None, None))
             .count()
+    }
+
+    fn shortest_rate_limit_delay(
+        &self,
+        model: Option<&str>,
+        group: Option<&str>,
+    ) -> Option<StdDuration> {
+        let entries = self.entries.lock();
+        let now = Instant::now();
+        entries
+            .iter()
+            .filter(|e| base_schedulable(e, now, model, group))
+            .filter_map(|e| rate_limit_remaining(e, now))
+            .min()
+    }
+
+    fn any_dynamic_concurrency_limited(&self, model: Option<&str>, group: Option<&str>) -> bool {
+        let entries = self.entries.lock();
+        let now = Instant::now();
+        entries
+            .iter()
+            .any(|e| base_schedulable(e, now, model, group) && dynamic_concurrency_limited(e))
     }
 
     /// 根据负载均衡模式选择下一个凭据
@@ -1285,18 +1413,7 @@ impl MultiTokenManager {
         let available: Vec<_> = entries
             .iter()
             .filter(|e| {
-                if e.disabled {
-                    return false;
-                }
-                // 临时冷却中（账号级 429 风控）：跳过
-                if e.throttled_until.map(|t| t > now).unwrap_or(false) {
-                    return false;
-                }
-                // 模型/分组隔离：请求模型必须由该账号支持，且账号必须匹配请求分组
-                if !credential_matches_request(&e.credentials, model, group) {
-                    return false;
-                }
-                true
+                schedulable(e, now, model, group)
             })
             .collect();
 
@@ -1372,9 +1489,7 @@ impl MultiTokenManager {
                         .iter()
                         .find(|e| {
                             e.id == current_id
-                                && !e.disabled
-                                && !e.throttled_until.map(|t| t > now).unwrap_or(false)
-                                && credential_matches_request(&e.credentials, model, group)
+                                && schedulable(e, now, model, group)
                         })
                         .map(|e| (e.id, e.credentials.clone()))
                 };
@@ -1412,6 +1527,26 @@ impl MultiTokenManager {
                         *current_id = new_id;
                         (new_id, new_creds)
                     } else {
+                        if let Some(delay) = self.shortest_rate_limit_delay(model, group) {
+                            if delay <= StdDuration::from_secs(RATE_LIMIT_LOCAL_WAIT_MAX_SECS) {
+                                tracing::info!(
+                                    "所有候选凭据处于普通 429 软限流，等待 {}ms 后重试选择",
+                                    delay.as_millis()
+                                );
+                                sleep(delay + StdDuration::from_millis(50)).await;
+                                continue;
+                            }
+                            return Err(RateLimitSoftThrottleError {
+                                retry_after_secs: delay.as_secs().max(1),
+                            }
+                            .into());
+                        }
+                        if self.any_dynamic_concurrency_limited(model, group) {
+                            return Err(RateLimitSoftThrottleError {
+                                retry_after_secs: 1,
+                            }
+                            .into());
+                        }
                         let entries = self.entries.lock();
                         // 注意：必须在 bail! 之前计算 available_count，
                         // 因为 available_count() 会尝试获取 entries 锁，
@@ -1871,6 +2006,27 @@ impl MultiTokenManager {
                 entry.last_used_at = Some(Utc::now().to_rfc3339());
                 // 成功 = 风控已解除，提前结束冷却
                 entry.throttled_until = None;
+                entry.rate_limit_until = None;
+                entry.rate_limit_count = 0;
+                if let Some(limit) = entry.rate_limit_concurrency_limit {
+                    entry.rate_limit_success_streak =
+                        entry.rate_limit_success_streak.saturating_add(1);
+                    if entry.rate_limit_success_streak >= RATE_LIMIT_SUCCESS_STEP {
+                        let next_limit = limit.saturating_add(1);
+                        if next_limit >= RATE_LIMIT_CONCURRENCY_CLEAR_AT {
+                            entry.rate_limit_concurrency_limit = None;
+                            tracing::info!("凭据 #{} 普通 429 动态并发限制已解除", id);
+                        } else {
+                            entry.rate_limit_concurrency_limit = Some(next_limit);
+                            tracing::info!(
+                                "凭据 #{} 普通 429 动态并发上限恢复到 {}",
+                                id,
+                                next_limit
+                            );
+                        }
+                        entry.rate_limit_success_streak = 0;
+                    }
+                }
                 tracing::debug!(
                     "凭据 #{} API 调用成功（累计 {} 次）",
                     id,
@@ -1879,6 +2035,68 @@ impl MultiTokenManager {
             }
         }
         self.save_stats_debounced();
+    }
+
+    /// 报告指定凭据命中普通 429（非 suspicious activity）。
+    ///
+    /// 这不是永久失败，也不是账号级硬冷却：只做短软冷却和动态并发收缩，
+    /// 让调度器优先避开该账号，单账号时也不会继续猛打。
+    pub(crate) fn report_rate_limited(&self, id: u64) -> RateLimitSoftThrottleReport {
+        let now = Instant::now();
+        let mut report = RateLimitSoftThrottleReport {
+            cooldown_secs: RATE_LIMIT_SOFT_COOLDOWN_BASE_SECS,
+            consecutive_count: 1,
+            concurrency_limit: 1,
+            remaining_available: 0,
+        };
+
+        {
+            let mut entries = self.entries.lock();
+            if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+                let count = entry.rate_limit_count.saturating_add(1);
+                let exp = count.saturating_sub(1).min(6);
+                let cooldown_secs = RATE_LIMIT_SOFT_COOLDOWN_BASE_SECS
+                    .saturating_mul(2u64.saturating_pow(exp))
+                    .min(RATE_LIMIT_SOFT_COOLDOWN_MAX_SECS);
+                let until = now + StdDuration::from_secs(cooldown_secs);
+                let observed_in_flight = entry.in_flight.max(1);
+                let current_limit = entry
+                    .rate_limit_concurrency_limit
+                    .unwrap_or(observed_in_flight);
+                let next_limit = (current_limit / 2).max(1);
+
+                entry.rate_limit_count = count;
+                entry.rate_limit_until = Some(match entry.rate_limit_until {
+                    Some(prev) if prev > until => prev,
+                    _ => until,
+                });
+                entry.rate_limit_concurrency_limit = Some(next_limit);
+                entry.rate_limit_success_streak = 0;
+                entry.total_failure_count += 1;
+                entry.last_used_at = Some(Utc::now().to_rfc3339());
+
+                report.cooldown_secs = cooldown_secs;
+                report.consecutive_count = count;
+                report.concurrency_limit = next_limit;
+
+                tracing::warn!(
+                    "凭据 #{} 命中普通 429，软冷却 {} 秒，连续 {} 次，动态并发上限 {}",
+                    id,
+                    cooldown_secs,
+                    count,
+                    next_limit
+                );
+            }
+
+            let check_now = Instant::now();
+            report.remaining_available = entries
+                .iter()
+                .filter(|e| schedulable(e, check_now, None, None))
+                .count();
+        }
+
+        self.save_stats_debounced();
+        report
     }
 
     /// 报告指定凭据 API 调用失败
@@ -2162,7 +2380,7 @@ impl MultiTokenManager {
         let now = Instant::now();
         let available = entries
             .iter()
-            .filter(|e| !e.disabled && !e.throttled_until.map(|t| t > now).unwrap_or(false))
+            .filter(|e| schedulable(e, now, None, None))
             .count();
 
         ManagerSnapshot {
@@ -2234,6 +2452,13 @@ impl MultiTokenManager {
                         .and_then(|t| t.checked_duration_since(now))
                         .map(|d| d.as_secs())
                         .filter(|s| *s > 0),
+                    rate_limit_remaining_secs: e
+                        .rate_limit_until
+                        .and_then(|t| t.checked_duration_since(now))
+                        .map(|d| d.as_secs())
+                        .filter(|s| *s > 0),
+                    rate_limit_count: (e.rate_limit_count > 0).then_some(e.rate_limit_count),
+                    rate_limit_concurrency_limit: e.rate_limit_concurrency_limit,
                     endpoint: e.credentials.endpoint.clone(),
                     groups: e.credentials.groups.clone(),
                     source_channel: e.credentials.source_channel.clone(),
@@ -2330,7 +2555,11 @@ impl MultiTokenManager {
             .find(|e| e.id == id)
             .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
         entry.throttled_until = None;
-        tracing::info!("凭据 #{} 风控冷却已被手动解除", id);
+        entry.rate_limit_until = None;
+        entry.rate_limit_count = 0;
+        entry.rate_limit_concurrency_limit = None;
+        entry.rate_limit_success_streak = 0;
+        tracing::info!("凭据 #{} 冷却/普通 429 软限流已被手动解除", id);
         Ok(())
     }
 
@@ -2388,6 +2617,10 @@ impl MultiTokenManager {
             entry.disabled = false;
             entry.disabled_reason = None;
             entry.throttled_until = None;
+            entry.rate_limit_until = None;
+            entry.rate_limit_count = 0;
+            entry.rate_limit_concurrency_limit = None;
+            entry.rate_limit_success_streak = 0;
         }
         // 持久化更改
         self.persist_credentials()?;
@@ -2994,6 +3227,10 @@ impl MultiTokenManager {
                 success_count: baseline_success,
                 last_used_at: None,
                 throttled_until: None,
+                rate_limit_until: None,
+                rate_limit_count: 0,
+                rate_limit_concurrency_limit: None,
+                rate_limit_success_streak: 0,
                 in_flight: 0,
             });
         }

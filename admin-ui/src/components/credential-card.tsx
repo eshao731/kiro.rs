@@ -239,9 +239,15 @@ export function CredentialCard({
   const [throttleRemaining, setThrottleRemaining] = useState<number>(
     credential.throttledRemainingSecs ?? 0,
   );
+  const [rateLimitRemaining, setRateLimitRemaining] = useState<number>(
+    credential.rateLimitRemainingSecs ?? 0,
+  );
   useEffect(() => {
     setThrottleRemaining(credential.throttledRemainingSecs ?? 0);
   }, [credential.throttledRemainingSecs]);
+  useEffect(() => {
+    setRateLimitRemaining(credential.rateLimitRemainingSecs ?? 0);
+  }, [credential.rateLimitRemainingSecs]);
   useEffect(() => {
     if (throttleRemaining <= 0) return;
     const t = window.setInterval(() => {
@@ -249,10 +255,18 @@ export function CredentialCard({
     }, 1000);
     return () => window.clearInterval(t);
   }, [throttleRemaining]);
+  useEffect(() => {
+    if (rateLimitRemaining <= 0) return;
+    const t = window.setInterval(() => {
+      setRateLimitRemaining((v) => (v > 0 ? v - 1 : 0));
+    }, 1000);
+    return () => window.clearInterval(t);
+  }, [rateLimitRemaining]);
   const handleClearThrottle = useCallback(() => {
     clearThrottle.mutate(credential.id, {
       onSuccess: (res) => {
         setThrottleRemaining(0);
+        setRateLimitRemaining(0);
         toast.success(res.message);
       },
       onError: (err) => toast.error("解除失败: " + extractErrorMessage(err)),
@@ -366,6 +380,10 @@ export function CredentialCard({
     credential.disabled && credential.disabledReason === "QuotaExceeded";
   const reasonStyle = getDisabledReasonStyle(credential.disabledReason);
   const isThrottled = !credential.disabled && throttleRemaining > 0;
+  const hasDynamicRateLimit =
+    !credential.disabled && credential.rateLimitConcurrencyLimit != null;
+  const isRateLimited =
+    !credential.disabled && (rateLimitRemaining > 0 || hasDynamicRateLimit);
 
   // 卡片与列表行共用的状态描边 / 灰化（活跃 · 超额 · 冷却 · 禁用）
   const stateClasses = [
@@ -376,6 +394,9 @@ export function CredentialCard({
       : "",
     isThrottled
       ? "ring-1 ring-orange-500/60 bg-orange-50/40 dark:bg-orange-500/[0.04]"
+      : "",
+    isRateLimited
+      ? "ring-1 ring-yellow-500/60 bg-yellow-50/40 dark:bg-yellow-500/[0.04]"
       : "",
     credential.disabled && !disabledByQuota ? "opacity-70" : "",
   ]
@@ -411,6 +432,26 @@ export function CredentialCard({
         >
           <Clock className="mr-1 h-3 w-3" />
           冷却 {formatThrottleCountdown(throttleRemaining)}
+        </Badge>
+      )}
+      {isRateLimited && (
+        <Badge
+          variant="warning"
+          className="bg-yellow-500/15 text-yellow-700 dark:text-yellow-300 border-yellow-500/30"
+          title={[
+            "普通 429 软限流中，到期后自动恢复调度",
+            credential.rateLimitCount ? `连续 ${credential.rateLimitCount} 次` : null,
+            credential.rateLimitConcurrencyLimit
+              ? `动态并发上限 ${credential.rateLimitConcurrencyLimit}`
+              : null,
+          ]
+            .filter(Boolean)
+            .join(" · ")}
+        >
+          <Clock className="mr-1 h-3 w-3" />
+          {rateLimitRemaining > 0
+            ? `限流 ${formatThrottleCountdown(rateLimitRemaining)}`
+            : `限并发 ${credential.rateLimitConcurrencyLimit}`}
         </Badge>
       )}
       {credential.authMethod && <Badge variant="secondary">{authLabel}</Badge>}
@@ -477,7 +518,7 @@ export function CredentialCard({
           <Boxes />
           查看可用模型
         </DropdownMenuItem>
-        {throttleRemaining > 0 && (
+        {(throttleRemaining > 0 || rateLimitRemaining > 0 || hasDynamicRateLimit) && (
           <DropdownMenuItem
             onSelect={(e) => {
               e.preventDefault();
@@ -486,7 +527,7 @@ export function CredentialCard({
             disabled={clearThrottle.isPending}
           >
             <Clock />
-            解除风控冷却（{formatThrottleCountdown(throttleRemaining)}）
+            解除冷却/限流
           </DropdownMenuItem>
         )}
         {balance?.overageCapable === true &&

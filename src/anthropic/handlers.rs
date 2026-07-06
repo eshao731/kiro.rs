@@ -294,6 +294,30 @@ fn count_image_budget(payload: &super::types::MessagesRequest) -> ImageBudget {
 
 /// 将 KiroProvider 错误映射为 HTTP 响应
 pub(super) fn map_provider_error(err: Error) -> Response {
+    if let Some(rate_limit) =
+        err.downcast_ref::<crate::kiro::token_manager::RateLimitSoftThrottleError>()
+    {
+        tracing::warn!(
+            retry_after_secs = rate_limit.retry_after_secs,
+            "all credentials are under ordinary 429 soft throttle; mapped to 429"
+        );
+        return Response::builder()
+            .status(StatusCode::TOO_MANY_REQUESTS)
+            .header(header::RETRY_AFTER, rate_limit.retry_after_secs.to_string())
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&ErrorResponse::new(
+                    "rate_limit_error",
+                    format!(
+                        "All credentials are temporarily rate limited. Retry after {} seconds.",
+                        rate_limit.retry_after_secs
+                    ),
+                ))
+                .unwrap_or_else(|_| b"{\"error\":{\"type\":\"rate_limit_error\"}}".to_vec()),
+            ))
+            .unwrap();
+    }
+
     let err_str = err.to_string();
 
     // 上下文窗口满了（对话历史累积超出模型上下文窗口限制）
