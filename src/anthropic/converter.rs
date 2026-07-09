@@ -477,7 +477,7 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
 
     // 5. 处理最后一条消息作为 current_message（经过 prefill 预处理，末尾必为 user）
     let last_message = messages.last().unwrap();
-    let (text_content, images, tool_results) = process_message_content(&last_message.content)?;
+    let (mut text_content, images, tool_results) = process_message_content(&last_message.content)?;
 
     // 6. 转换工具定义（超长名称自动缩短并记录映射）
     let mut tool_name_map = HashMap::new();
@@ -501,11 +501,16 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
     // 8. 验证并过滤 tool_use/tool_result 配对
     // 移除孤立的 tool_result（没有对应的 tool_use）
     // 同时返回孤立的 tool_use_id 集合，用于后续清理
-    let (validated_tool_results, orphaned_tool_use_ids) =
+    let (mut validated_tool_results, orphaned_tool_use_ids) =
         validate_tool_pairing(&history, &tool_results);
 
     // 9. 从历史中移除孤立的 tool_use（Kiro API 要求 tool_use 必须有对应的 tool_result）
     remove_orphaned_tool_uses(&mut history, &orphaned_tool_use_ids);
+
+    // Bedrock 要求紧跟 tool_use 的 user 消息以 tool_result 开头。Kiro wire schema
+    // 会把 user content 与 toolResults 分开，因此混合文本需要折入 tool_result。
+    normalize_tool_result_user_content(&mut history);
+    fold_user_text_into_tool_results(&mut text_content, &mut validated_tool_results);
 
     // 10. 收集历史中使用的工具名称，为缺失的工具生成占位符定义
     // Kiro API 要求：历史消息中引用的工具必须在 tools 列表中有定义
@@ -532,7 +537,6 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
     }
 
     // 12. 构建当前消息
-    // 保留文本内容，即使有工具结果也不丢弃用户文本
     let content = text_content;
 
     let mut user_input = UserInputMessage::new(content, &model_id)
@@ -920,6 +924,56 @@ fn remove_orphaned_tool_uses(
                     original_len - new_len
                 );
             }
+        }
+    }
+}
+
+fn append_user_text_to_tool_result(tool_result: &mut ToolResult, user_text: &str) {
+    let mut map = serde_json::Map::new();
+    map.insert(
+        "text".to_string(),
+        serde_json::Value::String(format!("User message after tool_result:\n{}", user_text)),
+    );
+    tool_result.content.push(map);
+}
+
+fn fold_user_text_into_tool_results(content: &mut String, tool_results: &mut [ToolResult]) {
+    let user_text = content.trim();
+    if user_text.is_empty() || tool_results.is_empty() {
+        return;
+    }
+
+    if let Some(last_result) = tool_results.last_mut() {
+        append_user_text_to_tool_result(last_result, user_text);
+        tracing::warn!(
+            "将混合在 tool_result user 消息中的普通文本折入 tool_result，避免 Bedrock tool_result 顺序校验失败"
+        );
+    }
+    content.clear();
+}
+
+fn normalize_tool_result_user_content(history: &mut [Message]) {
+    for idx in 1..history.len() {
+        let previous_has_tool_use = if let Message::Assistant(assistant_msg) = &history[idx - 1] {
+            assistant_msg
+                .assistant_response_message
+                .tool_uses
+                .as_ref()
+                .is_some_and(|tool_uses| !tool_uses.is_empty())
+        } else {
+            false
+        };
+
+        if !previous_has_tool_use {
+            continue;
+        }
+
+        if let Message::User(user_msg) = &mut history[idx] {
+            let user_input = &mut user_msg.user_input_message;
+            fold_user_text_into_tool_results(
+                &mut user_input.content,
+                &mut user_input.user_input_message_context.tool_results,
+            );
         }
     }
 }
@@ -2629,6 +2683,137 @@ mod tests {
             tr[0].content[0].get("text").and_then(|v| v.as_str()),
             Some("file content"),
             "text-only tool_result content should be preserved as-is"
+        );
+    }
+
+    #[test]
+    fn test_current_tool_result_user_text_folded_into_tool_result() {
+        use super::super::types::Message as AnthropicMessage;
+
+        let req = MessagesRequest {
+            model: "claude-sonnet-4.5".to_string(),
+            max_tokens: 1024,
+            messages: vec![
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("read the file"),
+                },
+                AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!([
+                        {"type": "tool_use", "id": "tool-1", "name": "read", "input": {"path": "/a.txt"}}
+                    ]),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!([
+                        {"type": "tool_result", "tool_use_id": "tool-1", "content": "file content"},
+                        {"type": "text", "text": "please summarize it"}
+                    ]),
+                },
+            ],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let result = convert_request(&req).unwrap();
+        let msg = &result.conversation_state.current_message.user_input_message;
+
+        assert!(
+            msg.content.is_empty(),
+            "tool_result response should not carry top-level user text before tool_results"
+        );
+        let tr = &msg.user_input_message_context.tool_results;
+        assert_eq!(tr.len(), 1);
+        assert_eq!(
+            tr[0].content[0].get("text").and_then(|v| v.as_str()),
+            Some("file content")
+        );
+        assert!(
+            tr[0].content
+                .iter()
+                .any(|part| part
+                    .get("text")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|text| text.contains("please summarize it"))),
+            "mixed user text should be preserved inside the tool_result"
+        );
+    }
+
+    #[test]
+    fn test_history_tool_result_user_text_folded_into_tool_result() {
+        use super::super::types::Message as AnthropicMessage;
+
+        let req = MessagesRequest {
+            model: "claude-sonnet-4.5".to_string(),
+            max_tokens: 1024,
+            messages: vec![
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("read the file"),
+                },
+                AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!([
+                        {"type": "tool_use", "id": "tool-1", "name": "read", "input": {"path": "/a.txt"}}
+                    ]),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!([
+                        {"type": "tool_result", "tool_use_id": "tool-1", "content": "file content"}
+                    ]),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("also explain it"),
+                },
+                AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!("The file says hello."),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("thanks"),
+                },
+            ],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let result = convert_request(&req).unwrap();
+        let history = &result.conversation_state.history;
+        let Message::User(user_msg) = &history[2] else {
+            panic!("expected paired history user message");
+        };
+
+        assert!(
+            user_msg.user_input_message.content.is_empty(),
+            "history tool_result response should not carry top-level user text before tool_results"
+        );
+        let tr = &user_msg
+            .user_input_message
+            .user_input_message_context
+            .tool_results;
+        assert_eq!(tr.len(), 1);
+        assert!(
+            tr[0].content
+                .iter()
+                .any(|part| part
+                    .get("text")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|text| text.contains("also explain it"))),
+            "mixed history user text should be preserved inside the tool_result"
         );
     }
 }
