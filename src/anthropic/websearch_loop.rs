@@ -680,7 +680,7 @@ pub(super) async fn run_web_search_loop(
             let mut searched: Vec<Option<WebSearchResults>> = Vec::with_capacity(round.tool_uses.len());
             for tu in &round.tool_uses {
                 let (_id, mcp_request) = websearch::create_mcp_request(&tool_query(tu));
-                match websearch::call_mcp_api(&provider, &mcp_request).await {
+                match websearch::call_mcp_api(&provider, &mcp_request, group.as_deref()).await {
                     Ok(resp) => searched.push(websearch::parse_search_results(&resp)),
                     Err(e) => {
                         tracing::warn!("web_search MCP call failed: {}", e);
@@ -719,7 +719,7 @@ pub(super) async fn run_web_search_loop(
         for tu in &round.tool_uses {
             if tu.name == "web_search" {
                 let (_id, mcp_request) = websearch::create_mcp_request(&tool_query(tu));
-                match websearch::call_mcp_api(&provider, &mcp_request).await {
+                match websearch::call_mcp_api(&provider, &mcp_request, group.as_deref()).await {
                     Ok(resp) => searched.push(websearch::parse_search_results(&resp)),
                     Err(e) => {
                         // Same pass-through discipline as the continue branch: a failed
@@ -844,7 +844,7 @@ pub(crate) fn render_json(
 }
 
 /// SSE response (streaming): splits the final content into a sequence of Anthropic content_block events
-fn render_sse(
+pub(crate) fn render_sse(
     model: &str,
     content: Vec<Value>,
     stop_reason: &str,

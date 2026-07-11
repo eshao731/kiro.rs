@@ -294,7 +294,7 @@ fn count_image_budget(payload: &super::types::MessagesRequest) -> ImageBudget {
 
 /// 将 KiroProvider 错误映射为 HTTP 响应
 pub(super) fn map_provider_error(err: Error) -> Response {
-    if let Some(rate_limit) = err.downcast_ref::<crate::kiro::provider::UpstreamRateLimitError>() {
+    if let Some(rate_limit) = err.downcast_ref::<crate::kiro::error::UpstreamRateLimitError>() {
         tracing::warn!(error = %err, "上游限流（映射为 429）");
         let mut response = (
             StatusCode::TOO_MANY_REQUESTS,
@@ -393,7 +393,7 @@ pub(super) fn map_provider_error(err: Error) -> Response {
         StatusCode::BAD_GATEWAY,
         Json(ErrorResponse::new(
             "api_error",
-            format!("上游 API 调用失败: {}", err),
+            "Upstream API request failed.",
         )),
     )
         .into_response()
@@ -676,7 +676,13 @@ pub async fn post_messages(
             payload.tools.clone(),
         ) as i32;
 
-        let resp = websearch::handle_websearch_request(provider, &payload, input_tokens).await;
+        let resp = websearch::handle_websearch_request(
+            provider,
+            &payload,
+            input_tokens,
+            key_ctx.group.as_deref(),
+        )
+        .await;
         // WebSearch 路径走 MCP 端点，没有 credential_id 上下文，统一记 0
         let status = if resp.status().is_success() { "success" } else { "error" };
         hook.record(0, input_tokens, 0, 0, 0, 0.0, status);
@@ -1485,7 +1491,13 @@ pub async fn post_messages_cc(
             payload.tools.clone(),
         ) as i32;
 
-        let resp = websearch::handle_websearch_request(provider, &payload, input_tokens).await;
+        let resp = websearch::handle_websearch_request(
+            provider,
+            &payload,
+            input_tokens,
+            key_ctx.group.as_deref(),
+        )
+        .await;
         let status = if resp.status().is_success() { "success" } else { "error" };
         hook.record(0, input_tokens, 0, 0, 0, 0.0, status);
         return resp;
@@ -1878,7 +1890,7 @@ mod tests {
 
     #[test]
     fn upstream_rate_limit_maps_to_429_with_retry_after() {
-        let err = crate::kiro::provider::UpstreamRateLimitError::new(Some("1800".to_string()));
+        let err = crate::kiro::error::UpstreamRateLimitError::new(Some("1800".to_string()));
         let resp = map_provider_error(err.into());
 
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
@@ -1886,6 +1898,31 @@ mod tests {
             resp.headers().get(header::RETRY_AFTER).unwrap(),
             "1800"
         );
+    }
+
+    #[test]
+    fn upstream_rate_limit_drops_invalid_retry_after() {
+        let err = crate::kiro::error::UpstreamRateLimitError::new(Some(
+            "not-a-retry-delay".to_string(),
+        ));
+        let resp = map_provider_error(err.into());
+
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(resp.headers().get(header::RETRY_AFTER).is_none());
+    }
+
+    #[tokio::test]
+    async fn generic_upstream_error_does_not_expose_raw_body() {
+        let secret = "aws-account=123456789012 request-id=private-request";
+        let resp = map_provider_error(anyhow::anyhow!(secret));
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(!body.contains(secret));
+        assert!(body.contains("Upstream API request failed"));
     }
 
     #[test]

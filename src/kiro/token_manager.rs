@@ -17,6 +17,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration as StdDuration, Instant};
 
 use crate::http_client::{ProxyConfig, build_client};
+use crate::kiro::error::UpstreamRateLimitError;
 use crate::kiro::kiro_version::USAGE_API_KIRO_VERSION;
 use crate::kiro::machine_id;
 use crate::kiro::model::available_models::ListAvailableModelsResponse;
@@ -204,8 +205,14 @@ async fn refresh_social_token(
         .await?;
 
     let status = response.status();
+    let rate_limit_error = (status.as_u16() == 429)
+        .then(|| UpstreamRateLimitError::from_headers(response.headers()));
     if !status.is_success() {
         let body_text = response.text().await.unwrap_or_default();
+
+        if let Some(error) = rate_limit_error {
+            return Err(error.into());
+        }
 
         // 400 + invalid_grant + Invalid refresh token provided → refreshToken 永久失效
         if status.as_u16() == 400
@@ -301,8 +308,14 @@ async fn refresh_idc_token(
         .await?;
 
     let status = response.status();
+    let rate_limit_error = (status.as_u16() == 429)
+        .then(|| UpstreamRateLimitError::from_headers(response.headers()));
     if !status.is_success() {
         let body_text = response.text().await.unwrap_or_default();
+
+        if let Some(error) = rate_limit_error {
+            return Err(error.into());
+        }
 
         // 400 + invalid_grant + Invalid refresh token provided → refreshToken 永久失效
         if status.as_u16() == 400
@@ -393,7 +406,12 @@ async fn refresh_external_idp_token(
         .await?;
 
     let status = response.status();
+    let rate_limit_error = (status.as_u16() == 429)
+        .then(|| UpstreamRateLimitError::from_headers(response.headers()));
     let body_text = response.text().await.unwrap_or_default();
+    if let Some(error) = rate_limit_error {
+        return Err(error.into());
+    }
     let data: ExternalIdpRefreshResponse =
         serde_json::from_str(&body_text).unwrap_or_default();
 
@@ -541,12 +559,17 @@ pub(crate) async fn get_usage_limits(
         let response = request.send().await?;
 
         let status = response.status();
+        let rate_limit_error = (status.as_u16() == 429)
+            .then(|| UpstreamRateLimitError::from_headers(response.headers()));
         if status.is_success() {
             let data: UsageLimitsResponse = response.json().await?;
             return Ok(data);
         }
 
         let body_text = response.text().await.unwrap_or_default();
+        if let Some(error) = rate_limit_error {
+            return Err(error.into());
+        }
 
         // 403 且仍有备用端点时，尝试下一个区域端点（Enterprise/IdC 跨区兼容）
         if status.as_u16() == 403 && idx + 1 < candidates.len() {
@@ -633,12 +656,17 @@ pub(crate) async fn get_available_models(
         let response = request.send().await?;
 
         let status = response.status();
+        let rate_limit_error = (status.as_u16() == 429)
+            .then(|| UpstreamRateLimitError::from_headers(response.headers()));
         if status.is_success() {
             let data: ListAvailableModelsResponse = response.json().await?;
             return Ok(data);
         }
 
         let body_text = response.text().await.unwrap_or_default();
+        if let Some(error) = rate_limit_error {
+            return Err(error.into());
+        }
 
         // 403 且仍有备用端点时，尝试下一个区域端点（Enterprise/IdC 跨区兼容）
         if status.as_u16() == 403 && idx + 1 < candidates.len() {
@@ -735,6 +763,8 @@ pub(crate) async fn list_available_profiles(
 
         let response = request.send().await?;
         let status = response.status();
+        let rate_limit_error = (status.as_u16() == 429)
+            .then(|| UpstreamRateLimitError::from_headers(response.headers()));
 
         if status.is_success() {
             let data: ListAvailableProfilesResponse = response.json().await?;
@@ -747,6 +777,9 @@ pub(crate) async fn list_available_profiles(
         }
 
         let body_text = response.text().await.unwrap_or_default();
+        if let Some(error) = rate_limit_error {
+            return Err(error.into());
+        }
         last_error = Some(format!("{} {}", status, body_text));
         // 403 等错误继续尝试下一个候选端点
     }
@@ -833,11 +866,16 @@ pub(crate) async fn set_user_preference(
         let response = request.send().await?;
 
         let status = response.status();
+        let rate_limit_error = (status.as_u16() == 429)
+            .then(|| UpstreamRateLimitError::from_headers(response.headers()));
         if status.is_success() {
             return Ok(());
         }
 
         let body_text = response.text().await.unwrap_or_default();
+        if let Some(error) = rate_limit_error {
+            return Err(error.into());
+        }
 
         // 403 且仍有备用端点时，尝试下一个区域端点（Enterprise/IdC 跨区兼容）
         if status.as_u16() == 403 && idx + 1 < candidates.len() {
@@ -1623,17 +1661,9 @@ impl MultiTokenManager {
                     return Ok(ctx);
                 }
                 Err(e) => {
-                    let has_available = if e.downcast_ref::<RefreshTokenInvalidError>().is_some() {
-                        // 先尝试从源文件重新加载（适用于 IDE 退出后 token rotation 导致失效的场景）
-                        if self.try_reload_credential_from_file(id) {
-                            // 找到新 Token，不计入失败次数，直接重试
-                            continue;
-                        }
-                        tracing::warn!("凭据 #{} refreshToken 永久失效: {}", id, e);
-                        self.report_refresh_token_invalid(id)
-                    } else {
-                        tracing::warn!("凭据 #{} Token 刷新失败: {}", id, e);
-                        self.report_refresh_failure(id)
+                    let Some(has_available) = self.handle_token_refresh_error(id, e)? else {
+                        // 从源文件加载到了轮换后的 Token，不计失败次数，直接重试。
+                        continue;
                     };
                     attempt_count += 1;
                     if !has_available {
@@ -1641,6 +1671,34 @@ impl MultiTokenManager {
                     }
                 }
             }
+        }
+    }
+
+    /// 分类并记录一次 Token 刷新错误。
+    ///
+    /// 上游 429 是临时流控，不代表凭据失效，因此直接保留类型化错误返回，绝不增加
+    /// `refresh_failure_count`。`Ok(None)` 表示已从源文件加载到轮换后的 Token，调用方
+    /// 应使用同一凭据立即重试；`Ok(Some(_))` 返回记录失败后是否仍有可用凭据。
+    fn handle_token_refresh_error(
+        &self,
+        id: u64,
+        error: anyhow::Error,
+    ) -> anyhow::Result<Option<bool>> {
+        if error.downcast_ref::<UpstreamRateLimitError>().is_some() {
+            tracing::warn!("凭据 #{} Token 刷新被上游限流", id);
+            return Err(error);
+        }
+
+        if error.downcast_ref::<RefreshTokenInvalidError>().is_some() {
+            // 先尝试从源文件重新加载（适用于 IDE 退出后 token rotation 导致失效的场景）。
+            if self.try_reload_credential_from_file(id) {
+                return Ok(None);
+            }
+            tracing::warn!("凭据 #{} refreshToken 永久失效: {}", id, error);
+            Ok(Some(self.report_refresh_token_invalid(id)))
+        } else {
+            tracing::warn!("凭据 #{} Token 刷新失败: {}", id, error);
+            Ok(Some(self.report_refresh_failure(id)))
         }
     }
 
@@ -2612,6 +2670,36 @@ impl MultiTokenManager {
     /// 返回剩余可用凭据数（已排除冷却中的）。
     pub fn report_account_throttled(&self, id: u64, cooldown: StdDuration) -> usize {
         self.report_temporary_cooldown(id, cooldown, "账号级风控")
+    }
+
+    /// 标记凭据冷却，并在同一锁临界区内返回当前请求范围的剩余凭据数。
+    pub fn report_account_throttled_for_request(
+        &self,
+        id: u64,
+        cooldown: StdDuration,
+        model: Option<&str>,
+        group: Option<&str>,
+    ) -> usize {
+        let now = Instant::now();
+        let mut entries = self.entries.lock();
+        if let Some(entry) = entries.iter_mut().find(|entry| entry.id == id) {
+            let until = now + cooldown;
+            entry.throttled_until = Some(match entry.throttled_until {
+                Some(previous) if previous > until => previous,
+                _ => until,
+            });
+            entry.total_failure_count += 1;
+            tracing::warn!(
+                "凭据 #{} 触发账号级风控，冷却 {} 秒",
+                id,
+                cooldown.as_secs()
+            );
+        }
+        let throttled_now = Instant::now();
+        entries
+            .iter()
+            .filter(|entry| schedulable(entry, throttled_now, model, group))
+            .count()
     }
 
     /// 记录当前凭据不支持指定模型，并返回同一请求范围内仍可调度的凭据数。
@@ -4179,6 +4267,30 @@ mod tests {
     }
 
     #[test]
+    fn refresh_rate_limit_does_not_disable_or_increment_failure_count() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![KiroCredentials::default()],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        let error = anyhow::Error::new(UpstreamRateLimitError::new(Some("30".to_string())));
+        let returned = manager
+            .handle_token_refresh_error(1, error)
+            .expect_err("429 应立即返回给调用方");
+
+        assert!(returned.downcast_ref::<UpstreamRateLimitError>().is_some());
+        let snapshot = manager.snapshot();
+        let entry = &snapshot.entries[0];
+        assert_eq!(entry.refresh_failure_count, 0);
+        assert!(!entry.disabled);
+        assert_eq!(entry.disabled_reason, None);
+    }
+
+    #[test]
     fn test_multi_token_manager_switch_to_next() {
         let config = Config::default();
         let mut cred1 = KiroCredentials::default();
@@ -5090,7 +5202,15 @@ mod tests {
 
         assert_eq!(manager.available_count_for_request(None, Some("g1")), 1);
         // g1 的唯一凭据进入冷却后，即使全局还有 g2，g1 也必须视为无可用账号。
-        assert_eq!(manager.report_account_throttled(1, StdDuration::from_secs(60)), 1);
+        assert_eq!(
+            manager.report_account_throttled_for_request(
+                1,
+                StdDuration::from_secs(60),
+                None,
+                Some("g1"),
+            ),
+            0
+        );
         assert_eq!(manager.available_count_for_request(None, Some("g1")), 0);
         assert_eq!(manager.available_count_for_request(None, Some("g2")), 1);
     }
