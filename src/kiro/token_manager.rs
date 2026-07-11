@@ -1442,6 +1442,23 @@ impl MultiTokenManager {
             .any(|e| base_schedulable(e, now, model, group) && dynamic_concurrency_limited(e))
     }
 
+    /// 获取当前请求范围内的可用凭据数量。
+    ///
+    /// 与全局 [`Self::available_count`] 不同，这里同时应用模型能力和客户端 Key
+    /// 绑定的分组过滤，供严格隔离场景判断是否还能故障转移。
+    pub fn available_count_for_request(
+        &self,
+        model: Option<&str>,
+        group: Option<&str>,
+    ) -> usize {
+        let now = Instant::now();
+        self.entries
+            .lock()
+            .iter()
+            .filter(|entry| schedulable(entry, now, model, group))
+            .count()
+    }
+
     /// 根据负载均衡模式选择下一个凭据
     ///
     /// - priority 模式：选择优先级最高（priority 最小）的可用凭据
@@ -5040,6 +5057,27 @@ mod tests {
         assert_eq!(manager.total_count_in_group(Some("g2")), 1); // B
         assert_eq!(manager.total_count_in_group(None), 3); // 全部
         assert_eq!(manager.total_count_in_group(Some("none")), 0);
+    }
+
+    #[test]
+    fn test_available_count_for_request_respects_group_throttle() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![
+                grouped_cred("a", &["g1"]),
+                grouped_cred("b", &["g2"]),
+            ],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(manager.available_count_for_request(None, Some("g1")), 1);
+        // g1 的唯一凭据进入冷却后，即使全局还有 g2，g1 也必须视为无可用账号。
+        assert_eq!(manager.report_account_throttled(1, StdDuration::from_secs(60)), 1);
+        assert_eq!(manager.available_count_for_request(None, Some("g1")), 0);
+        assert_eq!(manager.available_count_for_request(None, Some("g2")), 1);
     }
 
     #[test]

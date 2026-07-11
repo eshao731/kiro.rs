@@ -294,6 +294,25 @@ fn count_image_budget(payload: &super::types::MessagesRequest) -> ImageBudget {
 
 /// 将 KiroProvider 错误映射为 HTTP 响应
 pub(super) fn map_provider_error(err: Error) -> Response {
+    if let Some(rate_limit) = err.downcast_ref::<crate::kiro::provider::UpstreamRateLimitError>() {
+        tracing::warn!(error = %err, "上游限流（映射为 429）");
+        let mut response = (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(ErrorResponse::new(
+                "rate_limit_error",
+                "Upstream rate limit exceeded. Retry later.",
+            )),
+        )
+            .into_response();
+        if let Some(value) = rate_limit
+            .retry_after()
+            .and_then(|value| value.parse::<header::HeaderValue>().ok())
+        {
+            response.headers_mut().insert(header::RETRY_AFTER, value);
+        }
+        return response;
+    }
+
     if let Some(rate_limit) =
         err.downcast_ref::<crate::kiro::token_manager::RateLimitSoftThrottleError>()
     {
@@ -1855,6 +1874,18 @@ mod tests {
             "ValidationException: transient backend issue".to_string()
         ));
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[test]
+    fn upstream_rate_limit_maps_to_429_with_retry_after() {
+        let err = crate::kiro::provider::UpstreamRateLimitError::new(Some("1800".to_string()));
+        let resp = map_provider_error(err.into());
+
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            resp.headers().get(header::RETRY_AFTER).unwrap(),
+            "1800"
+        );
     }
 
     #[test]
