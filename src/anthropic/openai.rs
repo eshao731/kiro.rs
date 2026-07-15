@@ -398,11 +398,20 @@ pub(super) struct ParsedResponse {
     pub(super) finish_reason: String,
     pub(super) prompt_tokens: i64,
     pub(super) completion_tokens: i64,
+    /// 思考文本（content 里的 thinking 块 + web_search loop 的顶层
+    /// `kiro_thinking` 带外字段）。chat/completions 路径不消费，
+    /// Responses 路径渲染为 reasoning summary item。
+    pub(super) thinking: String,
+    /// 内部代答的 web_search 展示（server_tool_use 块）：(id, query)。
+    /// Responses 路径渲染为 web_search_call item。
+    pub(super) web_searches: Vec<(String, String)>,
 }
 
 pub(super) fn parse_anthropic_message(anthropic: &Value, model: &str) -> ParsedResponse {
     let mut text = String::new();
     let mut tool_calls = Vec::new();
+    let mut thinking = String::new();
+    let mut web_searches = Vec::new();
 
     if let Some(blocks) = anthropic.get("content").and_then(|v| v.as_array()) {
         for block in blocks {
@@ -410,6 +419,27 @@ pub(super) fn parse_anthropic_message(anthropic: &Value, model: &str) -> ParsedR
                 Some("text") => {
                     if let Some(t) = block.get("text").and_then(|v| v.as_str()) {
                         text.push_str(t);
+                    }
+                }
+                Some("thinking") => {
+                    if let Some(t) = block.get("thinking").and_then(|v| v.as_str()) {
+                        thinking.push_str(t);
+                    }
+                }
+                Some("server_tool_use") => {
+                    // 内部代答的 web_search 展示块（websearch_loop Contract A）
+                    if block.get("name").and_then(|v| v.as_str()) == Some("web_search") {
+                        let id = block
+                            .get("id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let query = block
+                            .pointer("/input/query")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        web_searches.push((id, query));
                     }
                 }
                 Some("tool_use") => {
@@ -433,8 +463,18 @@ pub(super) fn parse_anthropic_message(anthropic: &Value, model: &str) -> ParsedR
                         "function": { "name": name, "arguments": arguments },
                     }));
                 }
-                _ => {} // thinking / 其它块对 OpenAI 客户端无意义，忽略
+                _ => {} // web_search_tool_result / 其它块对 OpenAI 客户端无意义，忽略
             }
+        }
+    }
+
+    // web_search loop 的带外思考文本（不进 content，避免 Anthropic 客户端回放）
+    if let Some(t) = anthropic.get("kiro_thinking").and_then(|v| v.as_str()) {
+        if !t.is_empty() {
+            if !thinking.is_empty() {
+                thinking.push_str("\n\n");
+            }
+            thinking.push_str(t);
         }
     }
 
@@ -461,6 +501,8 @@ pub(super) fn parse_anthropic_message(anthropic: &Value, model: &str) -> ParsedR
         finish_reason,
         prompt_tokens,
         completion_tokens,
+        thinking,
+        web_searches,
     }
 }
 
