@@ -14,7 +14,7 @@
 # 中转层缓存计量落盘（运行时产物，不入库）
 /cache_metering.json
 /prompt_cache.json
-# 客户端 Key 分发（含明文 csk_*，绝对不能提交）
+# 客户端 Key 分发（含明文 API Key，绝对不能提交）
 /client_api_keys.json
 # 账号分组注册表（运行时产物，不入库）
 /groups.json

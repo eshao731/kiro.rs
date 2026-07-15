@@ -52,7 +52,7 @@
 - **Prompt cache 计量**：模拟 Anthropic cache_control 的 `cache_creation` / `cache_read` token 统计。
 - **用量统计**：按客户端 Key、模型、凭据、日期聚合 input/output/cache token 和 credits。
 - **请求链路追踪**：SQLite `traces.db`，记录成功 / 失败请求、尝试链路和错误类型。
-- 客户端 Key 分发：Admin 面板生成 `csk_*` Key，支持独立启停和统计。
+- 客户端 Key 分发：Admin 面板生成 `sk-...` Key，支持独立启停和统计。
 - **Admin UI**：概览、凭据管理、客户端 Key、请求日志四个主视图。
 - 代理能力：全局代理、凭据级代理、代理池、健康检查、轮询分配。
 - **在线更新**：从 GitHub Release / Docker Hub 拉取新版本，支持镜像定时自动更新与手动回退。
@@ -169,7 +169,7 @@ cargo test
 <a id="api-usage"></a>
 ## 调用 API
 
-`/v1` 路由支持 `x-api-key` 和 `Authorization: Bearer` 两种鉴权方式。Key 可以是主 `apiKey`，也可以是 Admin 面板生成的 `csk_*` 客户端 Key。
+`/v1` 路由支持 `x-api-key` 和 `Authorization: Bearer` 两种鉴权方式。Key 可以是 `config.json` 中用户自定义的 `apiKey`，也可以是 Admin 面板生成的 `sk-...` 客户端 Key。鉴权只比较完整 Key，不限制自定义 `apiKey` 的前缀或格式。
 
 ```bash
 curl http://127.0.0.1:8990/v1/messages \
@@ -622,7 +622,7 @@ data/
 
 说明：
 
-- `client_api_keys.json`：Admin 生成的 `csk_*` 客户端 Key，明文存储，用于鉴权。
+- `client_api_keys.json`：系统 Key 和 Admin 生成的 `sk-...` 客户端 Key，明文存储，用于鉴权。
 - `kiro_stats.json`：凭据成功 / 失败 / 额度 / 冷却等统计。
 - `kiro_balance_cache.json`：凭据订阅、额度、邮箱等缓存。
 - `proxy_pool.json`：代理池与健康状态。

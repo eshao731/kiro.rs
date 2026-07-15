@@ -1,7 +1,7 @@
 //! 客户端 API Key 管理
 //!
-//! 中转站对外分发的"客户端 Key"层。客户端调用 `/v1/messages` 时携带 `csk_*`
-//! 格式的 Key，由本模块校验并按 Key 维度记录调用次数与累计 Token。
+//! 中转站对外分发的"客户端 Key"层。程序生成的 Key 以 `sk-` 开头；鉴权时不校验
+//! 前缀，只按完整 Key 精确匹配，并按 Key 维度记录调用次数与累计 Token。
 //!
 //! 与上游 Kiro 凭据（`KiroCredentials`，`ksk_*`）相互独立：
 //! - 上游凭据池：服务对接 Kiro 的"出口"
@@ -17,9 +17,6 @@ use chrono::Utc;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
-
-/// 客户端 Key 前缀（区分上游 `ksk_`）
-pub const CLIENT_KEY_PREFIX: &str = "csk_";
 
 /// 单条客户端 Key
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -52,10 +49,10 @@ pub struct ClientKey {
     /// 绑定的账号分组名（可选）
     ///
     /// 设置后，用该 Key 发起的请求只会调度到 groups 包含此分组名的上游账号（严格隔离）。
-    /// None 表示不绑定分组，可使用全部账号（与 master apiKey 行为一致）。
+    /// None 表示不绑定分组，可使用全部账号。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
-    /// 系统 Key（由 config.json apiKey bootstrap 生成，不可删除 / 不可轮换）。
+    /// 系统 Key（由 config.json apiKey bootstrap 生成，不可删除、可轮换）。
     /// 老数据无此字段，默认 false。
     #[serde(default, skip_serializing_if = "is_false")]
     pub is_system: bool,
@@ -64,8 +61,8 @@ pub struct ClientKey {
 /// 客户端 Key 管理器
 ///
 /// 内部双索引：
-/// - `by_key: HashMap<String, u64>` —— 用于 `/v1` 鉴权时 O(1) 查询命中
-/// - `entries: HashMap<u64, ClientKey>` —— 用于按 id 读写明细
+/// - `by_key: HashMap<String, u64>` —— 用于 Key 判重和索引维护
+/// - `entries: HashMap<u64, ClientKey>` —— 用于按 id 读写明细和鉴权扫描
 ///
 /// 校验比对仍使用 `subtle::ConstantTimeEq` 防止时序攻击。
 pub struct ClientKeyManager {
@@ -459,10 +456,10 @@ impl ClientKeyManager {
     /// 校验 Key，命中且未禁用则返回 id；同时更新 `last_used_at`/`total_calls`
     ///
     /// 用 `ConstantTimeEq` 对所有 active Key 做常量时间比对，防止时序攻击；
-    /// 之前的 HashMap 直接 lookup 仅作快速短路（命中后还会再做一次常量时间比较）。
+    /// Key 的前缀和格式不参与鉴权，允许 `config.apiKey` 使用自定义值。
     pub fn verify_and_touch(&self, presented: &str) -> Option<u64> {
         let mut inner = self.inner.write();
-        // 第一遍：扫描所有 entry 做常量时间比较，避免 HashMap 短路泄露
+        // 扫描所有 entry 做常量时间比较，避免 HashMap 短路泄露
         let mut hit_id: Option<u64> = None;
         for (id, ck) in inner.entries.iter() {
             if ck.disabled {
@@ -528,7 +525,7 @@ fn is_false(b: &bool) -> bool {
     !b
 }
 
-/// 生成 `csk_` 前缀 + 32 位 base62 随机字符串
+/// 生成 `sk-` 前缀 + 32 位 base62 随机字符串
 pub fn generate_client_key() -> String {
     const CHARSET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     let body: String = (0..32)
@@ -537,7 +534,7 @@ pub fn generate_client_key() -> String {
             CHARSET[idx] as char
         })
         .collect();
-    format!("{}{}", CLIENT_KEY_PREFIX, body)
+    format!("sk-{}", body)
 }
 
 /// 脱敏展示：保留前 8 位（含前缀）和后 4 位
@@ -564,7 +561,7 @@ mod tests {
     fn create_and_verify() {
         let mgr = ClientKeyManager::new();
         let entry = mgr.create("test".to_string(), None, None);
-        assert!(entry.key.starts_with(CLIENT_KEY_PREFIX));
+        assert!(entry.key.starts_with("sk-"));
         assert_eq!(mgr.verify_and_touch(&entry.key), Some(entry.id));
         // 未登记的 Key 拒绝
         assert_eq!(mgr.verify_and_touch("nope"), None);
@@ -603,7 +600,7 @@ mod tests {
 
     #[test]
     fn mask_format() {
-        assert_eq!(mask_client_key("csk_abcdefghijklmnop"), "csk_abcd...mnop");
+        assert_eq!(mask_client_key("sk-abcdefghijklmnop"), "sk-abcde...mnop");
         assert_eq!(mask_client_key("short"), "short");
     }
 
@@ -615,9 +612,9 @@ mod tests {
         mgr.record_usage(entry.id, 100, 50, 5, 10, 1.5);
         let old_key = entry.key.clone();
         let rotated = mgr.rotate(entry.id).expect("rotate should succeed");
-        // 新 Key 与旧 Key 不同、且仍带前缀
+        // 新 Key 与旧 Key 不同，且使用统一生成前缀
         assert_ne!(rotated.key, old_key);
-        assert!(rotated.key.starts_with(CLIENT_KEY_PREFIX));
+        assert!(rotated.key.starts_with("sk-"));
         // 元数据保留
         assert_eq!(rotated.id, entry.id);
         assert_eq!(rotated.name, "kb");
@@ -641,12 +638,13 @@ mod tests {
     #[test]
     fn ensure_system_key_uses_id_zero() {
         let mgr = ClientKeyManager::new();
-        mgr.ensure_system_key("默认密钥".into(), None, "sk-kiro-abc".into());
+        mgr.ensure_system_key("默认密钥".into(), None, "custom-api-key".into());
         // 系统密钥固定在 id=0，对齐历史 keyId=0 用量桶
         assert!(mgr.is_system(0));
         assert_eq!(mgr.list().first().map(|k| k.id), Some(0));
+        assert_eq!(mgr.verify_and_touch("custom-api-key"), Some(0));
         // 幂等：再次调用不重复创建
-        mgr.ensure_system_key("默认密钥".into(), None, "sk-kiro-abc".into());
+        mgr.ensure_system_key("默认密钥".into(), None, "custom-api-key".into());
         assert_eq!(mgr.list().iter().filter(|k| k.is_system).count(), 1);
     }
 

@@ -818,7 +818,7 @@ pub struct UpdateAdminKeyRequest {
 #[serde(rename_all = "camelCase")]
 pub struct ClientKeyItem {
     pub id: u64,
-    /// 脱敏后的 Key 展示（如 csk_abcd...mnop）
+    /// 脱敏后的 Key 展示（如 sk-abcde...mnop）
     pub masked_key: String,
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -834,7 +834,7 @@ pub struct ClientKeyItem {
     pub total_cache_read_tokens: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
-    /// 是否系统密钥（config.json apiKey 导入，不可删除 / 不可轮换）
+    /// 是否系统密钥（config.json apiKey 导入，不可删除、可轮换）
     #[serde(default)]
     pub is_system: bool,
 }
