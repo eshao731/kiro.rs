@@ -392,7 +392,7 @@ export interface ClientKeyItem {
   totalCacheReadTokens: number
   /** 绑定的账号分组（未绑定时为 undefined） */
   group?: string
-  /** 是否系统密钥（config.json apiKey 导入，不可删除 / 不可轮换） */
+  /** 是否系统密钥（由 config.json apiKey 同步，不可删除、可轮换） */
   isSystem: boolean
 }
 

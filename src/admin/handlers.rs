@@ -1114,7 +1114,7 @@ pub async fn rotate_client_key(
     match state.client_keys.rotate(id) {
         Some(entry) => {
             // 系统密钥轮换后明文变了，需同步写回 config.json apiKey，
-            // 否则下次启动 ensure_system_key 会因旧 apiKey 不在列表而重复导入。
+            // 否则下次启动会按配置中的权威值恢复旧 Key。
             if entry.is_system {
                 state.service.persist_api_key(&entry.key);
             }

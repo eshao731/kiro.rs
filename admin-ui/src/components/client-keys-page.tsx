@@ -248,7 +248,7 @@ export function ClientKeysPage() {
                       <div className="flex items-center gap-1.5">
                         <span className="max-w-[220px] truncate font-medium">{k.name}</span>
                         {k.isSystem && (
-                          <Badge variant="secondary" title="由 config.json apiKey 导入，不可删除 / 不可轮换">
+                          <Badge variant="secondary" title="由 config.json apiKey 同步，不可删除、可轮换">
                             系统
                           </Badge>
                         )}
