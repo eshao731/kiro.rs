@@ -1062,6 +1062,15 @@ fn build_responses_sse(p: &ParsedResponse, kinds: &ToolKindMap) -> String {
                     }),
                     &mut seq,
                 );
+                emit(
+                    "response.custom_tool_call_input.done",
+                    json!({
+                        "item_id": mid,
+                        "output_index": output_index,
+                        "input": input.as_str(),
+                    }),
+                    &mut seq,
+                );
             }
             "reasoning" => {
                 let text = item
@@ -1619,9 +1628,29 @@ mod tests {
         assert!(sse.contains("event: response.output_item.added"));
         assert!(sse.contains("event: response.output_item.done"));
         assert!(sse.contains("event: response.custom_tool_call_input.delta"));
+        assert!(sse.contains("event: response.custom_tool_call_input.done"));
         assert!(sse.contains("\"custom_tool_call\""));
         assert!(sse.contains("PATCH BODY"));
         assert!(sse.contains("event: response.completed"));
+        let delta_pos = sse
+            .find("event: response.custom_tool_call_input.delta")
+            .unwrap();
+        let input_done_pos = sse
+            .find("event: response.custom_tool_call_input.done")
+            .unwrap();
+        let item_done_pos = sse.find("event: response.output_item.done").unwrap();
+        assert!(
+            delta_pos < input_done_pos && input_done_pos < item_done_pos,
+            "custom input must finish before the output item is marked done"
+        );
+        let input_done_line = sse
+            .lines()
+            .find(|l| {
+                l.starts_with("data: ")
+                    && l.contains("response.custom_tool_call_input.done")
+            })
+            .expect("custom input done event data line");
+        assert!(input_done_line.contains("\"input\":\"PATCH BODY\""));
         // added 也必须带完整 input（codex 反序列化要求字段存在）
         let added_line = sse
             .lines()
