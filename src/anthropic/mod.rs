@@ -25,6 +25,8 @@
 mod converter;
 mod handlers;
 mod middleware;
+mod openai;
+mod responses;
 pub mod cache_metering;
 mod router;
 pub mod stream;
