@@ -860,7 +860,7 @@ fn build_view(p: &ParsedResponse, kinds: &ToolKindMap) -> ResponsesView {
 
     let usage = json!({
         "input_tokens": p.prompt_tokens,
-        "input_tokens_details": { "cached_tokens": 0 },
+        "input_tokens_details": { "cached_tokens": p.cached_tokens },
         "output_tokens": p.completion_tokens,
         "output_tokens_details": { "reasoning_tokens": 0 },
         "total_tokens": p.prompt_tokens + p.completion_tokens,
@@ -1173,10 +1173,22 @@ mod tests {
             tool_calls,
             finish_reason: "tool_calls".to_string(),
             prompt_tokens: 10,
+            cached_tokens: 0,
             completion_tokens: 5,
             thinking: String::new(),
             web_searches: Vec::new(),
         }
+    }
+
+    #[test]
+    fn responses_usage_reports_cached_input_tokens() {
+        let mut parsed = parsed_with_tool_calls(Vec::new());
+        parsed.prompt_tokens = 1_000;
+        parsed.cached_tokens = 850;
+        let view = build_view(&parsed, &ToolKindMap::new());
+        assert_eq!(view.usage["input_tokens"], 1_000);
+        assert_eq!(view.usage["input_tokens_details"]["cached_tokens"], 850);
+        assert_eq!(view.usage["total_tokens"], 1_005);
     }
 
     fn kinds_of(pairs: &[(&str, DeclaredToolKind)]) -> ToolKindMap {

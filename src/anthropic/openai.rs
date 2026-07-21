@@ -396,7 +396,10 @@ pub(super) struct ParsedResponse {
     pub(super) text: String,
     pub(super) tool_calls: Vec<Value>, // OpenAI tool_calls
     pub(super) finish_reason: String,
+    /// Total prompt tokens, including uncached input, cache creation, and cache reads.
     pub(super) prompt_tokens: i64,
+    /// Prompt tokens served from an existing cache entry.
+    pub(super) cached_tokens: i64,
     pub(super) completion_tokens: i64,
     /// 思考文本（content 里的 thinking 块 + web_search loop 的顶层
     /// `kiro_thinking` 带外字段）。chat/completions 路径不消费，
@@ -485,10 +488,19 @@ pub(super) fn parse_anthropic_message(anthropic: &Value, model: &str) -> ParsedR
     let finish_reason = map_finish_reason(stop_reason, !tool_calls.is_empty()).to_string();
 
     let usage = anthropic.get("usage");
-    let prompt_tokens = usage
+    let input_tokens = usage
         .and_then(|u| u.get("input_tokens"))
         .and_then(|v| v.as_i64())
         .unwrap_or(0);
+    let cache_creation_tokens = usage
+        .and_then(|u| u.get("cache_creation_input_tokens"))
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    let cached_tokens = usage
+        .and_then(|u| u.get("cache_read_input_tokens"))
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    let prompt_tokens = input_tokens + cache_creation_tokens + cached_tokens;
     let completion_tokens = usage
         .and_then(|u| u.get("output_tokens"))
         .and_then(|v| v.as_i64())
@@ -500,6 +512,7 @@ pub(super) fn parse_anthropic_message(anthropic: &Value, model: &str) -> ParsedR
         tool_calls,
         finish_reason,
         prompt_tokens,
+        cached_tokens,
         completion_tokens,
         thinking,
         web_searches,
@@ -547,6 +560,7 @@ fn build_completion_json(p: &ParsedResponse) -> Value {
         }],
         "usage": {
             "prompt_tokens": p.prompt_tokens,
+            "prompt_tokens_details": { "cached_tokens": p.cached_tokens },
             "completion_tokens": p.completion_tokens,
             "total_tokens": p.prompt_tokens + p.completion_tokens,
         }
@@ -610,6 +624,7 @@ fn build_stream_sse(p: &ParsedResponse) -> String {
         }],
         "usage": {
             "prompt_tokens": p.prompt_tokens,
+            "prompt_tokens_details": { "cached_tokens": p.cached_tokens },
             "completion_tokens": p.completion_tokens,
             "total_tokens": p.prompt_tokens + p.completion_tokens,
         }
@@ -630,4 +645,43 @@ fn openai_error(status: StatusCode, err_type: &str, message: &str) -> Response {
         }
     });
     (status, Json(body)).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cached_anthropic_message() -> Value {
+        json!({
+            "content": [{"type": "text", "text": "ok"}],
+            "stop_reason": "end_turn",
+            "usage": {
+                "input_tokens": 100,
+                "cache_creation_input_tokens": 50,
+                "cache_read_input_tokens": 850,
+                "output_tokens": 10
+            }
+        })
+    }
+
+    #[test]
+    fn parses_anthropic_cache_usage_into_openai_totals() {
+        let parsed = parse_anthropic_message(&cached_anthropic_message(), "gpt-5.6-terra");
+        assert_eq!(parsed.prompt_tokens, 1_000);
+        assert_eq!(parsed.cached_tokens, 850);
+        assert_eq!(parsed.completion_tokens, 10);
+    }
+
+    #[test]
+    fn chat_completion_reports_cached_prompt_tokens() {
+        let parsed = parse_anthropic_message(&cached_anthropic_message(), "gpt-5.6-terra");
+        let body = build_completion_json(&parsed);
+        assert_eq!(body["usage"]["prompt_tokens"], 1_000);
+        assert_eq!(body["usage"]["prompt_tokens_details"]["cached_tokens"], 850);
+        assert_eq!(body["usage"]["total_tokens"], 1_010);
+
+        let sse = build_stream_sse(&parsed);
+        assert!(sse.contains("\"prompt_tokens\":1000"));
+        assert!(sse.contains("\"cached_tokens\":850"));
+    }
 }

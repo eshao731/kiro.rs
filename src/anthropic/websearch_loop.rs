@@ -27,6 +27,7 @@ use crate::kiro::provider::KiroProvider;
 use crate::token;
 
 use super::converter::{ConversionError, convert_request, get_context_window_size};
+use super::cache_metering::SharedCacheMeter;
 use super::handlers::{UsageRecordHook, map_provider_error};
 use super::stream::SseEvent;
 use super::types::{ErrorResponse, Message, MessagesRequest};
@@ -585,6 +586,8 @@ pub(super) async fn run_web_search_loop(
     hook: UsageRecordHook,
     stream_client: bool,
     group: Option<String>,
+    cache_meter: Option<SharedCacheMeter>,
+    key_id: u64,
 ) -> Response {
     let fallback_input_tokens = token::count_all_tokens(
         payload.model.clone(),
@@ -592,6 +595,13 @@ pub(super) async fn run_web_search_loop(
         payload.messages.clone(),
         payload.tools.clone(),
     ) as i32;
+    // Compute against the original client prompt before the loop appends internal
+    // web-search tool rounds. This mirrors the normal messages path and records the
+    // stable prefix immediately, so the next request can report a cache read.
+    let cache_usage = cache_meter
+        .as_ref()
+        .map(|cache| super::cache_metering::compute_cache_usage(cache, &payload, key_id))
+        .unwrap_or_default();
 
     let mut presentation: Vec<Value> = Vec::new();
     let mut last_credential_id: u64 = 0;
@@ -755,25 +765,37 @@ pub(super) async fn run_web_search_loop(
         );
 
         let output_tokens = token::estimate_output_tokens(&content);
+        let (input_tokens, cache_creation_tokens, cache_read_tokens) =
+            cache_usage.split_against_total(final_input);
         hook.record(
             last_credential_id,
-            final_input,
+            input_tokens,
             output_tokens,
-            0,
-            0,
+            cache_creation_tokens,
+            cache_read_tokens,
             total_credits,
             "success",
         );
 
         return if stream_client {
-            render_sse(&payload.model, content, &stop_reason, final_input, output_tokens)
+            render_sse(
+                &payload.model,
+                content,
+                &stop_reason,
+                input_tokens,
+                output_tokens,
+                cache_creation_tokens,
+                cache_read_tokens,
+            )
         } else {
             render_json(
                 &payload.model,
                 content,
                 &stop_reason,
-                final_input,
+                input_tokens,
                 output_tokens,
+                cache_creation_tokens,
+                cache_read_tokens,
                 &all_thinking,
             )
         };
@@ -801,6 +823,8 @@ pub(crate) fn render_json(
     stop_reason: &str,
     input_tokens: i32,
     output_tokens: i32,
+    cache_creation_tokens: i32,
+    cache_read_tokens: i32,
     thinking: &str,
 ) -> Response {
     let mut body = json!({
@@ -814,8 +838,8 @@ pub(crate) fn render_json(
         "usage": {
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
-            "cache_creation_input_tokens": 0,
-            "cache_read_input_tokens": 0
+            "cache_creation_input_tokens": cache_creation_tokens,
+            "cache_read_input_tokens": cache_read_tokens
         }
     });
     if !thinking.is_empty() {
@@ -831,8 +855,18 @@ fn render_sse(
     stop_reason: &str,
     input_tokens: i32,
     output_tokens: i32,
+    cache_creation_tokens: i32,
+    cache_read_tokens: i32,
 ) -> Response {
-    let events = build_sse_events(model, content, stop_reason, input_tokens, output_tokens);
+    let events = build_sse_events(
+        model,
+        content,
+        stop_reason,
+        input_tokens,
+        output_tokens,
+        cache_creation_tokens,
+        cache_read_tokens,
+    );
     let stream = stream::iter(
         events
             .into_iter()
@@ -854,6 +888,8 @@ fn build_sse_events(
     stop_reason: &str,
     input_tokens: i32,
     output_tokens: i32,
+    cache_creation_tokens: i32,
+    cache_read_tokens: i32,
 ) -> Vec<SseEvent> {
     let mut events = Vec::new();
     let message_id = format!(
@@ -876,8 +912,8 @@ fn build_sse_events(
                 "usage": {
                     "input_tokens": input_tokens,
                     "output_tokens": 0,
-                    "cache_creation_input_tokens": 0,
-                    "cache_read_input_tokens": 0
+                    "cache_creation_input_tokens": cache_creation_tokens,
+                    "cache_read_input_tokens": cache_read_tokens
                 }
             }
         }),
@@ -1185,10 +1221,13 @@ mod tests {
             json!({"type": "text", "text": "done"}),
             json!({"type": "tool_use", "id": "toolu_exec", "name": "exec", "input": {"cmd": "ls"}}),
         ];
-        let events = build_sse_events("claude-sonnet-4-8", content, "tool_use", 10, 5);
+        let events = build_sse_events("claude-sonnet-4-8", content, "tool_use", 10, 5, 3, 7);
 
         // Must contain message_start / message_delta(stop_reason) / message_stop
         assert_eq!(events.first().unwrap().event, "message_start");
+        assert_eq!(events[0].data["message"]["usage"]["input_tokens"], 10);
+        assert_eq!(events[0].data["message"]["usage"]["cache_creation_input_tokens"], 3);
+        assert_eq!(events[0].data["message"]["usage"]["cache_read_input_tokens"], 7);
         assert_eq!(events.last().unwrap().event, "message_stop");
         let delta = events.iter().find(|e| e.event == "message_delta").unwrap();
         assert_eq!(delta.data["delta"]["stop_reason"], "tool_use");

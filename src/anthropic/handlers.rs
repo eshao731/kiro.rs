@@ -669,8 +669,16 @@ pub async fn post_messages(
     // where the upstream may return a tool_use with name=web_search. Take the internal agentic loop: search internally and feed the results back.
     if websearch::has_web_search_among_tools(&payload) {
         tracing::info!("detected mixed tools containing web_search, entering the web_search agentic loop");
-        return super::websearch_loop::run_web_search_loop(provider, payload, hook, payload_stream, key_ctx.group.clone())
-            .await;
+        return super::websearch_loop::run_web_search_loop(
+            provider,
+            payload,
+            hook,
+            payload_stream,
+            key_ctx.group.clone(),
+            state.cache_meter.clone(),
+            key_ctx.key_id,
+        )
+        .await;
     }
 
     // 转换请求
@@ -1437,8 +1445,16 @@ pub async fn post_messages_cc(
     // where the upstream may return a tool_use with name=web_search. Take the internal agentic loop: search internally and feed the results back.
     if websearch::has_web_search_among_tools(&payload) {
         tracing::info!("detected mixed tools containing web_search, entering the web_search agentic loop");
-        return super::websearch_loop::run_web_search_loop(provider, payload, hook, payload_stream, key_ctx.group.clone())
-            .await;
+        return super::websearch_loop::run_web_search_loop(
+            provider,
+            payload,
+            hook,
+            payload_stream,
+            key_ctx.group.clone(),
+            state.cache_meter.clone(),
+            key_ctx.key_id,
+        )
+        .await;
     }
 
     // 转换请求
