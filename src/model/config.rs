@@ -98,6 +98,11 @@ pub struct Config {
     #[serde(default)]
     pub admin_api_key: Option<String>,
 
+    /// 运维凭据导入 API 密钥（可选）。配置非空值后启用专用的 Kiro API Key 导入接口，
+    /// 与 adminApiKey 相互独立。
+    #[serde(default)]
+    pub credential_import_api_key: Option<String>,
+
     /// 上一次成功更新前正在运行的版本号，用于在前端展示「回退到 vX.Y.Z」按钮。
     /// 实际回退动作通过 `<exe>.backup` 文件完成，无需访问网络。
     #[serde(default)]
@@ -291,6 +296,7 @@ impl Default for Config {
             proxy_username: None,
             proxy_password: None,
             admin_api_key: None,
+            credential_import_api_key: None,
             update_previous_version: None,
             github_token: None,
             update_last_applied_at: None,

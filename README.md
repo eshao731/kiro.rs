@@ -243,6 +243,7 @@ curl http://127.0.0.1:8990/v1/messages/count_tokens \
 |---|---|
 | `/admin` | 嵌入式 Web 管理界面 |
 | `/api/admin/credentials` | 凭据列表、新增、编辑、删除 |
+| `/api/admin/credentials/kiro-api-key` | 使用运维专用密钥导入 Kiro API Key 凭据 |
 | `/api/admin/credentials/{id}/balance` | 查询单个凭据订阅 / 用量 |
 | `/api/admin/credentials/{id}/models` | 查询该凭据上游实际可用模型 |
 | `/api/admin/client-keys` | 客户端 Key 管理 |
@@ -257,6 +258,27 @@ Admin API 鉴权同样支持：
 
 - `x-api-key: <adminApiKey>`
 - `Authorization: Bearer <adminApiKey>`
+
+运维系统可以通过独立密钥导入 Kiro API Key。先在 `config.json` 配置：
+
+```json
+{
+  "credentialImportApiKey": "sk-credential-import-change-me"
+}
+```
+
+然后调用：
+
+```bash
+curl -X POST http://127.0.0.1:8990/api/admin/credentials/kiro-api-key \
+  -H 'content-type: application/json' \
+  -H 'x-credential-import-key: sk-credential-import-change-me' \
+  -d '{"kiroApiKey":"ksk_xxx"}'
+```
+
+该接口只接受 `x-credential-import-key`，不会接受 `adminApiKey`。请求还可携带
+`priority`、`groups` 和 `sourceChannel`；成功后会复用标准新增凭据流程完成去重、分配 ID、
+持久化与余额刷新。未配置或配置为空时，该路由不会挂载。
 
 <a id="configuration"></a>
 ## ⚙️ 配置
@@ -285,6 +307,7 @@ Admin API 鉴权同样支持：
 | `port` | `8080` | 监听端口。自动生成配置时为 `8990` |
 | `apiKey` | 无 | 主 API Key，调用 `/v1` 和 `/cc/v1` 必填 |
 | `adminApiKey` | 无 | 设置后启用 `/admin` 和 `/api/admin` |
+| `credentialImportApiKey` | 无 | 设置后启用 Kiro API Key 运维导入接口（同时需要启用 Admin API） |
 | `region` | `us-east-1` | 全局默认 Region |
 | `authRegion` | 无 | token 刷新用 Region，未配置时回退 `region` |
 | `apiRegion` | 无 | Kiro API 请求用 Region，未配置时回退 `region` |

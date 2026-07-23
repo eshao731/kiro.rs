@@ -215,6 +215,62 @@ fn default_auth_method() -> String {
     "social".to_string()
 }
 
+/// 运维接口导入 Kiro API Key 的受限请求。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportKiroApiKeyRequest {
+    /// Kiro API Key（格式: ksk_xxxxxxxx）
+    pub kiro_api_key: String,
+
+    /// 优先级（可选，默认 0）
+    #[serde(default)]
+    pub priority: u32,
+
+    /// 账号所属分组（可选）
+    #[serde(default)]
+    pub groups: Vec<String>,
+
+    /// 账号来源渠道（可选，默认标记为 operations-api）
+    #[serde(default)]
+    pub source_channel: Option<String>,
+}
+
+impl From<ImportKiroApiKeyRequest> for AddCredentialRequest {
+    fn from(req: ImportKiroApiKeyRequest) -> Self {
+        Self {
+            refresh_token: None,
+            access_token: None,
+            profile_arn: None,
+            expires_at: None,
+            auth_method: "api_key".to_string(),
+            provider: None,
+            client_id: None,
+            client_secret: None,
+            start_url: None,
+            token_endpoint: None,
+            issuer_url: None,
+            scopes: None,
+            priority: req.priority,
+            region: None,
+            auth_region: None,
+            api_region: None,
+            machine_id: None,
+            email: None,
+            proxy_url: None,
+            proxy_username: None,
+            proxy_password: None,
+            kiro_api_key: Some(req.kiro_api_key.trim().to_string()),
+            endpoint: None,
+            groups: req.groups,
+            source_channel: Some(
+                req.source_channel
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or_else(|| "operations-api".to_string()),
+            ),
+        }
+    }
+}
+
 /// 更新 refreshToken 请求
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1037,6 +1093,13 @@ impl AdminErrorResponse {
         Self::new("authentication_error", "Invalid or missing admin API key")
     }
 
+    pub fn credential_import_authentication_error() -> Self {
+        Self::new(
+            "authentication_error",
+            "Invalid or missing credential import API key",
+        )
+    }
+
     pub fn not_found(message: impl Into<String>) -> Self {
         Self::new("not_found", message)
     }
@@ -1102,4 +1165,39 @@ pub struct DeleteGroupQuery {
     /// 强制删除：即使仍有引用也删；同时级联清理凭据 / Key 的引用
     #[serde(default)]
     pub force: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AddCredentialRequest, ImportKiroApiKeyRequest};
+
+    #[test]
+    fn import_kiro_api_key_request_maps_to_standard_add_flow() {
+        let import: ImportKiroApiKeyRequest = serde_json::from_value(serde_json::json!({
+            "kiroApiKey": "ksk_test",
+            "priority": 7,
+            "groups": ["operations"]
+        }))
+        .expect("请求应可反序列化");
+
+        let add: AddCredentialRequest = import.into();
+        assert_eq!(add.auth_method, "api_key");
+        assert_eq!(add.kiro_api_key.as_deref(), Some("ksk_test"));
+        assert_eq!(add.priority, 7);
+        assert_eq!(add.groups, vec!["operations"]);
+        assert_eq!(add.source_channel.as_deref(), Some("operations-api"));
+        assert!(add.refresh_token.is_none());
+    }
+
+    #[test]
+    fn import_kiro_api_key_request_preserves_source_channel() {
+        let import: ImportKiroApiKeyRequest = serde_json::from_value(serde_json::json!({
+            "kiroApiKey": "ksk_test",
+            "sourceChannel": "account-manager"
+        }))
+        .expect("请求应可反序列化");
+
+        let add: AddCredentialRequest = import.into();
+        assert_eq!(add.source_channel.as_deref(), Some("account-manager"));
+    }
 }

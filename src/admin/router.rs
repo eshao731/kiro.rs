@@ -16,19 +16,19 @@ use super::{
         export_credentials, force_refresh_token, get_account_throttle_config,
         get_all_credentials, get_credential_balance, get_credential_models, get_global_proxy,
         get_load_balancing_mode, get_log_governance_config, get_proxy_pool, get_update_config,
-        list_client_keys, list_groups, list_traces, trace_failure_stats, poll_idc_login,
-        poll_idc_relogin, poll_social_login,
-        poll_social_relogin, pull_update_image, reset_all_success_count, reset_client_key_stats,
-        reset_failure_count, reset_success_count, rollback_image_update, rotate_client_key,
-        set_account_throttle_config, set_client_key_disabled, set_credential_disabled,
-        set_credential_overage, set_credential_priority, set_global_proxy,
-        set_load_balancing_mode, set_log_governance_config, set_proxy_enabled, set_update_config,
-        social_oauth_callback, start_idc_login, start_idc_relogin, start_social_login,
-        start_social_relogin, stats_by_credential, stats_by_model, stats_overview,
-        stats_timeseries, update_admin_key, update_client_key, update_credential, update_group,
+        import_kiro_api_key, list_client_keys, list_groups, list_traces, poll_idc_login,
+        poll_idc_relogin, poll_social_login, poll_social_relogin, pull_update_image,
+        reset_all_success_count, reset_client_key_stats, reset_failure_count, reset_success_count,
+        rollback_image_update, rotate_client_key, set_account_throttle_config,
+        set_client_key_disabled, set_credential_disabled, set_credential_overage,
+        set_credential_priority, set_global_proxy, set_load_balancing_mode,
+        set_log_governance_config, set_proxy_enabled, set_update_config, social_oauth_callback,
+        start_idc_login, start_idc_relogin, start_social_login, start_social_relogin,
+        stats_by_credential, stats_by_model, stats_overview, stats_timeseries,
+        trace_failure_stats, update_admin_key, update_client_key, update_credential, update_group,
         update_refresh_token,
     },
-    middleware::{AdminState, admin_auth_middleware},
+    middleware::{AdminState, admin_auth_middleware, credential_import_auth_middleware},
 };
 
 /// 创建 Admin API 路由
@@ -168,12 +168,26 @@ pub fn create_admin_router(state: AdminState) -> Router {
             admin_auth_middleware,
         ));
 
+    // 运维专用导入路由：只使用独立的 x-credential-import-key 认证。
+    // 未配置 credentialImportApiKey 时不挂载该路由。
+    let credential_import = if state.credential_import_api_key.is_some() {
+        Router::new()
+            .route("/credentials/kiro-api-key", post(import_kiro_api_key))
+            .layer(middleware::from_fn_with_state(
+                state.clone(),
+                credential_import_auth_middleware,
+            ))
+    } else {
+        Router::new()
+    };
+
     // 免鉴权路由：远程部署模式下 OAuth 公网回调（浏览器顶层导航到达，不带 admin API Key）。
     // 由 OAuth state 定位会话，CSRF 保护与本地回调服务器同等。
     let public = Router::new().route("/auth/callback/{*tail}", get(social_oauth_callback));
 
     Router::new()
         .merge(authenticated)
+        .merge(credential_import)
         .merge(public)
         .with_state(state)
 }

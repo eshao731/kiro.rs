@@ -301,7 +301,8 @@ async fn main() {
                 usage_aggregator.clone(),
                 admin_trace_store,
                 group_manager.clone(),
-            );
+            )
+            .with_credential_import_api_key(config.credential_import_api_key.clone());
 
             // 启动余额后台刷新调度器（每 5 分钟一次，与缓存 TTL 对齐）
             admin_state
@@ -317,6 +318,7 @@ async fn main() {
             // 且开启 update_auto_apply 时执行一次更新；否则静默等待。
             admin_state.service.start_auto_update_scheduler();
 
+            let credential_import_enabled = admin_state.credential_import_api_key.is_some();
             let admin_app = admin::create_admin_router(admin_state);
 
             // 创建 Admin UI 路由
@@ -324,6 +326,11 @@ async fn main() {
 
             tracing::info!("Admin API 已启用");
             tracing::info!("Admin UI 已启用: /admin");
+            if credential_import_enabled {
+                tracing::info!(
+                    "运维凭据导入 API 已启用: POST /api/admin/credentials/kiro-api-key"
+                );
+            }
             anthropic_app
                 .nest("/api/admin", admin_app)
                 .nest("/admin", admin_ui_app)

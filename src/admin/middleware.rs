@@ -25,6 +25,8 @@ use crate::common::auth;
 pub struct AdminState {
     /// 登录API密钥（管理面板登录用，运行时可修改）
     pub admin_api_key: Arc<RwLock<String>>,
+    /// 运维凭据导入 API 密钥（独立于管理面板密钥）
+    pub credential_import_api_key: Option<Arc<str>>,
     /// Admin 服务
     pub service: Arc<AdminService>,
     /// 客户端 Key 管理器（与 anthropic 路由共享）
@@ -48,12 +50,20 @@ impl AdminState {
     ) -> Self {
         Self {
             admin_api_key: Arc::new(RwLock::new(admin_api_key.into())),
+            credential_import_api_key: None,
             service: Arc::new(service),
             client_keys,
             usage_aggregator,
             trace_store,
             groups,
         }
+    }
+
+    pub fn with_credential_import_api_key(mut self, api_key: Option<String>) -> Self {
+        self.credential_import_api_key = api_key
+            .filter(|key| !key.trim().is_empty())
+            .map(Arc::<str>::from);
+        self
     }
 }
 
@@ -72,5 +82,65 @@ pub async fn admin_auth_middleware(
             let error = AdminErrorResponse::authentication_error();
             (StatusCode::UNAUTHORIZED, Json(error)).into_response()
         }
+    }
+}
+
+/// 运维凭据导入 API 认证中间件。
+///
+/// 只接受专用的 `x-credential-import-key` 请求头，不接受 adminApiKey 或 Bearer 认证。
+pub async fn credential_import_auth_middleware(
+    State(state): State<AdminState>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    let authenticated =
+        credential_import_key_matches(&request, state.credential_import_api_key.as_deref());
+
+    if authenticated {
+        next.run(request).await
+    } else {
+        let error = AdminErrorResponse::credential_import_authentication_error();
+        (StatusCode::UNAUTHORIZED, Json(error)).into_response()
+    }
+}
+
+fn credential_import_key_matches(request: &Request<Body>, expected_key: Option<&str>) -> bool {
+    let supplied_key = request
+        .headers()
+        .get("x-credential-import-key")
+        .and_then(|value| value.to_str().ok());
+
+    expected_key
+        .zip(supplied_key)
+        .is_some_and(|(expected, supplied)| auth::constant_time_eq(supplied, expected))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::credential_import_key_matches;
+    use axum::{body::Body, http::Request};
+
+    #[test]
+    fn credential_import_auth_accepts_only_dedicated_header() {
+        let request = Request::builder()
+            .header("x-credential-import-key", "ops-secret")
+            .body(Body::empty())
+            .unwrap();
+        assert!(credential_import_key_matches(&request, Some("ops-secret")));
+    }
+
+    #[test]
+    fn credential_import_auth_rejects_admin_header_and_missing_config() {
+        let request = Request::builder()
+            .header("x-api-key", "ops-secret")
+            .body(Body::empty())
+            .unwrap();
+        assert!(!credential_import_key_matches(&request, Some("ops-secret")));
+
+        let request = Request::builder()
+            .header("x-credential-import-key", "ops-secret")
+            .body(Body::empty())
+            .unwrap();
+        assert!(!credential_import_key_matches(&request, None));
     }
 }
