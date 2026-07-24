@@ -56,6 +56,14 @@ pub struct CredentialStatusItem {
     pub success_count: u64,
     /// 最后一次 API 调用时间（RFC3339 格式）
     pub last_used_at: Option<String>,
+    /// 凭据首次进入当前系统的时间（RFC3339 格式）
+    pub created_at: String,
+    /// 因连续失败过多自动禁用的时间（RFC3339 格式）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disabled_at: Option<String>,
+    /// 自动禁用前的存活秒数
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub survival_seconds: Option<u64>,
     /// 是否配置了凭据级代理
     pub has_proxy: bool,
     /// 代理 URL（用于前端展示）
@@ -95,6 +103,14 @@ pub struct CredentialStatusItem {
     /// 余额缓存的更新时间（Unix 秒，仅在 balance 有值时返回）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub balance_updated_at: Option<f64>,
+}
+
+/// 单个 API Key 凭据的原始 Key 响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CredentialApiKeyResponse {
+    pub id: u64,
+    pub kiro_api_key: String,
 }
 
 // ============ 操作请求 ============

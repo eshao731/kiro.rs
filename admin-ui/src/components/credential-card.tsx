@@ -88,6 +88,22 @@ function formatLastUsed(lastUsedAt: string | null): string {
   return `${Math.floor(h / 24)} 天前`;
 }
 
+function formatDateTime(value: string): string {
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? "未知" : date.toLocaleString("zh-CN");
+}
+
+function formatDuration(totalSeconds: number): string {
+  const seconds = Math.max(0, Math.floor(totalSeconds));
+  const days = Math.floor(seconds / 86400);
+  const hours = Math.floor((seconds % 86400) / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  if (days > 0) return `${days} 天 ${hours} 小时`;
+  if (hours > 0) return `${hours} 小时 ${minutes} 分钟`;
+  if (minutes > 0) return `${minutes} 分钟`;
+  return `${seconds} 秒`;
+}
+
 function formatNumber(n: number): string {
   return n.toLocaleString("zh-CN", {
     minimumFractionDigits: 2,
@@ -1019,6 +1035,23 @@ export function CredentialCard({
                 {formatLastUsed(credential.lastUsedAt)}
               </dd>
             </div>
+            <div className="flex min-w-0 items-center justify-between gap-2 min-[420px]:col-span-2">
+              <dt className="shrink-0 text-muted-foreground">导入 / 生成</dt>
+              <dd className="min-w-0 truncate text-right font-medium">
+                {formatDateTime(credential.createdAt)}
+              </dd>
+            </div>
+            {credential.survivalSeconds !== undefined && (
+              <div className="flex min-w-0 items-center justify-between gap-2 min-[420px]:col-span-2">
+                <dt className="shrink-0 text-muted-foreground">存活时间</dt>
+                <dd
+                  className="min-w-0 truncate text-right font-medium text-amber-600 dark:text-amber-400"
+                  title={credential.disabledAt ? `自动禁用于 ${formatDateTime(credential.disabledAt)}` : undefined}
+                >
+                  {formatDuration(credential.survivalSeconds)}
+                </dd>
+              </div>
+            )}
             {credential.maskedApiKey && (
               <div className="flex min-w-0 items-center justify-between gap-2 min-[420px]:col-span-2">
                 <dt className="shrink-0 text-muted-foreground">API Key</dt>

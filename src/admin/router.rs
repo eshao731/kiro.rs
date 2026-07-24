@@ -14,7 +14,8 @@ use super::{
         complete_social_relogin, create_client_key, create_group, delete_client_key,
         delete_credential, delete_group, delete_proxy, disable_quota_exceeded, enable_overage_all,
         export_credentials, force_refresh_token, get_account_throttle_config,
-        get_all_credentials, get_credential_balance, get_credential_models, get_global_proxy,
+        get_all_credentials, get_credential_api_key, get_credential_balance,
+        get_credential_models, get_global_proxy,
         get_load_balancing_mode, get_log_governance_config, get_proxy_pool, get_update_config,
         import_kiro_api_key, list_client_keys, list_groups, list_traces, poll_idc_login,
         poll_idc_relogin, poll_social_login, poll_social_relogin, pull_update_image,
@@ -81,6 +82,7 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/credentials/{id}/refresh", post(force_refresh_token))
         .route("/credentials/{id}/refresh-token", put(update_refresh_token))
         .route("/credentials/{id}/balance", get(get_credential_balance))
+        .route("/credentials/{id}/api-key", get(get_credential_api_key))
         .route("/credentials/{id}/models", get(get_credential_models))
         .route("/credentials/{id}/proxy", post(assign_proxy_to_credential))
         .route("/proxy-pool", get(get_proxy_pool).post(add_proxy))

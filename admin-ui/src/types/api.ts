@@ -25,6 +25,12 @@ export interface CredentialStatusItem {
   maskedApiKey?: string
   successCount: number
   lastUsedAt: string | null
+  /** 凭据首次进入当前系统的时间（RFC3339） */
+  createdAt: string
+  /** 因连续失败过多自动禁用的时间（RFC3339） */
+  disabledAt?: string
+  /** 自动禁用前的存活秒数 */
+  survivalSeconds?: number
   hasProxy: boolean
   proxyUrl?: string
   refreshFailureCount: number
@@ -48,6 +54,11 @@ export interface CredentialStatusItem {
   balance?: BalanceResponse
   /** 余额缓存的更新时间（Unix 秒） */
   balanceUpdatedAt?: number
+}
+
+export interface CredentialApiKeyResponse {
+  id: number
+  kiroApiKey: string
 }
 
 // 余额响应

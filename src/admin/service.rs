@@ -22,7 +22,8 @@ use super::types::{
     AccountThrottleConfigResponse, AddCredentialRequest, AddCredentialResponse,
     AssignProxyRequest, AssignRoundRobinResponse, AvailableModelItem, AvailableModelsResponse,
     BalanceResponse, BatchAddProxyRequest, BatchImportEvent,
-    CheckRateLimitRequest, CredentialStatusItem, CredentialsStatusResponse, EnableOverageAllResult,
+    CheckRateLimitRequest, CredentialApiKeyResponse, CredentialStatusItem,
+    CredentialsStatusResponse, EnableOverageAllResult,
     GitHubRateLimitInfo, ImageUpdateResponse, ExportedAccount, ExportedCredentials,
     CredentialsExportResponse,
     LoadBalancingModeResponse, LogGovernanceConfigResponse, PollIdcLoginResponse,
@@ -559,6 +560,18 @@ impl AdminService {
                     .map(|c| (Some(c.data.clone()), Some(c.cached_at)))
                     .unwrap_or((None, None));
 
+                let survival_seconds = match entry.disabled_reason.as_deref() {
+                    Some("TooManyFailures" | "TooManyRefreshFailures") => entry
+                        .disabled_at
+                        .as_deref()
+                        .and_then(|disabled_at| {
+                            let created = DateTime::parse_from_rfc3339(&entry.created_at).ok()?;
+                            let disabled = DateTime::parse_from_rfc3339(disabled_at).ok()?;
+                            u64::try_from((disabled - created).num_seconds()).ok()
+                        }),
+                    _ => None,
+                };
+
                 CredentialStatusItem {
                     id: entry.id,
                     priority: entry.priority,
@@ -576,6 +589,9 @@ impl AdminService {
                     email: entry.email,
                     success_count: entry.success_count,
                     last_used_at: entry.last_used_at.clone(),
+                    created_at: entry.created_at,
+                    disabled_at: entry.disabled_at,
+                    survival_seconds,
                     has_proxy: entry.has_proxy,
                     proxy_url: entry.proxy_url,
                     refresh_failure_count: entry.refresh_failure_count,
@@ -603,6 +619,33 @@ impl AdminService {
             current_id: snapshot.current_id,
             credentials,
         }
+    }
+
+    /// 按需获取单个 API Key 凭据的原始 Key。
+    pub fn get_credential_api_key(
+        &self,
+        id: u64,
+    ) -> Result<CredentialApiKeyResponse, AdminServiceError> {
+        let snapshot = self.token_manager.snapshot();
+        let entry = snapshot
+            .entries
+            .iter()
+            .find(|entry| entry.id == id)
+            .ok_or(AdminServiceError::NotFound { id })?;
+
+        if entry.auth_method.as_deref() != Some("api_key") {
+            return Err(AdminServiceError::InvalidCredential(format!(
+                "凭据 #{} 不是 API Key 凭据",
+                id
+            )));
+        }
+
+        let kiro_api_key = self
+            .token_manager
+            .get_kiro_api_key(id)
+            .map_err(|error| AdminServiceError::InternalError(error.to_string()))?;
+
+        Ok(CredentialApiKeyResponse { id, kiro_api_key })
     }
 
     /// 导出凭据为兼容 JSON（嵌套 `Account` 格式）

@@ -2,6 +2,7 @@ import axios from 'axios'
 import { storage } from '@/lib/storage'
 import type {
   CredentialsStatusResponse,
+  CredentialApiKeyResponse,
   BalanceResponse,
   AvailableModelsResponse,
   SuccessResponse,
@@ -69,6 +70,12 @@ api.interceptors.request.use((config) => {
 // 获取所有凭据状态
 export async function getCredentials(): Promise<CredentialsStatusResponse> {
   const { data } = await api.get<CredentialsStatusResponse>('/credentials')
+  return data
+}
+
+// 按需获取单个 API Key 凭据的原始 Key（管理员认证）
+export async function getCredentialApiKey(id: number): Promise<CredentialApiKeyResponse> {
+  const { data } = await api.get<CredentialApiKeyResponse>(`/credentials/${id}/api-key`)
   return data
 }
 

@@ -43,6 +43,22 @@ pub async fn get_all_credentials(State(state): State<AdminState>) -> impl IntoRe
     Json(response)
 }
 
+/// GET /api/admin/credentials/:id/api-key
+/// 按需获取 API Key 凭据的原始 Key（受管理员认证保护）
+pub async fn get_credential_api_key(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+) -> impl IntoResponse {
+    match state.service.get_credential_api_key(id) {
+        Ok(response) => (
+            [(header::CACHE_CONTROL, "no-store")],
+            Json(response),
+        )
+            .into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
 /// GET /api/admin/credentials/export
 /// 导出凭据为兼容 JSON（含 refreshToken 等敏感字段）
 ///
