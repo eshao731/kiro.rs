@@ -461,6 +461,7 @@ KIRO_API_KEY=ksk_xxx ./kiro-rs
 
 当前静态列表包含：
 
+- `claude-opus-5` / `claude-opus-5-thinking`（实验预览，1M 上下文）
 - `claude-opus-4-8` / `claude-opus-4-8-thinking`
 - `claude-sonnet-4-8` / `claude-sonnet-4-8-thinking`
 - `claude-opus-4-7` / `claude-opus-4-7-thinking`
@@ -474,6 +475,7 @@ KIRO_API_KEY=ksk_xxx ./kiro-rs
 
 | 请求模型关键词 | 上游模型 |
 |---|---|
+| `opus-5` / `opus5` / `opus.5` | `claude-opus-5` |
 | `sonnet` + `4-8` / `4.8` | `claude-sonnet-4.8` |
 | `sonnet` + `4-6` / `4.6` | `claude-sonnet-4.6` |
 | `sonnet` + `4-5` / `4.5` | `claude-sonnet-4.5` |
@@ -487,7 +489,7 @@ KIRO_API_KEY=ksk_xxx ./kiro-rs
 
 上下文窗口估算：
 
-- `claude-sonnet-4.6`、`claude-sonnet-4.8`、`claude-opus-4.6`、`claude-opus-4.7`、`claude-opus-4.8`：`1_000_000`
+- `claude-opus-5`、`claude-sonnet-5`、`claude-sonnet-4.6`、`claude-sonnet-4.8`、`claude-opus-4.6`、`claude-opus-4.7`、`claude-opus-4.8`：`1_000_000`
 - 其它模型：`200_000`
 
 <a id="thinking-tools-websearch"></a>

@@ -214,7 +214,12 @@ pub fn map_model(model: &str) -> Option<String> {
             None
         }
     } else if model_lower.contains("opus") {
-        if model_lower.contains("4-8") || model_lower.contains("4.8") {
+        if model_lower.contains("opus-5")
+            || model_lower.contains("opus5")
+            || model_lower.contains("opus.5")
+        {
+            Some("claude-opus-5".to_string())
+        } else if model_lower.contains("4-8") || model_lower.contains("4.8") {
             Some("claude-opus-4.8".to_string())
         } else if model_lower.contains("4-7") || model_lower.contains("4.7") {
             Some("claude-opus-4.7".to_string())
@@ -241,7 +246,7 @@ pub fn map_model(model: &str) -> Option<String> {
 ///
 /// 复用 `map_model` 的映射逻辑，确保窗口大小判断与模型映射一致。
 /// Kiro 于 2026-03-24 将 Opus 4.6 和 Sonnet 4.6 升级至 1M 上下文。
-/// 4.7 / 4.8 同 1M
+/// 4.7 / 4.8 / Opus 5 同 1M
 pub fn get_context_window_size(model: &str) -> i32 {
     match map_model(model) {
         // GPT-5.6 family on Kiro ships a 272K context window.
@@ -252,7 +257,8 @@ pub fn get_context_window_size(model: &str) -> i32 {
                 || mapped == "claude-sonnet-5"
                 || mapped == "claude-opus-4.6"
                 || mapped == "claude-opus-4.7"
-                || mapped == "claude-opus-4.8" =>
+                || mapped == "claude-opus-4.8"
+                || mapped == "claude-opus-5" =>
         {
             1_000_000
         }
@@ -405,9 +411,10 @@ fn normalize_effort_for_model(model_id: &str, raw_effort: &str) -> Option<String
 fn model_supports_xhigh_effort(model_id: &str) -> bool {
     let model = model_id.to_ascii_lowercase();
 
-    // Anthropic documents xhigh for Opus 4.7/4.8 and Mythos 5.
+    // Newer reasoning-capable model families accept xhigh.
     if model.contains("opus-4.7")
         || model.contains("opus-4.8")
+        || model.contains("opus-5")
         || model.contains("mythos-5")
         || model.contains("claude-5")
     {
@@ -1999,6 +2006,25 @@ mod tests {
     }
 
     #[test]
+    fn test_map_model_opus_5() {
+        assert_eq!(
+            map_model("claude-opus-5"),
+            Some("claude-opus-5".to_string())
+        );
+        assert_eq!(
+            map_model("claude-opus-5-thinking"),
+            Some("claude-opus-5".to_string())
+        );
+        assert_eq!(
+            map_model("claude-opus5-preview"),
+            Some("claude-opus-5".to_string())
+        );
+        assert_eq!(get_context_window_size("claude-opus-5"), 1_000_000);
+        assert!(model_supports_native_reasoning("claude-opus-5"));
+        assert!(model_supports_xhigh_effort("claude-opus-5"));
+    }
+
+    #[test]
     fn test_map_model_sonnet_4_8() {
         assert_eq!(
             map_model("claude-sonnet-4-8"),
@@ -2263,6 +2289,11 @@ mod tests {
             normalize_effort_for_model("claude-opus-4.8", "xhigh").as_deref(),
             Some("xhigh"),
             "opus 4.8 supports xhigh"
+        );
+        assert_eq!(
+            normalize_effort_for_model("claude-opus-5", "xhigh").as_deref(),
+            Some("xhigh"),
+            "opus 5 supports xhigh"
         );
         assert_eq!(
             normalize_effort_for_model("claude-5", "xhigh").as_deref(),

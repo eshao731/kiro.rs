@@ -548,7 +548,16 @@ fn render_websearch_response(
         let content = build_websearch_content(&query, &tool_use_id, &search_results);
         let summary = generate_search_summary(&query, &search_results);
         let output_tokens = (summary.len() as i32 + 3) / 4;
-        super::websearch_loop::render_json(&model, content, "end_turn", input_tokens, output_tokens)
+        super::websearch_loop::render_json(
+            &model,
+            content,
+            "end_turn",
+            input_tokens,
+            output_tokens,
+            0,
+            0,
+            "",
+        )
     }
 }
 

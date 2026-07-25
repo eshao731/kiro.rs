@@ -6,6 +6,12 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### ✨ 新功能 — Claude Opus 5 实验预览
+
+- **新增 `claude-opus-5` 支持**：Anthropic 兼容模型映射、`GET /v1/models` 静态列表及 `-thinking` 别名均已接入，按 Kiro 返回信息使用 1M 上下文窗口。
+- **Reasoning 能力接入**：Opus 5 支持原生 `output_config.effort`，包括 `xhigh` 档位。
+- **修复 WebSearch 非流式构建**：补齐缓存 usage 与 thinking 参数，适配上游 `render_json` 新签名。
+
 ### ✨ 新功能 — 企业 SSO（Microsoft 365 / Entra ID / Azure AD）`external_idp` 认证
 
 - **新增 `external_idp` 认证方式**：支持导入 Microsoft Entra ID / Azure AD 企业租户账号（既不是 AWS Builder ID 也不是 IAM Identity Center，原先无法接入）。凭据新增 `tokenEndpoint`（IdP OAuth2 token 端点）、`issuerUrl`（OIDC issuer，纯备注）、`scopes`（空格分隔的已授权 scope）三个字段。
