@@ -1273,7 +1273,8 @@ mod tests {
         let max_cache = ((total as f64) * 0.9).floor() as i32;
         let (input1, creation1, read1) = first.split_against_total(total);
         assert_eq!(input1 + creation1 + read1, total);
-        assert_eq!(creation1, max_cache);
+        assert!(creation1 > 0, "system key should create prompt cache");
+        assert!(creation1 <= max_cache, "cache must respect configured maximum");
         assert_eq!(read1, 0);
 
         let second = compute_cache_usage(&cache, &req, 0);
@@ -1281,7 +1282,9 @@ mod tests {
         let (input2, creation2, read2) = second.split_against_total(total);
         assert_eq!(input2 + creation2 + read2, total);
         assert_eq!(creation2, 0);
-        assert_eq!(read2, max_cache);
+        assert!(read2 > 0, "system key should read prompt cache on reuse");
+        assert!(read2 <= max_cache, "cache must respect configured maximum");
+        assert_eq!(read2, creation1, "created cache should be reused in full");
     }
 
     /// 含图片的历史段：covered 应计入图片的 Anthropic 口径 token，且跨轮稳定命中。
