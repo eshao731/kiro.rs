@@ -575,7 +575,7 @@ mod tests {
     #[test]
     fn system_key_can_use_legacy_sk_prefix() {
         let mgr = ClientKeyManager::new();
-        mgr.ensure_system_key("默认密钥".into(), None, "sk-kiro-abc".into());
+        mgr.sync_system_key("默认密钥".into(), None, "sk-kiro-abc".into());
         assert_eq!(mgr.verify_and_touch("sk-kiro-abc"), Some(0));
     }
 

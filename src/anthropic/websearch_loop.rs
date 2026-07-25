@@ -1022,7 +1022,7 @@ mod tests {
         assert!(!should_search_round(0, &empty));
     }
 
-    fn round_outcome(text: &str, tool_uses: Vec<DecodedToolUse>) -> RoundOutcome {
+    fn round_outcome(text: &str, tool_uses: Vec<CompletedToolUse>) -> RoundOutcome {
         RoundOutcome {
             text: text.to_string(),
             thinking: String::new(),
