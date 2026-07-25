@@ -30,6 +30,43 @@ pub enum ToolCompatibilityMode {
     Raw,
 }
 
+/// 自定义模型定义。
+///
+/// 用户在 `config.json` 的 `customModels` 数组里声明客户端模型别名到 Kiro 后端
+/// 模型 ID 的映射及元数据。运行期由 [`crate::model::custom_models`] 全局注册表按
+/// `id`（大小写不敏感）精确匹配，优先于内置的模糊映射逻辑——既能新增模型，也能
+/// 覆盖内置模型的映射。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CustomModel {
+    /// 客户端请求时使用的模型名（别名）。匹配大小写不敏感。
+    pub id: String,
+
+    /// 映射到的 Kiro 后端模型 ID（实际下发给上游）。
+    pub backend_id: String,
+
+    /// `/v1/models` 展示名（可选，缺省用 `id`）。
+    #[serde(default)]
+    pub display_name: Option<String>,
+
+    /// 上下文窗口大小（可选，缺省 200000）。
+    #[serde(default)]
+    pub context_window: Option<i32>,
+
+    /// 单次响应最大 token 数，用于 `/v1/models` 展示（可选，缺省 64000）。
+    #[serde(default)]
+    pub max_tokens: Option<i32>,
+
+    /// 是否支持原生 reasoning / `output_config`（可选，缺省 false）。
+    /// 命中的自定义模型置 true 时，会按 backend_id 放行 `additionalModelRequestFields`。
+    #[serde(default)]
+    pub supports_reasoning: Option<bool>,
+
+    /// `/v1/models` 的 `owned_by` 字段（可选，缺省 "custom"）。
+    #[serde(default)]
+    pub owned_by: Option<String>,
+}
+
 /// KNA 应用配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -239,6 +276,14 @@ pub struct Config {
     #[serde(default)]
     pub endpoints: HashMap<String, serde_json::Value>,
 
+    /// 自定义模型映射表。
+    ///
+    /// 每条把一个客户端模型别名映射到 Kiro 后端模型 ID 并附带元数据。默认空数组
+    /// （完全向后兼容）。启动时装入 [`crate::model::custom_models`] 全局注册表，
+    /// 供 `map_model` / `get_context_window_size` / `/v1/models` 查询。
+    #[serde(default)]
+    pub custom_models: Vec<CustomModel>,
+
     /// 配置文件路径（运行时元数据，不写入 JSON）
     #[serde(skip)]
     config_path: Option<PathBuf>,
@@ -378,6 +423,7 @@ impl Default for Config {
             trace_retention_days: default_trace_retention_days(),
             usage_log_retention_days: default_usage_log_retention_days(),
             endpoints: HashMap::new(),
+            custom_models: Vec::new(),
             config_path: None,
         }
     }

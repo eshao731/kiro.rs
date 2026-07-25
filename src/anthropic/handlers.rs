@@ -452,7 +452,7 @@ fn resolve_usage_input_tokens(
 }
 
 fn available_models() -> Vec<Model> {
-    vec![
+    let mut models = vec![
         Model {
             id: "gpt-5.6-sol".to_string(),
             object: "model".to_string(),
@@ -660,7 +660,22 @@ fn available_models() -> Vec<Model> {
             model_type: "chat".to_string(),
             max_tokens: 64000,
         },
-    ]
+    ];
+
+    // 追加配置文件里声明的自定义模型（保持原始顺序）。
+    for cm in crate::model::custom_models::all() {
+        models.push(Model {
+            id: cm.id.clone(),
+            object: "model".to_string(),
+            created: 1782000000,
+            owned_by: cm.owned_by.clone().unwrap_or_else(|| "custom".to_string()),
+            display_name: cm.display_name.clone().unwrap_or_else(|| cm.id.clone()),
+            model_type: "chat".to_string(),
+            max_tokens: cm.max_tokens.unwrap_or(64000),
+        });
+    }
+
+    models
 }
 
 /// GET /v1/models

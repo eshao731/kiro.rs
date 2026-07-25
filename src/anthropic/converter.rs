@@ -196,6 +196,11 @@ Complete all chunked operations without commentary.";
 /// 模型映射：将 Anthropic 模型名映射到 Kiro 模型 ID
 /// 严格对照版本号
 pub fn map_model(model: &str) -> Option<String> {
+    // 自定义模型表优先（大小写不敏感精确匹配），可新增或覆盖内置映射。
+    if let Some(custom) = crate::model::custom_models::lookup(model) {
+        return Some(custom.backend_id.clone());
+    }
+
     let model_lower = model.to_lowercase();
 
     if model_lower.contains("sonnet") {
@@ -248,6 +253,13 @@ pub fn map_model(model: &str) -> Option<String> {
 /// Kiro 于 2026-03-24 将 Opus 4.6 和 Sonnet 4.6 升级至 1M 上下文。
 /// 4.7 / 4.8 / Opus 5 同 1M
 pub fn get_context_window_size(model: &str) -> i32 {
+    // 自定义模型若显式声明了上下文窗口，优先返回。
+    if let Some(custom) = crate::model::custom_models::lookup(model) {
+        if let Some(window) = custom.context_window {
+            return window;
+        }
+    }
+
     match map_model(model) {
         // GPT-5.6 family on Kiro ships a 272K context window.
         Some(mapped) if mapped.starts_with("gpt") => 272_000,
@@ -274,6 +286,10 @@ pub fn get_context_window_size(model: &str) -> i32 {
 /// 不支持——向它们下发会触发上游 400（`additionalModelRequestFields is not supported`）。
 /// 若后续实测某模型 400，从这里去除即可。
 fn model_supports_native_reasoning(model_id: &str) -> bool {
+    // 自定义模型可按 backend_id 声明支持 reasoning。
+    if crate::model::custom_models::backend_supports_reasoning(model_id) {
+        return true;
+    }
     let m = model_id.to_ascii_lowercase();
     matches!(
         m.as_str(),

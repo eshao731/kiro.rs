@@ -488,12 +488,41 @@ KIRO_API_KEY=ksk_xxx ./kiro-rs
 | `opus` + `4-5` / `4.5` | `claude-opus-4.5` |
 | 任意 `haiku` | `claude-haiku-4.5` |
 
-没有命中上述规则的模型会作为不支持模型处理。
+没有命中上述规则、且不在下文「自定义模型」表中的模型会作为不支持模型处理。
 
 上下文窗口估算：
 
 - `claude-opus-5`、`claude-sonnet-5`、`claude-sonnet-4.6`、`claude-sonnet-4.8`、`claude-opus-4.6`、`claude-opus-4.7`、`claude-opus-4.8`：`1_000_000`
 - 其它模型：`200_000`
+
+### 自定义模型
+
+可在 `config.json` 增加 `customModels` 数组，把任意客户端模型别名映射到 Kiro 后端模型 ID。自定义条目**优先于**上表的内置模糊匹配，既能新增模型，也能覆盖内置映射。
+
+```jsonc
+{
+  "customModels": [
+    {
+      "id": "my-opus",                 // 客户端请求用的模型名（大小写不敏感精确匹配）
+      "backendId": "claude-opus-4.8",  // 实际下发给 Kiro 的后端模型 ID（必填）
+      "displayName": "My Opus",        // 可选，/v1/models 展示名，缺省用 id
+      "contextWindow": 1000000,         // 可选，上下文窗口，缺省 200000
+      "maxTokens": 64000,               // 可选，/v1/models 展示的最大输出，缺省 64000
+      "supportsReasoning": true,        // 可选，是否放行原生 reasoning，缺省 false
+      "ownedBy": "custom"               // 可选，/v1/models 的 owned_by，缺省 "custom"
+    }
+  ]
+}
+```
+
+行为说明：
+
+- **匹配**：按 `id` 大小写不敏感精确匹配；客户端传 `my-opus-thinking` 时，若无同名精确条目，会自动剥离 `-thinking` 后缀回退到 `my-opus`。
+- **优先级**：命中自定义表直接返回其 `backendId`，不再走内置关键词映射，因此可用同名 `id` 覆盖内置模型的后端指向。
+- **展示**：所有 `customModels` 条目会追加到 `GET /v1/models` 列表尾部（保持配置文件顺序）。
+- **上下文窗口**：设了 `contextWindow` 时以其为准，否则回退到内置估算。
+- **reasoning**：`supportsReasoning: true` 会让该 `backendId` 放行 `additionalModelRequestFields`（`output_config` 等）；后端不接受时上游会返回 400，此时置 false 即可。
+- **兼容性**：默认空数组，不配置时行为与之前完全一致；`/v1/chat/completions` 与 `/v1/responses` 因复用同一映射链路自动生效。
 
 <a id="thinking-tools-websearch"></a>
 ## Thinking、工具与 WebSearch
