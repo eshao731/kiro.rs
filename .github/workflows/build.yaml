@@ -156,6 +156,12 @@ jobs:
         if: contains(matrix.target, 'linux-gnu')
         uses: rui314/setup-mold@v1
 
+      - name: Run system-key cache regression test
+        if: matrix.name == 'Linux-x64'
+        env:
+          RUSTFLAGS: -C link-arg=-fuse-ld=mold
+        run: cargo test --locked --target ${{ matrix.target }} system_key_without_session_uses_configured_cache_ratio
+
       - name: Build app
         env:
           RUSTFLAGS: ${{ contains(matrix.target, 'linux-gnu') && '-C link-arg=-fuse-ld=mold' || '' }}

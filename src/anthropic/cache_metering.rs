@@ -501,11 +501,10 @@ fn extract_segments(req: &MessagesRequest, key_id: u64, cache: &CacheMeter) -> (
     .max(0) as u32;
 
     // Prefer the Claude Code session id when available so separate sessions never
-    // share simulated cache state. The system key (id=0) may be shared by many
-    // users, so without a session identifier we deliberately disable simulation.
-    let Some(salt) = isolation_seed(req, key_id) else {
-        return (Vec::new(), prompt_total_est);
-    };
+    // share simulated cache state. Without a session identifier, isolate by the
+    // authenticated entry key. The system key (id=0) is still a real configured
+    // entry key and must keep prompt caching enabled.
+    let salt = isolation_seed(req, key_id);
     if let Some(system) = req.system.as_ref() {
         if let Ok(value) = serde_json::to_value(system) {
             push_segment(
@@ -609,19 +608,16 @@ fn extract_segments(req: &MessagesRequest, key_id: u64, cache: &CacheMeter) -> (
     (segments, prompt_total_est)
 }
 
-fn isolation_seed(req: &MessagesRequest, key_id: u64) -> Option<String> {
+fn isolation_seed(req: &MessagesRequest, key_id: u64) -> String {
     if let Some(session) = req
         .metadata
         .as_ref()
         .and_then(|metadata| metadata.user_id.as_deref())
         .and_then(extract_session_id)
     {
-        return Some(format!("session:{session}"));
+        return format!("session:{session}");
     }
-    if key_id == 0 {
-        return None;
-    }
-    Some(format!("key:{key_id}"))
+    format!("key:{key_id}")
 }
 
 fn extract_session_id(user_id: &str) -> Option<String> {
@@ -1266,21 +1262,26 @@ mod tests {
     }
 
     #[test]
-    fn system_key_without_session_does_not_simulate_shared_cache() {
+    fn system_key_without_session_uses_configured_cache_ratio() {
         let cache = CacheMeter::new(None);
-        let body = "shared system-key prompt without a session ".repeat(20);
-        let messages = || {
-            vec![
-                msg_with_cc("user", &body, false),
-                msg_with_cc("assistant", &body, false),
-                msg_with_cc("user", &body, false),
-            ]
-        };
-        let first = compute_cache_usage(&cache, &req_with_messages(messages()), 0);
-        let second = compute_cache_usage(&cache, &req_with_messages(messages()), 0);
-        assert_eq!(first.cache_covered_est, 0);
-        assert_eq!(second.cache_covered_est, 0);
-        assert_eq!(second.cache_read, 0);
+        let req = build_request_with_system_breakpoint();
+
+        let first = compute_cache_usage(&cache, &req, 0);
+        assert!(first.cache_covered_est > 0);
+        assert_eq!(first.cache_read, 0);
+        let total = first.prompt_total_est;
+        let max_cache = ((total as f64) * 0.9).floor() as i32;
+        let (input1, creation1, read1) = first.split_against_total(total);
+        assert_eq!(input1 + creation1 + read1, total);
+        assert_eq!(creation1, max_cache);
+        assert_eq!(read1, 0);
+
+        let second = compute_cache_usage(&cache, &req, 0);
+        assert!(second.cache_read > 0);
+        let (input2, creation2, read2) = second.split_against_total(total);
+        assert_eq!(input2 + creation2 + read2, total);
+        assert_eq!(creation2, 0);
+        assert_eq!(read2, max_cache);
     }
 
     /// 含图片的历史段：covered 应计入图片的 Anthropic 口径 token，且跨轮稳定命中。

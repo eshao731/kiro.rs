@@ -11,6 +11,7 @@ project adheres to [Semantic Versioning](https://semver.org/).
 - **新增 `claude-opus-5` 支持**：Anthropic 兼容模型映射、`GET /v1/models` 静态列表及 `-thinking` 别名均已接入，按 Kiro 返回信息使用 1M 上下文窗口。
 - **Reasoning 能力接入**：Opus 5 支持原生 `output_config.effort`，包括 `xhigh` 档位。
 - **修复 WebSearch 非流式构建**：补齐缓存 usage 与 thinking 参数，适配上游 `render_json` 新签名。
+- **修复系统默认 Key 缓存回归**：`keyId=0` 在请求未携带 session metadata 时继续按系统入口 Key 隔离并启用 Prompt Cache，严格应用 `cacheMaxSavingsRatio`，不再错误返回零缓存。
 
 ### ✨ 新功能 — 企业 SSO（Microsoft 365 / Entra ID / Azure AD）`external_idp` 认证
 
