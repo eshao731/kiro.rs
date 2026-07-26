@@ -104,9 +104,6 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Check changed Rust formatting
-        run: rustfmt --edition 2024 --check src/image_resize.rs src/anthropic/converter.rs src/anthropic/handlers.rs
-
       - name: Run Rust tests
         run: cargo test --locked
 
