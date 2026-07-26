@@ -80,53 +80,6 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-  hotfix-linux-release:
-    needs: pre-check
-    if: github.event_name == 'workflow_dispatch' && contains(github.event.inputs.version, 'hotfix')
-    runs-on: ubuntu-22.04
-    permissions:
-      contents: write
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Bun
-        uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: '1.3'
-
-      - name: Build admin-ui
-        working-directory: admin-ui
-        run: |
-          bun install --frozen-lockfile
-          bun run build
-
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Run Rust tests
-        run: cargo test --locked -- --skip explicit_effort_emits_for_fable_5_without_thinking
-
-      - name: Build Linux release binary
-        run: cargo build --release --locked
-
-      - name: Verify binary
-        run: |
-          file target/release/kiro-rs
-          sha256sum target/release/kiro-rs
-
-      - name: Publish temporary hotfix release
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: hotfix-${{ github.event.inputs.version }}-${{ github.run_id }}
-        run: |
-          gh release create "${RELEASE_TAG}" \
-            target/release/kiro-rs#kiro2api-linux-x64 \
-            --repo "${GITHUB_REPOSITORY}" \
-            --title "Temporary hotfix build ${GITHUB_SHA::8}" \
-            --notes "Temporary production build for commit ${GITHUB_SHA}." \
-            --prerelease
-
   build:
     needs:
       - pre-check
