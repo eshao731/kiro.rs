@@ -557,6 +557,7 @@ fn render_websearch_response(
             0,
             0,
             "",
+            None,
         )
     }
 }
