@@ -275,6 +275,10 @@ async fn run_round(
                     "invalid_request_error",
                     format!("unsupported tool mapping: {}", reason),
                 ),
+                ConversionError::InvalidImage(reason) => (
+                    "invalid_request_error",
+                    format!("invalid image: {}", reason),
+                ),
             };
             hook.record(0, 0, 0, 0, 0, 0.0, "error");
             return Err((StatusCode::BAD_REQUEST, Json(ErrorResponse::new(et, msg))).into_response());
