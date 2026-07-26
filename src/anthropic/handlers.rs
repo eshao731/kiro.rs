@@ -266,21 +266,33 @@ fn count_image_budget(payload: &super::types::MessagesRequest) -> ImageBudget {
     let mut count = 0usize;
     let mut total = 0usize;
     let mut largest = 0usize;
+    let mut record_image = |item: &serde_json::Value| {
+        if item.get("type").and_then(|v| v.as_str()) != Some("image") {
+            return;
+        }
+        let Some(src) = item.get("source") else { return };
+        if src.get("type").and_then(|v| v.as_str()) != Some("base64") {
+            return;
+        }
+        let n = src
+            .get("data")
+            .and_then(|v| v.as_str())
+            .map(|s| s.len())
+            .unwrap_or(0);
+        count += 1;
+        total += n;
+        largest = largest.max(n);
+    };
     for msg in &payload.messages {
         if let serde_json::Value::Array(arr) = &msg.content {
             for item in arr {
-                if item.get("type").and_then(|v| v.as_str()) != Some("image") {
-                    continue;
-                }
-                let Some(src) = item.get("source") else { continue };
-                if src.get("type").and_then(|v| v.as_str()) != Some("base64") {
-                    continue;
-                }
-                let n = src.get("data").and_then(|v| v.as_str()).map(|s| s.len()).unwrap_or(0);
-                count += 1;
-                total += n;
-                if n > largest {
-                    largest = n;
+                record_image(item);
+                if item.get("type").and_then(|v| v.as_str()) == Some("tool_result")
+                    && let Some(nested) = item.get("content").and_then(|v| v.as_array())
+                {
+                    for nested_item in nested {
+                        record_image(nested_item);
+                    }
                 }
             }
         }
@@ -337,6 +349,18 @@ pub(super) fn map_provider_error(err: Error) -> Response {
             .unwrap();
     }
 
+    if let Some(ConversionError::InvalidImage(reason)) = err.downcast_ref::<ConversionError>() {
+        tracing::warn!(reason, "invalid image rejected before upstream; mapped to 400");
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new(
+                "invalid_request_error",
+                format!("图片无效: {}", reason),
+            )),
+        )
+            .into_response();
+    }
+
     let err_str = err.to_string();
 
     // 上下文窗口满了（对话历史累积超出模型上下文窗口限制）
@@ -360,6 +384,21 @@ pub(super) fn map_provider_error(err: Error) -> Response {
             Json(ErrorResponse::new(
                 "invalid_request_error",
                 "Input is too long. Reduce the size of your messages.",
+            )),
+        )
+            .into_response();
+    }
+
+    if err_str.contains("IMAGE_FORMAT_UNSUPPORTED")
+        || err_str.contains("IMAGE_MIME_MISMATCH")
+        || err_str.contains("Could not process image")
+    {
+        tracing::warn!(error = %err, "upstream rejected an invalid image; mapped to 400");
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new(
+                "invalid_request_error",
+                "Could not process image. Check that every image is valid base64 and matches a supported image format.",
             )),
         )
             .into_response();
@@ -738,6 +777,9 @@ pub async fn post_messages(
                 }
                 ConversionError::UnsupportedToolMapping(reason) => {
                     ("invalid_request_error", format!("工具映射不支持: {}", reason))
+                }
+                ConversionError::InvalidImage(reason) => {
+                    ("invalid_request_error", format!("图片无效: {}", reason))
                 }
             };
             tracing::warn!("请求转换失败: {}", e);
@@ -1553,6 +1595,9 @@ pub async fn post_messages_cc(
                 ConversionError::UnsupportedToolMapping(reason) => {
                     ("invalid_request_error", format!("工具映射不支持: {}", reason))
                 }
+                ConversionError::InvalidImage(reason) => {
+                    ("invalid_request_error", format!("图片无效: {}", reason))
+                }
             };
             tracing::warn!("请求转换失败: {}", e);
             hook.record(0, 0, 0, 0, 0, 0.0, "error");
@@ -1907,6 +1952,23 @@ mod tests {
     }
 
     #[test]
+    fn image_processing_errors_map_to_400() {
+        for message in [
+            r#"{"message":"Could not process image","reason":"IMAGE_FORMAT_UNSUPPORTED"}"#,
+            r#"{"message":"Could not process image","reason":"IMAGE_MIME_MISMATCH"}"#,
+        ] {
+            let resp = map_provider_error(anyhow::anyhow!(message));
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        }
+
+        let resp = map_provider_error(
+            ConversionError::InvalidImage("tool_result tool-image image: invalid data".to_string())
+                .into(),
+        );
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
     fn upstream_rate_limit_maps_to_429_with_retry_after() {
         let err = crate::kiro::error::UpstreamRateLimitError::new(Some("1800".to_string()));
         let resp = map_provider_error(err.into());
@@ -2056,6 +2118,30 @@ mod tests {
         }"#).unwrap();
         let stats = count_image_budget(&req);
         assert_eq!(stats.count, 0);
+    }
+
+    #[test]
+    fn count_image_budget_includes_tool_result_images() {
+        let req: super::super::types::MessagesRequest = serde_json::from_str(r#"{
+            "model": "claude-opus-4-7",
+            "max_tokens": 100,
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "tool-1",
+                    "content": [
+                        {"type": "text", "text": "screenshot"},
+                        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "NESTED_IMAGE"}}
+                    ]
+                }]
+            }]
+        }"#).unwrap();
+
+        let stats = count_image_budget(&req);
+        assert_eq!(stats.count, 1);
+        assert_eq!(stats.total_b64_bytes, 12);
+        assert_eq!(stats.largest_b64_bytes, 12);
     }
 
     #[test]

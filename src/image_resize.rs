@@ -91,6 +91,41 @@ pub struct ProcessedImage {
     pub final_bytes: usize,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum ImageValidationError {
+    #[error("base64 decode failed: {0}")]
+    Base64(String),
+    #[error("unsupported or unrecognized image format")]
+    UnsupportedFormat,
+    #[error("image decode failed: {0}")]
+    Decode(String),
+}
+
+/// Strictly validates an inbound base64 image and returns its actual format.
+///
+/// This is intentionally separate from resizing: callers can reject corrupt or truncated
+/// images before the resizer's compatibility fallback passes the original bytes through.
+pub fn validate_and_detect_image_format(
+    data_base64: &str,
+) -> Result<String, ImageValidationError> {
+    let raw = BASE64
+        .decode(data_base64)
+        .map_err(|e| ImageValidationError::Base64(e.to_string()))?;
+    let detected = image::guess_format(&raw)
+        .map_err(|_| ImageValidationError::UnsupportedFormat)?;
+    let actual_format = canonical_format(detected)
+        .ok_or(ImageValidationError::UnsupportedFormat)?;
+
+    let cursor = Cursor::new(&raw);
+    let mut reader = ImageReader::new(cursor);
+    reader.set_format(detected);
+    reader
+        .decode()
+        .map_err(|e| ImageValidationError::Decode(e.to_string()))?;
+
+    Ok(actual_format.to_string())
+}
+
 /// Main entry: processes a single inbound image with the rule "small enough -> pass / large -> shrink"
 ///
 /// `format` is the last segment of the source media-type ("png" / "jpeg" / "gif" / "webp"),
@@ -289,6 +324,16 @@ fn guess_format(s: &str) -> Option<ImageFormat> {
         "jpeg" | "jpg" => Some(ImageFormat::Jpeg),
         "webp" => Some(ImageFormat::WebP),
         "gif" => Some(ImageFormat::Gif),
+        _ => None,
+    }
+}
+
+fn canonical_format(format: ImageFormat) -> Option<&'static str> {
+    match format {
+        ImageFormat::Png => Some("png"),
+        ImageFormat::Jpeg => Some("jpeg"),
+        ImageFormat::WebP => Some("webp"),
+        ImageFormat::Gif => Some("gif"),
         _ => None,
     }
 }
@@ -585,6 +630,30 @@ mod tests {
         let out = maybe_shrink_image(cfg, "jpeg", &jpeg);
         assert_eq!(out.format, "jpeg", "real jpeg must stay jpeg");
         assert_eq!(out.data_base64, jpeg);
+    }
+
+    #[test]
+    fn strict_validation_detects_actual_format() {
+        let jpeg = make_jpeg(64, 64);
+        let actual = validate_and_detect_image_format(&jpeg).unwrap();
+        assert_eq!(actual, "jpeg");
+    }
+
+    #[test]
+    fn strict_validation_rejects_invalid_base64() {
+        let err = validate_and_detect_image_format("not-valid-base64!!!").unwrap_err();
+        assert!(matches!(err, ImageValidationError::Base64(_)));
+    }
+
+    #[test]
+    fn strict_validation_rejects_truncated_image() {
+        let png = make_png(64, 64);
+        let mut raw = BASE64.decode(png).unwrap();
+        raw.truncate(raw.len() / 2);
+        let truncated = BASE64.encode(raw);
+
+        let err = validate_and_detect_image_format(&truncated).unwrap_err();
+        assert!(matches!(err, ImageValidationError::Decode(_)));
     }
 
     #[test]

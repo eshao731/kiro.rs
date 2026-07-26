@@ -19,7 +19,7 @@ use crate::model::config::ToolCompatibilityMode;
 
 use super::types::{ContentBlock, ImageSource, MessagesRequest};
 
-use crate::image_resize::{ResizeConfig, maybe_shrink_image};
+use crate::image_resize::{ResizeConfig, maybe_shrink_image, validate_and_detect_image_format};
 
 /// 规范化 JSON Schema，修复 MCP 工具定义中常见的类型问题
 /// 规范化 JSON Schema，修复工具定义中常见的类型问题
@@ -493,6 +493,7 @@ pub enum ConversionError {
     EmptyMessages,
     /// Claude Code 工具无法映射到 Kiro 内置工具（如 Read.pages 无对应、内置缺 schema）。
     UnsupportedToolMapping(String),
+    InvalidImage(String),
 }
 
 impl std::fmt::Display for ConversionError {
@@ -503,6 +504,7 @@ impl std::fmt::Display for ConversionError {
             ConversionError::UnsupportedToolMapping(reason) => {
                 write!(f, "工具映射不支持: {}", reason)
             }
+            ConversionError::InvalidImage(reason) => write!(f, "图片无效: {}", reason),
         }
     }
 }
@@ -781,17 +783,25 @@ fn process_message_content_dedup(
                             }
                         }
                         "image" => {
-                            if let Some(source) = block.source
-                                && let Some(placeholder) =
-                                    extract_kiro_image(&source, &mut dedup, &mut images)
-                            {
-                                text_parts.push(placeholder);
+                            if let Some(source) = block.source {
+                                if let Some(placeholder) = extract_kiro_image(
+                                    &source,
+                                    &mut dedup,
+                                    &mut images,
+                                    "message image",
+                                )? {
+                                    text_parts.push(placeholder);
+                                }
                             }
                         }
                         "tool_result" => {
                             if let Some(tool_use_id) = block.tool_use_id {
-                                let result_content =
-                                    extract_tool_result_content(&block.content, &mut dedup, &mut images);
+                                let result_content = extract_tool_result_content(
+                                    &block.content,
+                                    &mut dedup,
+                                    &mut images,
+                                    &tool_use_id,
+                                )?;
                                 let is_error = block.is_error.unwrap_or(false);
 
                                 let mut result = if is_error {
@@ -834,26 +844,52 @@ fn get_image_format(media_type: &str) -> Option<String> {
 ///
 /// Reuses the same conversion chain as top-level images (format validation + SHA256 dedup + resize + `from_base64`),
 /// so an image inside a tool_result is lifted into the top-level images field the same way.
-/// Returns `Some(placeholder)` when history dedup hit and the image was omitted; `None` when it was lifted or the format is unsupported.
+/// Returns a placeholder when history dedup omits the image, no placeholder when it is lifted,
+/// and an error when the media type or decoded bytes are invalid.
 fn extract_kiro_image(
     source: &ImageSource,
     dedup: &mut Option<&mut std::collections::HashSet<String>>,
     images: &mut Vec<KiroImage>,
-) -> Option<String> {
-    let format = get_image_format(&source.media_type)?;
+    location: &str,
+) -> Result<Option<String>, ConversionError> {
+    let declared_format = get_image_format(&source.media_type).ok_or_else(|| {
+        ConversionError::InvalidImage(format!(
+            "{} has unsupported media type {}",
+            location, source.media_type
+        ))
+    })?;
+    let actual_format = validate_and_detect_image_format(&source.data).map_err(|e| {
+        ConversionError::InvalidImage(format!(
+            "{} (media_type={}, base64_bytes={}): {}",
+            location,
+            source.media_type,
+            source.data.len(),
+            e
+        ))
+    })?;
+    if actual_format != declared_format {
+        tracing::debug!(
+            location,
+            declared = %declared_format,
+            actual = %actual_format,
+            "normalized image format from decoded bytes"
+        );
+    }
     // History dedup: an already-seen image omits its base64 and returns placeholder text
     if let Some(seen) = dedup.as_deref_mut() {
         let mut hasher = Sha256::new();
         hasher.update(source.data.as_bytes());
         let digest = format!("{:x}", hasher.finalize());
         if !seen.insert(digest) {
-            return Some("[image omitted: identical to an earlier screenshot]".to_string());
+            return Ok(Some(
+                "[image omitted: identical to an earlier screenshot]".to_string(),
+            ));
         }
     }
     let cfg = ResizeConfig::from_env();
-    let processed = maybe_shrink_image(cfg, &format, &source.data);
+    let processed = maybe_shrink_image(cfg, &actual_format, &source.data);
     images.push(KiroImage::from_base64(processed.format, processed.data_base64));
-    None
+    Ok(None)
 }
 
 /// 提取工具结果内容
@@ -865,9 +901,10 @@ fn extract_tool_result_content(
     content: &Option<serde_json::Value>,
     dedup: &mut Option<&mut std::collections::HashSet<String>>,
     images: &mut Vec<KiroImage>,
-) -> String {
+    tool_use_id: &str,
+) -> Result<String, ConversionError> {
     match content {
-        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(serde_json::Value::String(s)) => Ok(s.clone()),
         Some(serde_json::Value::Array(arr)) => {
             let mut parts = Vec::new();
             let mut had_image = false;
@@ -879,19 +916,22 @@ fn extract_tool_result_content(
                     && let Some(source) = block.source
                 {
                     had_image = true;
-                    if let Some(placeholder) = extract_kiro_image(&source, dedup, images) {
+                    let location = format!("tool_result {} image", tool_use_id);
+                    if let Some(placeholder) =
+                        extract_kiro_image(&source, dedup, images, &location)?
+                    {
                         parts.push(placeholder);
                     }
                 }
             }
             if parts.is_empty() && had_image {
-                "[image attached]".to_string()
+                Ok("[image attached]".to_string())
             } else {
-                parts.join("\n")
+                Ok(parts.join("\n"))
             }
         }
-        Some(v) => v.to_string(),
-        None => String::new(),
+        Some(v) => Ok(v.to_string()),
+        None => Ok(String::new()),
     }
 }
 
@@ -3636,6 +3676,76 @@ mod tests {
             Some("here is the screen"),
             "tool_result content should keep the text and contain no base64"
         );
+    }
+
+    #[test]
+    fn invalid_top_level_image_is_rejected_before_upstream() {
+        use super::super::types::Message as AnthropicMessage;
+
+        let req = MessagesRequest {
+            model: "claude-sonnet-4.5".to_string(),
+            max_tokens: 1024,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!([
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "not-valid-base64"}}
+                ]),
+            }],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let err = match convert_request(&req) {
+            Ok(_) => panic!("invalid image should fail conversion"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, ConversionError::InvalidImage(_)));
+        assert!(err.to_string().contains("base64 decode failed"));
+    }
+
+    #[test]
+    fn invalid_tool_result_image_reports_tool_id() {
+        use super::super::types::Message as AnthropicMessage;
+
+        let req = MessagesRequest {
+            model: "claude-sonnet-4.5".to_string(),
+            max_tokens: 1024,
+            messages: vec![
+                AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!([
+                        {"type": "tool_use", "id": "tool-image", "name": "screenshot", "input": {}}
+                    ]),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!([
+                        {"type": "tool_result", "tool_use_id": "tool-image", "content": [
+                            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "aGVsbG8="}}
+                        ]}
+                    ]),
+                },
+            ],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let err = match convert_request(&req) {
+            Ok(_) => panic!("invalid nested image should fail conversion"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, ConversionError::InvalidImage(_)));
+        assert!(err.to_string().contains("tool-image"));
     }
 
     #[test]
