@@ -105,16 +105,14 @@ pub enum ImageValidationError {
 ///
 /// This is intentionally separate from resizing: callers can reject corrupt or truncated
 /// images before the resizer's compatibility fallback passes the original bytes through.
-pub fn validate_and_detect_image_format(
-    data_base64: &str,
-) -> Result<String, ImageValidationError> {
+pub fn validate_and_detect_image_format(data_base64: &str) -> Result<String, ImageValidationError> {
     let raw = BASE64
         .decode(data_base64)
         .map_err(|e| ImageValidationError::Base64(e.to_string()))?;
-    let detected = image::guess_format(&raw)
-        .map_err(|_| ImageValidationError::UnsupportedFormat)?;
-    let actual_format = canonical_format(detected)
-        .ok_or(ImageValidationError::UnsupportedFormat)?;
+    let detected =
+        image::guess_format(&raw).map_err(|_| ImageValidationError::UnsupportedFormat)?;
+    let actual_format =
+        canonical_format(detected).ok_or(ImageValidationError::UnsupportedFormat)?;
 
     let cursor = Cursor::new(&raw);
     let mut reader = ImageReader::new(cursor);

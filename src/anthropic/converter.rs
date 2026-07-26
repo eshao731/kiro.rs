@@ -888,7 +888,10 @@ fn extract_kiro_image(
     }
     let cfg = ResizeConfig::from_env();
     let processed = maybe_shrink_image(cfg, &actual_format, &source.data);
-    images.push(KiroImage::from_base64(processed.format, processed.data_base64));
+    images.push(KiroImage::from_base64(
+        processed.format,
+        processed.data_base64,
+    ));
     Ok(None)
 }
 

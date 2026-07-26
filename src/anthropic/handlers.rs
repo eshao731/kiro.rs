@@ -270,7 +270,9 @@ fn count_image_budget(payload: &super::types::MessagesRequest) -> ImageBudget {
         if item.get("type").and_then(|v| v.as_str()) != Some("image") {
             return;
         }
-        let Some(src) = item.get("source") else { return };
+        let Some(src) = item.get("source") else {
+            return;
+        };
         if src.get("type").and_then(|v| v.as_str()) != Some("base64") {
             return;
         }
@@ -350,7 +352,10 @@ pub(super) fn map_provider_error(err: Error) -> Response {
     }
 
     if let Some(ConversionError::InvalidImage(reason)) = err.downcast_ref::<ConversionError>() {
-        tracing::warn!(reason, "invalid image rejected before upstream; mapped to 400");
+        tracing::warn!(
+            reason,
+            "invalid image rejected before upstream; mapped to 400"
+        );
         return (
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse::new(
@@ -2122,7 +2127,8 @@ mod tests {
 
     #[test]
     fn count_image_budget_includes_tool_result_images() {
-        let req: super::super::types::MessagesRequest = serde_json::from_str(r#"{
+        let req: super::super::types::MessagesRequest = serde_json::from_str(
+            r#"{
             "model": "claude-opus-4-7",
             "max_tokens": 100,
             "messages": [{
@@ -2136,7 +2142,9 @@ mod tests {
                     ]
                 }]
             }]
-        }"#).unwrap();
+        }"#,
+        )
+        .unwrap();
 
         let stats = count_image_budget(&req);
         assert_eq!(stats.count, 1);
