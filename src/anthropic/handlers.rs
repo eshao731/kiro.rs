@@ -1,5 +1,6 @@
 //! Anthropic API Handler 函数
 
+use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::time::Instant;
 
@@ -9,7 +10,9 @@ use crate::admin::trace_db::{
     SharedTraceStore, TraceAttempt, TraceKeySource, TraceRecord, TraceSink, outcome,
 };
 use crate::kiro::model::events::Event;
+use crate::kiro::model::available_models::{TokenLimits, UpstreamModel};
 use crate::kiro::model::requests::kiro::KiroRequest;
+use crate::kiro::token_manager::ModelDiscoveryError;
 use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::token;
 use anyhow::Error;
@@ -451,6 +454,7 @@ fn resolve_usage_input_tokens(
     context_total_input_tokens.unwrap_or(fallback_total_input_tokens)
 }
 
+#[cfg(test)]
 fn available_models() -> Vec<Model> {
     let mut models = vec![
         Model {
@@ -661,8 +665,7 @@ fn available_models() -> Vec<Model> {
             max_tokens: 64000,
         },
     ];
-
-    // 追加配置文件里声明的自定义模型（保持原始顺序）。
+    // 测试用静态基线；生产 `/v1/models` 使用下方动态发现结果。
     for cm in crate::model::custom_models::all() {
         models.push(Model {
             id: cm.id.clone(),
@@ -671,25 +674,190 @@ fn available_models() -> Vec<Model> {
             owned_by: cm.owned_by.clone().unwrap_or_else(|| "custom".to_string()),
             display_name: cm.display_name.clone().unwrap_or_else(|| cm.id.clone()),
             model_type: "chat".to_string(),
-            max_tokens: cm.max_tokens.unwrap_or(64000),
+            max_tokens: cm.max_tokens.unwrap_or(64_000),
         });
     }
-
     models
+}
+
+fn validate_max_tokens(max_tokens: i32) -> Result<(), ErrorResponse> {
+    if max_tokens <= 0 {
+        Err(ErrorResponse::new(
+            "invalid_request_error",
+            "max_tokens must be greater than 0",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn merge_token_limits(target: &mut Option<TokenLimits>, incoming: Option<TokenLimits>) {
+    let Some(incoming) = incoming else {
+        return;
+    };
+    match target {
+        Some(target) => {
+            target.max_input_tokens = target.max_input_tokens.max(incoming.max_input_tokens);
+            target.max_output_tokens = target.max_output_tokens.max(incoming.max_output_tokens);
+        }
+        None => *target = Some(incoming),
+    }
+}
+
+fn infer_model_owner(model_id: &str) -> &'static str {
+    let id = model_id.to_ascii_lowercase();
+    if id.starts_with("claude-") {
+        "anthropic"
+    } else if id.starts_with("gpt-")
+        || id.starts_with("chatgpt-")
+        || id.starts_with("o1-")
+        || id.starts_with("o3-")
+        || id.starts_with("o4-")
+    {
+        "openai"
+    } else {
+        "kiro"
+    }
+}
+
+fn model_from_upstream(upstream: UpstreamModel) -> Model {
+    let max_tokens = upstream
+        .token_limits
+        .as_ref()
+        .and_then(|limits| limits.max_output_tokens)
+        .and_then(|limit| i32::try_from(limit).ok())
+        .filter(|limit| *limit > 0)
+        .unwrap_or(64_000);
+    Model {
+        display_name: upstream
+            .model_name
+            .clone()
+            .unwrap_or_else(|| upstream.model_id.clone()),
+        owned_by: infer_model_owner(&upstream.model_id).to_string(),
+        id: upstream.model_id,
+        object: "model".to_string(),
+        created: 0,
+        model_type: "chat".to_string(),
+        max_tokens,
+    }
+}
+
+fn aggregate_available_models_with_custom(
+    upstream_models: Vec<UpstreamModel>,
+    custom_models: &[crate::model::config::CustomModel],
+) -> Vec<Model> {
+    let mut merged_upstream: BTreeMap<String, UpstreamModel> = BTreeMap::new();
+    for incoming in upstream_models {
+        match merged_upstream.get_mut(&incoming.model_id) {
+            Some(existing) => {
+                if existing.model_name.is_none() {
+                    existing.model_name = incoming.model_name;
+                }
+                if existing.description.is_none() {
+                    existing.description = incoming.description;
+                }
+                merge_token_limits(&mut existing.token_limits, incoming.token_limits);
+            }
+            None => {
+                merged_upstream.insert(incoming.model_id.clone(), incoming);
+            }
+        }
+    }
+
+    let mut models: BTreeMap<String, Model> = BTreeMap::new();
+    for upstream in merged_upstream.into_values() {
+        if upstream.model_id.eq_ignore_ascii_case("claude-fable-5") {
+            continue;
+        }
+        let model = model_from_upstream(upstream);
+        if model.id.starts_with("claude-") && !model.id.ends_with("-thinking") {
+            let mut thinking = model.clone();
+            thinking.id = format!("{}-thinking", model.id);
+            thinking.display_name = format!("{} (Thinking)", model.display_name);
+            models.insert(thinking.id.clone(), thinking);
+        }
+        models.insert(model.id.clone(), model);
+    }
+
+    // 自定义别名最后写入，同名时其展示元数据优先于动态条目。
+    for custom in custom_models {
+        let model = Model {
+            id: custom.id.clone(),
+            object: "model".to_string(),
+            created: 0,
+            owned_by: custom
+                .owned_by
+                .clone()
+                .unwrap_or_else(|| "custom".to_string()),
+            display_name: custom
+                .display_name
+                .clone()
+                .unwrap_or_else(|| custom.id.clone()),
+            model_type: "chat".to_string(),
+            max_tokens: custom.max_tokens.unwrap_or(64_000),
+        };
+        models.insert(model.id.clone(), model);
+    }
+
+    models.into_values().collect()
+}
+
+fn aggregate_available_models(upstream_models: Vec<UpstreamModel>) -> Vec<Model> {
+    aggregate_available_models_with_custom(upstream_models, crate::model::custom_models::all())
 }
 
 /// GET /v1/models
 ///
 /// 返回可用的模型列表
-pub async fn get_models() -> impl IntoResponse {
+pub async fn get_models(
+    State(state): State<AppState>,
+    Extension(key_ctx): Extension<KeyContext>,
+) -> Response {
     tracing::info!("Received GET /v1/models request");
 
-    let models = available_models();
+    let Some(provider) = &state.kiro_provider else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse::new(
+                "service_unavailable",
+                "Kiro API provider not configured",
+            )),
+        )
+            .into_response();
+    };
 
-    Json(ModelsResponse {
-        object: "list".to_string(),
-        data: models,
-    })
+    let upstream = match provider
+        .token_manager()
+        .discover_models_for_group(key_ctx.group.as_deref())
+        .await
+    {
+        Ok(models) => models,
+        Err(ModelDiscoveryError::NoAvailableCredentials) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ErrorResponse::new(
+                    "service_unavailable",
+                    "No available credentials for this API key",
+                )),
+            )
+                .into_response();
+        }
+        Err(error @ ModelDiscoveryError::ColdStartFailed { .. }) => {
+            tracing::warn!("动态模型列表加载失败: {}", error);
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(ErrorResponse::new(
+                    "api_error",
+                    "Unable to load available models from upstream",
+                )),
+            )
+                .into_response();
+        }
+    };
+
+    let models = aggregate_available_models(upstream);
+
+    Json(ModelsResponse { object: "list".to_string(), data: models }).into_response()
 }
 
 /// POST /v1/messages
@@ -712,6 +880,9 @@ pub async fn post_messages(
         image_largest_b64_kb = %(img_stats.largest_b64_bytes / 1024),
         "Received POST /v1/messages request"
     );
+    if let Err(error) = validate_max_tokens(payload.max_tokens) {
+        return (StatusCode::BAD_REQUEST, Json(error)).into_response();
+    }
     if img_stats.total_b64_bytes > IMAGE_BUDGET_WARN_BYTES {
         tracing::warn!(
             image_count = %img_stats.count,
@@ -789,8 +960,8 @@ pub async fn post_messages(
         Ok(result) => result,
         Err(e) => {
             let (error_type, message) = match &e {
-                ConversionError::UnsupportedModel(model) => {
-                    ("invalid_request_error", format!("模型不支持: {}", model))
+                ConversionError::InvalidModel(reason) => {
+                    ("invalid_request_error", format!("无效模型 ID: {}", reason))
                 }
                 ConversionError::EmptyMessages => {
                     ("invalid_request_error", "消息列表为空".to_string())
@@ -1732,6 +1903,9 @@ pub async fn post_messages_cc(
         "Received POST /cc/v1/messages request"
     );
     let traffic_guard = state.traffic_metrics.begin(&payload.model, payload.stream);
+    if let Err(error) = validate_max_tokens(payload.max_tokens) {
+        return (StatusCode::BAD_REQUEST, Json(error)).into_response();
+    }
     let hook = UsageRecordHook::from_state(&state, key_ctx.key_id, payload.model.clone());
 
     // 检查 KiroProvider 是否可用
@@ -1801,8 +1975,8 @@ pub async fn post_messages_cc(
         Ok(result) => result,
         Err(e) => {
             let (error_type, message) = match &e {
-                ConversionError::UnsupportedModel(model) => {
-                    ("invalid_request_error", format!("模型不支持: {}", model))
+                ConversionError::InvalidModel(reason) => {
+                    ("invalid_request_error", format!("无效模型 ID: {}", reason))
                 }
                 ConversionError::EmptyMessages => {
                     ("invalid_request_error", "消息列表为空".to_string())
@@ -2441,12 +2615,17 @@ mod tests {
     }
 
     #[test]
-    fn available_models_include_opus_4_7_variants() {
-        let models = available_models();
+    fn dynamic_models_include_claude_thinking_alias() {
+        let models = aggregate_available_models(vec![UpstreamModel {
+            model_id: "claude-opus-5".to_string(),
+            model_name: Some("Claude Opus 5".to_string()),
+            description: None,
+            token_limits: None,
+        }]);
         let ids: Vec<&str> = models.iter().map(|model| model.id.as_str()).collect();
 
-        assert!(ids.contains(&"claude-opus-4-7"));
-        assert!(ids.contains(&"claude-opus-4-7-thinking"));
+        assert!(ids.contains(&"claude-opus-5"));
+        assert!(ids.contains(&"claude-opus-5-thinking"));
     }
 
     #[test]
@@ -2527,14 +2706,69 @@ mod tests {
     }
 
     #[test]
-    fn available_models_include_4_8_variants() {
-        let models = available_models();
-        let ids: Vec<&str> = models.iter().map(|model| model.id.as_str()).collect();
+    fn dynamic_models_merge_metadata_and_do_not_use_input_limit_as_output_limit() {
+        let models = aggregate_available_models(vec![
+            UpstreamModel {
+                model_id: "glm-5".to_string(),
+                model_name: None,
+                description: Some("first".to_string()),
+                token_limits: Some(TokenLimits {
+                    max_input_tokens: Some(200_000),
+                    max_output_tokens: None,
+                }),
+            },
+            UpstreamModel {
+                model_id: "glm-5".to_string(),
+                model_name: Some("GLM 5".to_string()),
+                description: None,
+                token_limits: Some(TokenLimits {
+                    max_input_tokens: Some(1_000_000),
+                    max_output_tokens: Some(32_000),
+                }),
+            },
+        ]);
 
-        assert!(ids.contains(&"claude-opus-4-8"));
-        assert!(ids.contains(&"claude-opus-4-8-thinking"));
-        assert!(ids.contains(&"claude-sonnet-4-8"));
-        assert!(ids.contains(&"claude-sonnet-4-8-thinking"));
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].display_name, "GLM 5");
+        assert_eq!(models[0].owned_by, "kiro");
+        assert_eq!(models[0].max_tokens, 32_000);
+    }
+
+    #[test]
+    fn custom_model_metadata_overrides_dynamic_collision() {
+        let custom = crate::model::config::CustomModel {
+            id: "gpt-next".to_string(),
+            backend_id: "gpt-next".to_string(),
+            display_name: Some("Configured GPT".to_string()),
+            context_window: Some(500_000),
+            max_tokens: Some(12_345),
+            supports_reasoning: Some(true),
+            owned_by: Some("configured-owner".to_string()),
+        };
+        let models = aggregate_available_models_with_custom(
+            vec![UpstreamModel {
+                model_id: "gpt-next".to_string(),
+                model_name: Some("Upstream GPT".to_string()),
+                description: None,
+                token_limits: Some(TokenLimits {
+                    max_input_tokens: Some(300_000),
+                    max_output_tokens: Some(64_000),
+                }),
+            }],
+            &[custom],
+        );
+
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].display_name, "Configured GPT");
+        assert_eq!(models[0].owned_by, "configured-owner");
+        assert_eq!(models[0].max_tokens, 12_345);
+    }
+
+    #[test]
+    fn max_tokens_must_be_positive() {
+        assert!(validate_max_tokens(1).is_ok());
+        assert!(validate_max_tokens(0).is_err());
+        assert!(validate_max_tokens(-1).is_err());
     }
 
     #[test]

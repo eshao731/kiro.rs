@@ -168,7 +168,7 @@ export async function getCredentialBalance(id: number): Promise<BalanceResponse>
   return data
 }
 
-// 获取凭据当前可用的模型列表（按需实时查询上游）
+// 获取凭据当前可用的模型列表（实时查询上游并更新服务端缓存）
 export async function getCredentialModels(id: number): Promise<AvailableModelsResponse> {
   const { data } = await api.get<AvailableModelsResponse>(`/credentials/${id}/models`)
   return data

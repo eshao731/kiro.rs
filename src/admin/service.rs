@@ -845,7 +845,7 @@ impl AdminService {
         })
     }
 
-    /// 获取指定凭据当前可用的模型列表（按需实时查询上游，不缓存）
+    /// 获取指定凭据当前可用的模型列表（实时查询上游，成功后更新共享模型缓存）
     pub async fn get_available_models(
         &self,
         id: u64,

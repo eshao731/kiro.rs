@@ -281,8 +281,8 @@ async fn run_round(
         Ok(c) => c,
         Err(e) => {
             let (et, msg) = match &e {
-                ConversionError::UnsupportedModel(m) => {
-                    ("invalid_request_error", format!("unsupported model: {}", m))
+                ConversionError::InvalidModel(reason) => {
+                    ("invalid_request_error", format!("invalid model id: {}", reason))
                 }
                 ConversionError::EmptyMessages => {
                     ("invalid_request_error", "message list is empty".to_string())
