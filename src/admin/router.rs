@@ -1,8 +1,9 @@
 //! Admin API 路由配置
 
 use axum::{
-    Router, middleware,
+    Router,
     extract::DefaultBodyLimit,
+    middleware,
     routing::{delete, get, post, put},
 };
 
@@ -26,7 +27,8 @@ use super::{
         set_credential_priority, set_global_proxy, set_load_balancing_mode,
         set_log_governance_config, set_proxy_enabled, set_update_config, social_oauth_callback,
         start_idc_login, start_idc_relogin, start_social_login, start_social_relogin,
-        stats_by_credential, stats_by_model, stats_overview, stats_timeseries,
+        stats_by_credential, stats_by_model, stats_overview, stats_timeseries, get_current_models,
+        test_model,
         trace_failure_stats, update_admin_key, update_client_key, update_credential, update_group,
         update_refresh_token,
     },
@@ -82,21 +84,23 @@ pub fn create_admin_router(state: AdminState) -> Router {
             "/credentials/disable-quota-exceeded",
             post(disable_quota_exceeded),
         )
-        .route(
-            "/credentials/overage/enable-all",
-            post(enable_overage_all),
-        )
+        .route("/credentials/overage/enable-all", post(enable_overage_all))
         .route("/credentials/{id}/overage", post(set_credential_overage))
         .route("/credentials/{id}/refresh", post(force_refresh_token))
         .route("/credentials/{id}/refresh-token", put(update_refresh_token))
         .route("/credentials/{id}/balance", get(get_credential_balance))
         .route("/credentials/{id}/api-key", get(get_credential_api_key))
         .route("/credentials/{id}/models", get(get_credential_models))
+        .route("/models", get(get_current_models))
+        .route("/models/test", post(test_model))
         .route("/credentials/{id}/proxy", post(assign_proxy_to_credential))
         .route("/proxy-pool", get(get_proxy_pool).post(add_proxy))
         .route("/proxy-pool/batch", post(batch_add_proxies))
         .route("/proxy-pool/check-all", post(check_all_proxies))
-        .route("/proxy-pool/assign-round-robin", post(assign_proxies_round_robin))
+        .route(
+            "/proxy-pool/assign-round-robin",
+            post(assign_proxies_round_robin),
+        )
         .route("/proxy-pool/{id}", delete(delete_proxy))
         .route("/proxy-pool/{id}/enabled", post(set_proxy_enabled))
         .route("/proxy-pool/{id}/check", post(check_proxy))
@@ -154,19 +158,22 @@ pub fn create_admin_router(state: AdminState) -> Router {
             "/credentials/{id}/relogin/idc/poll/{session_id}",
             post(poll_idc_relogin),
         )
-        .route("/client-keys", get(list_client_keys).post(create_client_key))
+        .route(
+            "/client-keys",
+            get(list_client_keys).post(create_client_key),
+        )
         .route(
             "/client-keys/{id}",
             delete(delete_client_key).put(update_client_key),
         )
         .route("/client-keys/{id}/disabled", post(set_client_key_disabled))
-        .route("/client-keys/{id}/reset-stats", post(reset_client_key_stats))
+        .route(
+            "/client-keys/{id}/reset-stats",
+            post(reset_client_key_stats),
+        )
         .route("/client-keys/{id}/rotate", post(rotate_client_key))
         .route("/groups", get(list_groups).post(create_group))
-        .route(
-            "/groups/{name}",
-            delete(delete_group).patch(update_group),
-        )
+        .route("/groups/{name}", delete(delete_group).patch(update_group))
         .route("/stats/overview", get(stats_overview))
         .route("/stats/timeseries", get(stats_timeseries))
         .route("/stats/by-model", get(stats_by_model))

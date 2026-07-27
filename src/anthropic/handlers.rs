@@ -5,15 +5,15 @@ use std::convert::Infallible;
 use std::time::Instant;
 
 use crate::admin::client_keys::SharedClientKeyManager;
-use crate::admin::usage_stats::{SharedAggregator, SharedRecorder, UsageRecord};
 use crate::admin::trace_db::{
     SharedTraceStore, TraceAttempt, TraceKeySource, TraceRecord, TraceSink, outcome,
 };
-use crate::kiro::model::events::Event;
+use crate::admin::usage_stats::{SharedAggregator, SharedRecorder, UsageRecord};
 use crate::kiro::model::available_models::{TokenLimits, UpstreamModel};
+use crate::kiro::model::events::Event;
 use crate::kiro::model::requests::kiro::KiroRequest;
-use crate::kiro::token_manager::ModelDiscoveryError;
 use crate::kiro::parser::decoder::EventStreamDecoder;
+use crate::kiro::token_manager::ModelDiscoveryError;
 use crate::token;
 use anyhow::Error;
 use axum::{
@@ -770,12 +770,6 @@ fn aggregate_available_models_with_custom(
             continue;
         }
         let model = model_from_upstream(upstream);
-        if model.id.starts_with("claude-") && !model.id.ends_with("-thinking") {
-            let mut thinking = model.clone();
-            thinking.id = format!("{}-thinking", model.id);
-            thinking.display_name = format!("{} (Thinking)", model.display_name);
-            models.insert(thinking.id.clone(), thinking);
-        }
         models.insert(model.id.clone(), model);
     }
 
@@ -857,7 +851,11 @@ pub async fn get_models(
 
     let models = aggregate_available_models(upstream);
 
-    Json(ModelsResponse { object: "list".to_string(), data: models }).into_response()
+    Json(ModelsResponse {
+        object: "list".to_string(),
+        data: models,
+    })
+    .into_response()
 }
 
 /// POST /v1/messages
@@ -932,7 +930,11 @@ pub async fn post_messages(
         )
         .await;
         // WebSearch 路径走 MCP 端点，没有 credential_id 上下文，统一记 0
-        let status = if resp.status().is_success() { "success" } else { "error" };
+        let status = if resp.status().is_success() {
+            "success"
+        } else {
+            "error"
+        };
         hook.record(0, input_tokens, 0, 0, 0, 0.0, status);
         return resp;
     }
@@ -956,7 +958,8 @@ pub async fn post_messages(
     }
 
     // 转换请求
-    let conversion_result = match convert_request_with_mode(&payload, state.tool_compatibility_mode) {
+    let conversion_result = match convert_request_with_mode(&payload, state.tool_compatibility_mode)
+    {
         Ok(result) => result,
         Err(e) => {
             let (error_type, message) = match &e {
@@ -1132,12 +1135,21 @@ async fn handle_stream_request(
     traffic_guard: TrafficRequestGuard,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let call_result = match provider.call_api_stream(request_body, Some(tracer.as_ref()), group.as_deref()).await {
+    let call_result = match provider
+        .call_api_stream(request_body, Some(tracer.as_ref()), group.as_deref())
+        .await
+    {
         Ok(resp) => resp,
         Err(e) => {
             hook.record(0, input_tokens, 0, 0, 0, 0.0, "error");
             // 重试链路全部失败、未开始返回内容：error_type 取最后一跳分类
-            tracer.finalize("error", last_attempt_outcome(&tracer), Some(&e.to_string()), None, TraceUsage::zero());
+            tracer.finalize(
+                "error",
+                last_attempt_outcome(&tracer),
+                Some(&e.to_string()),
+                None,
+                TraceUsage::zero(),
+            );
             return map_provider_error(e);
         }
     };
@@ -1145,7 +1157,13 @@ async fn handle_stream_request(
     let credential_id = call_result.credential_id;
 
     // 创建流处理上下文
-    let mut ctx = StreamContext::new_with_thinking(model, input_tokens, thinking_enabled, tool_name_map, known_tool_names);
+    let mut ctx = StreamContext::new_with_thinking(
+        model,
+        input_tokens,
+        thinking_enabled,
+        tool_name_map,
+        known_tool_names,
+    );
     ctx.cache_usage = cache_usage;
 
     // 生成初始事件
@@ -1359,7 +1377,11 @@ fn stream_trace_usage(ctx: &StreamContext) -> TraceUsage {
         output_tokens: ctx.output_tokens.max(0) as u64,
         cache_creation_tokens: cache_creation.max(0) as u64,
         cache_read_tokens: cache_read.max(0) as u64,
-        credits: if ctx.credits.is_finite() && ctx.credits > 0.0 { ctx.credits } else { 0.0 },
+        credits: if ctx.credits.is_finite() && ctx.credits > 0.0 {
+            ctx.credits
+        } else {
+            0.0
+        },
     }
 }
 
@@ -1384,11 +1406,20 @@ async fn handle_non_stream_request(
 ) -> Response {
     for tool_json_retry in 0..=TOOL_JSON_INCOMPLETE_MAX_RETRIES {
     // 调用 Kiro API（支持多凭据故障转移）
-    let call_result = match provider.call_api(request_body, Some(tracer.as_ref()), group.as_deref()).await {
+    let call_result = match provider
+        .call_api(request_body, Some(tracer.as_ref()), group.as_deref())
+        .await
+    {
         Ok(resp) => resp,
         Err(e) => {
             hook.record(0, input_tokens, 0, 0, 0, 0.0, "error");
-            tracer.finalize("error", last_attempt_outcome(&tracer), Some(&e.to_string()), None, TraceUsage::zero());
+            tracer.finalize(
+                "error",
+                last_attempt_outcome(&tracer),
+                Some(&e.to_string()),
+                None,
+                TraceUsage::zero(),
+            );
             return map_provider_error(e);
         }
     };
@@ -1751,7 +1782,11 @@ async fn handle_non_stream_request(
             output_tokens: output_tokens.max(0) as u64,
             cache_creation_tokens: cache_creation_tokens.max(0) as u64,
             cache_read_tokens: cache_read_tokens.max(0) as u64,
-            credits: if credits.is_finite() && credits > 0.0 { credits } else { 0.0 },
+            credits: if credits.is_finite() && credits > 0.0 {
+                credits
+            } else {
+                0.0
+            },
         },
     );
     return (StatusCode::OK, Json(response_body)).into_response();
@@ -1947,7 +1982,11 @@ pub async fn post_messages_cc(
             key_ctx.group.as_deref(),
         )
         .await;
-        let status = if resp.status().is_success() { "success" } else { "error" };
+        let status = if resp.status().is_success() {
+            "success"
+        } else {
+            "error"
+        };
         hook.record(0, input_tokens, 0, 0, 0, 0.0, status);
         return resp;
     }
@@ -1971,7 +2010,8 @@ pub async fn post_messages_cc(
     }
 
     // 转换请求
-    let conversion_result = match convert_request_with_mode(&payload, state.tool_compatibility_mode) {
+    let conversion_result = match convert_request_with_mode(&payload, state.tool_compatibility_mode)
+    {
         Ok(result) => result,
         Err(e) => {
             let (error_type, message) = match &e {
@@ -2126,11 +2166,20 @@ async fn handle_stream_request_buffered(
     traffic_guard: TrafficRequestGuard,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let call_result = match provider.call_api_stream(request_body, Some(tracer.as_ref()), group.as_deref()).await {
+    let call_result = match provider
+        .call_api_stream(request_body, Some(tracer.as_ref()), group.as_deref())
+        .await
+    {
         Ok(resp) => resp,
         Err(e) => {
             hook.record(0, fallback_input_tokens, 0, 0, 0, 0.0, "error");
-            tracer.finalize("error", last_attempt_outcome(&tracer), Some(&e.to_string()), None, TraceUsage::zero());
+            tracer.finalize(
+                "error",
+                last_attempt_outcome(&tracer),
+                Some(&e.to_string()),
+                None,
+                TraceUsage::zero(),
+            );
             return map_provider_error(e);
         }
     };
@@ -2527,17 +2576,13 @@ mod tests {
         let resp = map_provider_error(err.into());
 
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
-        assert_eq!(
-            resp.headers().get(header::RETRY_AFTER).unwrap(),
-            "1800"
-        );
+        assert_eq!(resp.headers().get(header::RETRY_AFTER).unwrap(), "1800");
     }
 
     #[test]
     fn upstream_rate_limit_drops_invalid_retry_after() {
-        let err = crate::kiro::error::UpstreamRateLimitError::new(Some(
-            "not-a-retry-delay".to_string(),
-        ));
+        let err =
+            crate::kiro::error::UpstreamRateLimitError::new(Some("not-a-retry-delay".to_string()));
         let resp = map_provider_error(err.into());
 
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
@@ -2615,7 +2660,7 @@ mod tests {
     }
 
     #[test]
-    fn dynamic_models_include_claude_thinking_alias() {
+    fn dynamic_models_do_not_synthesize_claude_thinking_alias() {
         let models = aggregate_available_models(vec![UpstreamModel {
             model_id: "claude-opus-5".to_string(),
             model_name: Some("Claude Opus 5".to_string()),
@@ -2625,16 +2670,19 @@ mod tests {
         let ids: Vec<&str> = models.iter().map(|model| model.id.as_str()).collect();
 
         assert!(ids.contains(&"claude-opus-5"));
-        assert!(ids.contains(&"claude-opus-5-thinking"));
+        assert!(!ids.contains(&"claude-opus-5-thinking"));
     }
 
     #[test]
     fn count_image_budget_handles_empty() {
-        let req: super::super::types::MessagesRequest = serde_json::from_str(r#"{
+        let req: super::super::types::MessagesRequest = serde_json::from_str(
+            r#"{
             "model": "claude-opus-4-7",
             "max_tokens": 100,
             "messages": []
-        }"#).unwrap();
+        }"#,
+        )
+        .unwrap();
         let stats = count_image_budget(&req);
         assert_eq!(stats.count, 0);
         assert_eq!(stats.total_b64_bytes, 0);
@@ -2664,7 +2712,8 @@ mod tests {
 
     #[test]
     fn count_image_budget_skips_url_only_images() {
-        let req: super::super::types::MessagesRequest = serde_json::from_str(r#"{
+        let req: super::super::types::MessagesRequest = serde_json::from_str(
+            r#"{
             "model": "claude-opus-4-7",
             "max_tokens": 100,
             "messages": [{
@@ -2673,7 +2722,9 @@ mod tests {
                     {"type": "image", "source": {"type": "url", "url": "https://example.com/x.png"}}
                 ]
             }]
-        }"#).unwrap();
+        }"#,
+        )
+        .unwrap();
         let stats = count_image_budget(&req);
         assert_eq!(stats.count, 0);
     }

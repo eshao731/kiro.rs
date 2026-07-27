@@ -403,7 +403,7 @@ export function CredentialCard({
     !credential.disabled && (rateLimitRemaining > 0 || hasDynamicRateLimit);
   const unsupportedModels = credential.unsupportedModels ?? [];
 
-  // 卡片与列表行共用的状态描边 / 灰化（活跃 · 超额 · 冷却 · 禁用）
+  // 卡片与列表行共用的状态描边 / 灰化（当前优先 · 超额 · 冷却 · 禁用）
   const stateClasses = [
     credential.isCurrent ? "ring-2 ring-primary/60 shadow-apple-lg" : "",
     !credential.disabled && isQuotaExceeded ? "ring-1 ring-amber-500/60" : "",
@@ -430,7 +430,7 @@ export function CredentialCard({
           className="max-w-full"
         />
       )}
-      {credential.isCurrent && <Badge variant="success">活跃</Badge>}
+      {credential.isCurrent && <Badge variant="success">当前优先</Badge>}
       {/* 禁用状态：合并 "已禁用" + 中文化的原因，单个 Badge 更醒目 */}
       {credential.disabled && reasonStyle && (
         <Badge variant={reasonStyle.variant}>已禁用 · {reasonStyle.label}</Badge>
@@ -1273,7 +1273,7 @@ export function CredentialCard({
       <AvailableModelsDialog
         open={showModelsDialog}
         onOpenChange={setShowModelsDialog}
-        credentialId={showModelsDialog ? credential.id : null}
+        credentialId={credential.id}
       />
     </>
   );

@@ -206,8 +206,8 @@ async fn refresh_social_token(
         .await?;
 
     let status = response.status();
-    let rate_limit_error = (status.as_u16() == 429)
-        .then(|| UpstreamRateLimitError::from_headers(response.headers()));
+    let rate_limit_error =
+        (status.as_u16() == 429).then(|| UpstreamRateLimitError::from_headers(response.headers()));
     if !status.is_success() {
         let body_text = response.text().await.unwrap_or_default();
 
@@ -309,8 +309,8 @@ async fn refresh_idc_token(
         .await?;
 
     let status = response.status();
-    let rate_limit_error = (status.as_u16() == 429)
-        .then(|| UpstreamRateLimitError::from_headers(response.headers()));
+    let rate_limit_error =
+        (status.as_u16() == 429).then(|| UpstreamRateLimitError::from_headers(response.headers()));
     if !status.is_success() {
         let body_text = response.text().await.unwrap_or_default();
 
@@ -1078,7 +1078,7 @@ pub struct CredentialEntrySnapshot {
 pub struct ManagerSnapshot {
     /// 凭据条目列表
     pub entries: Vec<CredentialEntrySnapshot>,
-    /// 当前活跃凭据 ID
+    /// 内部调度指针；balanced 模式不代表唯一活跃凭据
     pub current_id: u64,
     /// 总凭据数量
     pub total: usize,
@@ -1579,8 +1579,7 @@ impl MultiTokenManager {
         if let Some(entry) = self.model_cache.lock().get(&id) {
             let refreshed_by_concurrent_request =
                 force && entry.refreshed_at >= refresh_requested_at;
-            let fresh_ttl_hit =
-                !force && entry.refreshed_at.elapsed() < self.model_cache_ttl();
+            let fresh_ttl_hit = !force && entry.refreshed_at.elapsed() < self.model_cache_ttl();
             if refreshed_by_concurrent_request || fresh_ttl_hit {
                 return Ok(entry.response.clone());
             }
@@ -1660,9 +1659,11 @@ impl MultiTokenManager {
             return Err(ModelDiscoveryError::NoAvailableCredentials);
         }
 
-        let results = futures::future::join_all(ids.iter().copied().map(|id| async move {
-            (id, self.cached_or_refresh_models_for(id).await)
-        }))
+        let results = futures::future::join_all(
+            ids.iter()
+                .copied()
+                .map(|id| async move { (id, self.cached_or_refresh_models_for(id).await) }),
+        )
         .await;
 
         let mut models = Vec::new();
@@ -1693,7 +1694,9 @@ impl MultiTokenManager {
         let manager = Arc::clone(self);
         tokio::spawn(async move {
             match manager.discover_models_for_group(None).await {
-                Ok(models) => tracing::info!("模型缓存预热完成，共加载 {} 个模型条目", models.len()),
+                Ok(models) => {
+                    tracing::info!("模型缓存预热完成，共加载 {} 个模型条目", models.len())
+                }
                 Err(ModelDiscoveryError::NoAvailableCredentials) => {
                     tracing::debug!("没有可用于模型缓存预热的凭据")
                 }
@@ -1775,7 +1778,11 @@ impl MultiTokenManager {
     ///
     /// # 参数
     /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
-    fn select_next_credential(&self, model: Option<&str>, group: Option<&str>) -> Option<(u64, KiroCredentials)> {
+    fn select_next_credential(
+        &self,
+        model: Option<&str>,
+        group: Option<&str>,
+    ) -> Option<(u64, KiroCredentials)> {
         let entries = self.entries.lock();
         let now = Instant::now();
 
@@ -1814,18 +1821,10 @@ impl MultiTokenManager {
                 Some((entry.id, entry.credentials.clone()))
             }
             "least_conn" => {
-                // Least-Connections 策略：选择当前在途请求数最少的凭据。
-                let (entry, _) = available
-                    .iter()
-                    .min_by_key(|(e, support)| {
-                        let discovery_rank = usize::from(*support != CachedModelSupport::Confirmed);
-                        (
-                            discovery_rank,
-                            e.in_flight,
-                            e.credentials.priority,
-                            e.load_balance_count,
-                        )
-                    })?;
+                let (entry, _) = available.iter().min_by_key(|(e, support)| {
+                    let discovery_rank = usize::from(*support != CachedModelSupport::Confirmed);
+                    (discovery_rank, e.in_flight, e.credentials.priority, e.load_balance_count)
+                })?;
 
                 Some((entry.id, entry.credentials.clone()))
             }
@@ -1850,7 +1849,26 @@ impl MultiTokenManager {
     ///
     /// # 参数
     /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
-    pub async fn acquire_context(&self, model: Option<&str>, group: Option<&str>) -> anyhow::Result<CallContext> {
+    pub async fn acquire_context(
+        &self,
+        model: Option<&str>,
+        group: Option<&str>,
+    ) -> anyhow::Result<CallContext> {
+        self.acquire_context_impl(model, group, true)
+            .await
+            .map(|(context, _)| context)
+    }
+
+    /// 获取 API 调用上下文，并返回本次选择是否使用了 balanced 模式。
+    ///
+    /// `update_current` 仅应在真实业务请求中开启。Admin 模型发现需要复用同一套
+    /// 凭据选择和 Token 刷新规则，但不应因只读查询改变调度状态。
+    async fn acquire_context_impl(
+        &self,
+        model: Option<&str>,
+        group: Option<&str>,
+        update_current: bool,
+    ) -> anyhow::Result<(CallContext, bool)> {
         let total = self.total_count_in_group(group);
         let max_attempts = (total * MAX_FAILURES_PER_CREDENTIAL as usize).max(1);
         let mut attempt_count = 0;
@@ -1864,7 +1882,8 @@ impl MultiTokenManager {
                 );
             }
 
-            let (id, credentials) = {
+            let (id, credentials, is_balanced) = {
+                let is_balanced = self.load_balancing_mode.lock().as_str() == "balanced";
                 let re_select_each_request = self.load_balancing_mode.lock().as_str() != "priority";
 
                 // 非 priority 模式：每次请求都重新选择，不固定 current_id
@@ -1895,7 +1914,7 @@ impl MultiTokenManager {
                         .map(|e| (e.id, e.credentials.clone()))
                 };
 
-                if let Some(hit) = current_hit {
+                let (id, credentials) = if let Some(hit) = current_hit {
                     hit
                 } else {
                     // 当前凭据不可用或 balanced 模式，根据负载均衡策略选择
@@ -1924,9 +1943,10 @@ impl MultiTokenManager {
                     }
 
                     if let Some((new_id, new_creds)) = best {
-                        // 更新 current_id
-                        let mut current_id = self.current_id.lock();
-                        *current_id = new_id;
+                        if update_current {
+                            let mut current_id = self.current_id.lock();
+                            *current_id = new_id;
+                        }
                         (new_id, new_creds)
                     } else {
                         if let Some(delay) = self.shortest_rate_limit_delay(model, group) {
@@ -1956,15 +1976,19 @@ impl MultiTokenManager {
                         let available = entries.iter().filter(|e| !e.disabled).count();
                         anyhow::bail!("所有凭据均已禁用（{}/{}）", available, total);
                     }
-                }
+                };
+
+                (id, credentials, is_balanced)
             };
 
             // 尝试获取/刷新 Token
             match self.try_ensure_token(id, &credentials).await {
                 Ok(ctx) => {
-                    // 仅在最终把凭据交给调用方时 +1（least_conn 在途计数）。
-                    self.inc_in_flight(ctx.id);
-                    return Ok(ctx);
+                    if update_current {
+                        // 仅在最终把凭据交给真实调用方时 +1（least_conn 在途计数）。
+                        self.inc_in_flight(ctx.id);
+                    }
+                    return Ok((ctx, is_balanced));
                 }
                 Err(e) => {
                     let Some(has_available) = self.handle_token_refresh_error(id, e)? else {
@@ -3155,6 +3179,7 @@ impl MultiTokenManager {
                 .filter(|e| {
                     !e.disabled
                         && !e.throttled_until.map(|t| t > throttled_now).unwrap_or(false)
+                        && credential_matches_request(&e.credentials, model, group)
                 })
                 .count()
         }
@@ -3499,10 +3524,7 @@ impl MultiTokenManager {
     /// 复用 [`Self::get_usage_limits_for`] 的 token 准备流程：API Key 凭据直接用
     /// kiroApiKey；OAuth 凭据按需在 `refresh_lock` 内刷新并持久化。返回的凭据是
     /// 刷新后重新读取的最新快照，调用方据此构造请求。
-    async fn prepare_request_token(
-        &self,
-        id: u64,
-    ) -> anyhow::Result<(String, KiroCredentials)> {
+    async fn prepare_request_token(&self, id: u64) -> anyhow::Result<(String, KiroCredentials)> {
         let credentials = {
             let entries = self.entries.lock();
             entries
@@ -3580,6 +3602,20 @@ impl MultiTokenManager {
         id: u64,
     ) -> anyhow::Result<ListAvailableModelsResponse> {
         self.refresh_model_cache_for(id, true).await
+    }
+
+    /// 使用账号池当前选中的可用凭据实时查询模型列表（Admin 全局模型视图）。
+    ///
+    /// 凭据选择复用正常请求的账号池规则：priority 模式优先当前凭据，balanced
+    /// 模式按均衡策略选择；失效 Token 会在查询前刷新。返回实际命中的凭据 ID，
+    /// 供管理前端明确展示数据来源。
+    pub async fn get_available_models_for_current(
+        &self,
+    ) -> anyhow::Result<(u64, ListAvailableModelsResponse, bool)> {
+        let (context, is_balanced) = self.acquire_context_impl(None, None, false).await?;
+        let id = context.id;
+        let response = self.refresh_model_cache_for(id, true).await?;
+        Ok((id, response, is_balanced))
     }
 
     /// 设置用户偏好（开启/关闭超额）— Admin API
@@ -3916,8 +3952,11 @@ impl MultiTokenManager {
                 entry.credentials.proxy_password = v.filter(|s| !s.is_empty());
             }
             if let Some(g) = groups {
-                entry.credentials.groups =
-                    g.into_iter().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+                entry.credentials.groups = g
+                    .into_iter()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
             }
             if let Some(v) = source_channel {
                 entry.credentials.source_channel =
@@ -4232,6 +4271,10 @@ impl MultiTokenManager {
         if let Err(err) = self.persist_load_balancing_mode(&mode) {
             *self.load_balancing_mode.lock() = previous_mode;
             return Err(err);
+        }
+
+        if mode == "priority" {
+            self.select_highest_priority();
         }
 
         tracing::info!("负载均衡模式已设置为: {}", mode);
@@ -5089,6 +5132,75 @@ mod tests {
         assert_eq!(ctx.token, "good-token");
     }
 
+    #[tokio::test]
+    async fn balanced_read_only_selection_does_not_update_current_id() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+
+        let first = KiroCredentials {
+            access_token: Some("first-token".to_string()),
+            expires_at: Some((Utc::now() + Duration::hours(1)).to_rfc3339()),
+            priority: 0,
+            ..KiroCredentials::default()
+        };
+        let second = KiroCredentials {
+            access_token: Some("second-token".to_string()),
+            expires_at: Some((Utc::now() + Duration::hours(1)).to_rfc3339()),
+            priority: 1,
+            ..KiroCredentials::default()
+        };
+        let manager =
+            MultiTokenManager::new(config, vec![first, second], None, None, false).unwrap();
+
+        assert_eq!(manager.snapshot().current_id, 1);
+        manager.report_success(1);
+
+        let (context, is_balanced) = manager
+            .acquire_context_impl(None, None, false)
+            .await
+            .unwrap();
+
+        assert!(is_balanced);
+        assert_eq!(context.id, 2);
+        assert_eq!(manager.snapshot().current_id, 1);
+
+        let context = manager.acquire_context(None, None).await.unwrap();
+        assert_eq!(context.id, 2);
+        assert_eq!(manager.snapshot().current_id, 2);
+    }
+
+    #[tokio::test]
+    async fn switching_from_balanced_to_priority_selects_highest_priority() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+
+        let first = KiroCredentials {
+            access_token: Some("first-token".to_string()),
+            expires_at: Some((Utc::now() + Duration::hours(1)).to_rfc3339()),
+            priority: 0,
+            ..KiroCredentials::default()
+        };
+        let second = KiroCredentials {
+            access_token: Some("second-token".to_string()),
+            expires_at: Some((Utc::now() + Duration::hours(1)).to_rfc3339()),
+            priority: 1,
+            ..KiroCredentials::default()
+        };
+        let manager =
+            MultiTokenManager::new(config, vec![first, second], None, None, false).unwrap();
+
+        manager.report_success(1);
+        let context = manager.acquire_context(None, None).await.unwrap();
+        assert_eq!(context.id, 2);
+        assert_eq!(manager.snapshot().current_id, 2);
+
+        manager
+            .set_load_balancing_mode("priority".to_string())
+            .unwrap();
+
+        assert_eq!(manager.snapshot().current_id, 1);
+    }
+
     #[test]
     fn test_multi_token_manager_report_refresh_failure() {
         let config = Config::default();
@@ -5560,7 +5672,8 @@ mod tests {
     async fn test_concurrent_add_same_api_key_inserts_once() {
         let path = tmp_creds_path("concurrent_dedup");
         let manager = Arc::new(
-            MultiTokenManager::new(Config::default(), vec![], None, Some(path.clone()), true).unwrap(),
+            MultiTokenManager::new(Config::default(), vec![], None, Some(path.clone()), true)
+                .unwrap(),
         );
 
         const N: usize = 8;
@@ -5581,7 +5694,10 @@ mod tests {
                 ok_count += 1;
             }
         }
-        assert_eq!(ok_count, 1, "并发添加同一凭据应只成功一次，实际成功 {ok_count} 次");
+        assert_eq!(
+            ok_count, 1,
+            "并发添加同一凭据应只成功一次，实际成功 {ok_count} 次"
+        );
 
         let snapshot = manager.snapshot();
         assert_eq!(
@@ -5812,14 +5928,9 @@ mod tests {
     async fn test_model_cache_refresh_failure_preserves_stale_value() {
         let mut config = Config::default();
         config.model_cache_ttl_secs = 0;
-        let manager = MultiTokenManager::new(
-            config,
-            vec![KiroCredentials::default()],
-            None,
-            None,
-            false,
-        )
-        .unwrap();
+        let manager =
+            MultiTokenManager::new(config, vec![KiroCredentials::default()], None, None, false)
+                .unwrap();
         seed_model_cache(&manager, 1, &["deepseek-3.2"]);
 
         let response = manager.cached_or_refresh_models_for(1).await.unwrap();
@@ -5974,10 +6085,7 @@ mod tests {
         .unwrap();
         seed_model_cache(&manager, 1, &["glm-5"]);
 
-        let models = manager
-            .discover_models_for_group(Some("g1"))
-            .await
-            .unwrap();
+        let models = manager.discover_models_for_group(Some("g1")).await.unwrap();
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].model_id, "glm-5");
     }
@@ -5988,7 +6096,10 @@ mod tests {
         assert!(group_matches(&[], None));
         assert!(group_matches(&["g1".to_string()], None));
         // 绑定分组时只匹配 groups 含该名的账号
-        assert!(group_matches(&["g1".to_string(), "g2".to_string()], Some("g1")));
+        assert!(group_matches(
+            &["g1".to_string(), "g2".to_string()],
+            Some("g1")
+        ));
         assert!(!group_matches(&["g2".to_string()], Some("g1")));
         assert!(!group_matches(&[], Some("g1")));
     }
@@ -6030,9 +6141,14 @@ mod tests {
         pro_cred.subscription_title = Some("KIRO PRO".to_string());
         pro_cred.priority = 10;
 
-        let manager =
-            MultiTokenManager::new(Config::default(), vec![free_cred, pro_cred], None, None, false)
-                .unwrap();
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![free_cred, pro_cred],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
 
         // Warm current_id with the highest-priority Free account.
         let current = manager.acquire_context(None, None).await.unwrap();
@@ -6168,10 +6284,7 @@ mod tests {
     fn test_available_count_for_request_respects_group_throttle() {
         let manager = MultiTokenManager::new(
             Config::default(),
-            vec![
-                grouped_cred("a", &["g1"]),
-                grouped_cred("b", &["g2"]),
-            ],
+            vec![grouped_cred("a", &["g1"]), grouped_cred("b", &["g2"])],
             None,
             None,
             false,
