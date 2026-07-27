@@ -445,6 +445,8 @@ export async function setLoadBalancingMode(mode: LoadBalancingMode): Promise<{ m
 export interface AccountThrottleConfig {
   failover: boolean
   cooldownSecs: number
+  unlimitedConcurrency: boolean
+  disableFailureAutoRecovery: boolean
 }
 
 // 获取账号级风控故障转移配置

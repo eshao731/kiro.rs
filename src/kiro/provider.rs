@@ -964,14 +964,24 @@ impl KiroProvider {
                     ));
                 } else {
                     let report = self.token_manager.report_rate_limited(ctx.id);
-                    tracing::warn!(
-                        "凭据 #{} 普通 429 软限流已生效：冷却 {}s，连续 {} 次，动态并发上限 {}，剩余可调度账号 {}",
-                        ctx.id,
-                        report.cooldown_secs,
-                        report.consecutive_count,
-                        report.concurrency_limit,
-                        report.remaining_available
-                    );
+                    if report.concurrency_limit == 0 {
+                        tracing::warn!(
+                            "凭据 #{} 普通 429 软限流已生效：冷却 {}s，连续 {} 次，动态并发不限，剩余可调度账号 {}",
+                            ctx.id,
+                            report.cooldown_secs,
+                            report.consecutive_count,
+                            report.remaining_available
+                        );
+                    } else {
+                        tracing::warn!(
+                            "凭据 #{} 普通 429 软限流已生效：冷却 {}s，连续 {} 次，动态并发上限 {}，剩余可调度账号 {}",
+                            ctx.id,
+                            report.cooldown_secs,
+                            report.consecutive_count,
+                            report.concurrency_limit,
+                            report.remaining_available
+                        );
+                    }
                     let propagated = match rate_limit_error {
                         Some(rate_limit) if !rate_limit.should_retry_locally() => {
                             return Err(rate_limit.into());

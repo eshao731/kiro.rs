@@ -157,6 +157,18 @@ pub struct Config {
     #[serde(default = "default_account_throttle_cooldown_secs")]
     pub account_throttle_cooldown_secs: u64,
 
+    /// 是否关闭普通 429 触发的动态并发收缩（默认 false）。
+    ///
+    /// 开启后仍保留 429 软冷却和重试，但不会设置凭据级动态并发上限。
+    #[serde(default)]
+    pub unlimited_concurrency: bool,
+
+    /// 是否关闭连续失败导致全部凭据禁用时的自动自愈（默认 false）。
+    ///
+    /// 开启后，`TooManyFailures` 凭据保持禁用，必须由管理员手动恢复。
+    #[serde(default)]
+    pub disable_failure_auto_recovery: bool,
+
     /// Prompt cache 最多计入的输入 token 比例，默认 0.90。
     #[serde(default = "default_cache_max_savings_ratio")]
     pub cache_max_savings_ratio: f64,
@@ -327,6 +339,8 @@ impl Default for Config {
             load_balancing_mode: default_load_balancing_mode(),
             account_throttle_failover: default_account_throttle_failover(),
             account_throttle_cooldown_secs: default_account_throttle_cooldown_secs(),
+            unlimited_concurrency: false,
+            disable_failure_auto_recovery: false,
             cache_max_savings_ratio: default_cache_max_savings_ratio(),
             input_cache_short_ttl_secs: default_input_cache_short_ttl_secs(),
             input_cache_long_ttl_secs: default_input_cache_long_ttl_secs(),

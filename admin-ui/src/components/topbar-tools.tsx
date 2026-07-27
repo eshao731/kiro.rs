@@ -9,6 +9,7 @@ import { storage } from '@/lib/storage'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Switch } from '@/components/ui/switch'
+import { Checkbox } from '@/components/ui/checkbox'
 import {
   Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter, DialogDescription,
 } from '@/components/ui/dialog'
@@ -21,7 +22,13 @@ import {
   useAccountThrottleConfig, useSetAccountThrottleConfig,
 } from '@/hooks/use-credentials'
 import { useUpdateCheck } from '@/hooks/use-update-check'
-import { updateAdminKey, type LoadBalancingMode, LB_LABEL, nextLbMode } from '@/api/credentials'
+import {
+  updateAdminKey,
+  type AccountThrottleConfig,
+  type LoadBalancingMode,
+  LB_LABEL,
+  nextLbMode,
+} from '@/api/credentials'
 import { extractErrorMessage, generateApiKey } from '@/lib/utils'
 import { ImageUpdateDialog } from '@/components/image-update-dialog'
 
@@ -74,6 +81,22 @@ export function TopbarTools({ compact = false }: TopbarToolsProps) {
     })
   }
 
+  const updateUnlimitedConcurrency = (enabled: boolean) => {
+    setThrottleConfig({ unlimitedConcurrency: enabled }, {
+      onSuccess: () => toast.success(enabled ? '已开启不限并发' : '已恢复动态并发限制'),
+      onError: (err) => toast.error(`切换失败: ${extractErrorMessage(err)}`),
+    })
+  }
+
+  const updateDisableFailureAutoRecovery = (enabled: boolean) => {
+    setThrottleConfig({ disableFailureAutoRecovery: enabled }, {
+      onSuccess: () => toast.success(
+        enabled ? '失败过多后将保持禁用' : '已恢复失败自动自愈',
+      ),
+      onError: (err) => toast.error(`切换失败: ${extractErrorMessage(err)}`),
+    })
+  }
+
   const openKeyDialog = () => {
     setNewKey('')
     setShowPlain(false)
@@ -114,6 +137,8 @@ export function TopbarTools({ compact = false }: TopbarToolsProps) {
     openKeyDialog,
     throttleConfig,
     updateCheck,
+    updateDisableFailureAutoRecovery,
+    updateUnlimitedConcurrency,
     updateCooldown: (secs: number) =>
       setThrottleConfig({ cooldownSecs: secs }, {
         onSuccess: () =>
@@ -232,8 +257,10 @@ interface ToolControls {
   loadBalancingMode?: LoadBalancingMode
   openImageUpdate: () => void
   openKeyDialog: () => void
-  throttleConfig?: { failover: boolean; cooldownSecs: number }
+  throttleConfig?: AccountThrottleConfig
   updateCheck?: { hasUpdate: boolean; latestVersion: string; currentVersion: string }
+  updateDisableFailureAutoRecovery: (enabled: boolean) => void
+  updateUnlimitedConcurrency: (enabled: boolean) => void
   updateCooldown: (secs: number) => void
 }
 
@@ -246,6 +273,8 @@ function FullTools({ controls }: { controls: ToolControls }) {
         loading={controls.isLoadingThrottle}
         saving={controls.isSettingThrottle}
         onToggleFailover={controls.handleToggleFailover}
+        onChangeDisableFailureAutoRecovery={controls.updateDisableFailureAutoRecovery}
+        onChangeUnlimitedConcurrency={controls.updateUnlimitedConcurrency}
         onChangeCooldown={controls.updateCooldown}
       />
       <RefreshButton onRefresh={controls.handleRefresh} />
@@ -261,6 +290,8 @@ function CompactTools({ controls }: { controls: ToolControls }) {
     loading: controls.isLoadingThrottle,
     saving: controls.isSettingThrottle,
     onToggleFailover: controls.handleToggleFailover,
+    onChangeDisableFailureAutoRecovery: controls.updateDisableFailureAutoRecovery,
+    onChangeUnlimitedConcurrency: controls.updateUnlimitedConcurrency,
     onChangeCooldown: controls.updateCooldown,
   }
 
@@ -373,17 +404,21 @@ function UpdateDot() {
 }
 
 interface ThrottleConfigButtonProps {
-  config?: { failover: boolean; cooldownSecs: number }
+  config?: AccountThrottleConfig
   loading: boolean
   saving: boolean
   onToggleFailover: () => void
+  onChangeDisableFailureAutoRecovery: (enabled: boolean) => void
+  onChangeUnlimitedConcurrency: (enabled: boolean) => void
   onChangeCooldown: (secs: number) => void
 }
 
 interface ThrottleState {
   cooldownMin: number
   cooldownSecs: number
+  disableFailureAutoRecovery: boolean
   failover: boolean
+  unlimitedConcurrency: boolean
 }
 
 interface CustomCooldownFormProps {
@@ -422,6 +457,7 @@ const MAX_CUSTOM_COOLDOWN_MINUTES = 1440
  */
 function ThrottleConfigButton({
   config, loading, saving, onToggleFailover, onChangeCooldown,
+  onChangeDisableFailureAutoRecovery, onChangeUnlimitedConcurrency,
 }: ThrottleConfigButtonProps) {
   const [open, setOpen] = useState(false)
   const [customMin, setCustomMin] = useState('')
@@ -453,6 +489,12 @@ function ThrottleConfigButton({
           state={state}
           onToggleFailover={onToggleFailover}
         />
+        <ThrottleBehaviorPanel
+          saving={saving}
+          state={state}
+          onChangeDisableFailureAutoRecovery={onChangeDisableFailureAutoRecovery}
+          onChangeUnlimitedConcurrency={onChangeUnlimitedConcurrency}
+        />
         <ThrottleCooldownPanel
           customMin={customMin}
           saving={saving}
@@ -464,6 +506,58 @@ function ThrottleConfigButton({
         />
       </DropdownMenuContent>
     </DropdownMenu>
+  )
+}
+
+function ThrottleBehaviorPanel({
+  saving,
+  state,
+  onChangeDisableFailureAutoRecovery,
+  onChangeUnlimitedConcurrency,
+}: {
+  saving: boolean
+  state: ThrottleState
+  onChangeDisableFailureAutoRecovery: (enabled: boolean) => void
+  onChangeUnlimitedConcurrency: (enabled: boolean) => void
+}) {
+  return (
+    <>
+      <DropdownMenuLabel className="pt-1">保护策略</DropdownMenuLabel>
+      <div className="space-y-1.5 px-2 pb-2">
+        <label className="flex cursor-pointer items-start justify-between gap-3 rounded-md bg-secondary/40 px-2.5 py-2">
+          <div className="text-xs">
+            <div className="font-medium text-foreground">不限并发</div>
+            <div className="leading-snug text-muted-foreground">
+              仍保留 429 冷却，但不再动态收缩并发上限
+            </div>
+          </div>
+          <Checkbox
+            aria-label="不限并发"
+            className="mt-0.5"
+            checked={state.unlimitedConcurrency}
+            disabled={saving}
+            onCheckedChange={(checked) => onChangeUnlimitedConcurrency(checked === true)}
+          />
+        </label>
+        <label className="flex cursor-pointer items-start justify-between gap-3 rounded-md bg-secondary/40 px-2.5 py-2">
+          <div className="text-xs">
+            <div className="font-medium text-foreground">失败后不自动自愈</div>
+            <div className="leading-snug text-muted-foreground">
+              失败过多被禁用后保持禁用，需要手动恢复
+            </div>
+          </div>
+          <Checkbox
+            aria-label="失败后不自动自愈"
+            className="mt-0.5"
+            checked={state.disableFailureAutoRecovery}
+            disabled={saving}
+            onCheckedChange={(checked) =>
+              onChangeDisableFailureAutoRecovery(checked === true)
+            }
+          />
+        </label>
+      </div>
+    </>
   )
 }
 
@@ -595,7 +689,14 @@ function CustomCooldownForm({
 }
 
 function ThrottleCompactItems(props: ThrottleConfigButtonProps) {
-  const { loading, saving, onToggleFailover, onChangeCooldown } = props
+  const {
+    loading,
+    saving,
+    onToggleFailover,
+    onChangeCooldown,
+    onChangeDisableFailureAutoRecovery,
+    onChangeUnlimitedConcurrency,
+  } = props
   const [customMin, setCustomMin] = useState('')
   const state = readThrottleState(props.config)
   const busy = loading || saving
@@ -621,6 +722,12 @@ function ThrottleCompactItems(props: ThrottleConfigButtonProps) {
         {state.failover ? <ShieldCheck /> : <ShieldAlert />}
         {compactThrottleText(loading, state)}
       </DropdownMenuItem>
+      <ThrottleBehaviorPanel
+        saving={busy}
+        state={state}
+        onChangeDisableFailureAutoRecovery={onChangeDisableFailureAutoRecovery}
+        onChangeUnlimitedConcurrency={onChangeUnlimitedConcurrency}
+      />
       <ThrottleCooldownPanel
         customMin={customMin}
         saving={busy}
@@ -696,7 +803,9 @@ function readThrottleState(
   return {
     cooldownMin: secondsToMinutes(cooldownSecs),
     cooldownSecs,
+    disableFailureAutoRecovery: config?.disableFailureAutoRecovery ?? false,
     failover: config?.failover ?? true,
+    unlimitedConcurrency: config?.unlimitedConcurrency ?? false,
   }
 }
 
