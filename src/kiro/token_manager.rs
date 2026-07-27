@@ -4516,7 +4516,7 @@ mod tests {
 
         let first_report = manager.report_rate_limited(1);
         assert!(first_report.concurrency_limit > 0);
-        assert!(manager.snapshot().entries[0].rate_limit_until.is_some());
+        assert!(manager.entries.lock()[0].rate_limit_until.is_some());
         assert!(manager.snapshot().entries[0]
             .rate_limit_concurrency_limit
             .is_some());
@@ -4524,8 +4524,8 @@ mod tests {
         manager
             .set_account_throttle_config(None, None, Some(true), None)
             .unwrap();
-        assert_eq!(manager.snapshot().entries[0].rate_limit_count, 0);
-        assert!(manager.snapshot().entries[0].rate_limit_until.is_none());
+        assert_eq!(manager.entries.lock()[0].rate_limit_count, 0);
+        assert!(manager.entries.lock()[0].rate_limit_until.is_none());
         assert!(manager.snapshot().entries[0]
             .rate_limit_concurrency_limit
             .is_none());
@@ -4535,8 +4535,8 @@ mod tests {
         assert_eq!(unlimited_report.consecutive_count, 0);
         assert_eq!(unlimited_report.concurrency_limit, 0);
         assert_eq!(unlimited_report.remaining_available, 1);
-        assert_eq!(manager.snapshot().entries[0].rate_limit_count, 0);
-        assert!(manager.snapshot().entries[0].rate_limit_until.is_none());
+        assert_eq!(manager.entries.lock()[0].rate_limit_count, 0);
+        assert!(manager.entries.lock()[0].rate_limit_until.is_none());
         assert!(manager.snapshot().entries[0]
             .rate_limit_concurrency_limit
             .is_none());
