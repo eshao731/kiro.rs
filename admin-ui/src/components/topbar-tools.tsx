@@ -528,7 +528,7 @@ function ThrottleBehaviorPanel({
           <div className="text-xs">
             <div className="font-medium text-foreground">不限并发</div>
             <div className="leading-snug text-muted-foreground">
-              仍保留 429 冷却，但不再动态收缩并发上限
+              不再动态收缩并发，也不因普通 429 进入本地软冷却
             </div>
           </div>
           <Checkbox

@@ -2197,11 +2197,19 @@ impl MultiTokenManager {
             let mut entries = self.entries.lock();
             let unlimited_concurrency = self.get_unlimited_concurrency();
             if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
-                let count = entry.rate_limit_count.saturating_add(1);
+                let count = if unlimited_concurrency {
+                    0
+                } else {
+                    entry.rate_limit_count.saturating_add(1)
+                };
                 let exp = count.saturating_sub(1).min(6);
-                let cooldown_secs = RATE_LIMIT_SOFT_COOLDOWN_BASE_SECS
-                    .saturating_mul(2u64.saturating_pow(exp))
-                    .min(RATE_LIMIT_SOFT_COOLDOWN_MAX_SECS);
+                let cooldown_secs = if unlimited_concurrency {
+                    0
+                } else {
+                    RATE_LIMIT_SOFT_COOLDOWN_BASE_SECS
+                        .saturating_mul(2u64.saturating_pow(exp))
+                        .min(RATE_LIMIT_SOFT_COOLDOWN_MAX_SECS)
+                };
                 let until = now + StdDuration::from_secs(cooldown_secs);
                 let observed_in_flight = entry.in_flight.max(1);
                 let current_limit = entry
@@ -2210,10 +2218,14 @@ impl MultiTokenManager {
                 let next_limit = (current_limit / 2).max(1);
 
                 entry.rate_limit_count = count;
-                entry.rate_limit_until = Some(match entry.rate_limit_until {
-                    Some(prev) if prev > until => prev,
-                    _ => until,
-                });
+                entry.rate_limit_until = if unlimited_concurrency {
+                    None
+                } else {
+                    Some(match entry.rate_limit_until {
+                        Some(prev) if prev > until => prev,
+                        _ => until,
+                    })
+                };
                 entry.rate_limit_concurrency_limit = if unlimited_concurrency {
                     None
                 } else {
@@ -2229,10 +2241,8 @@ impl MultiTokenManager {
 
                 if unlimited_concurrency {
                     tracing::warn!(
-                        "凭据 #{} 命中普通 429，软冷却 {} 秒，连续 {} 次，动态并发不限",
-                        id,
-                        cooldown_secs,
-                        count
+                        "凭据 #{} 命中普通 429，不限并发模式下不进入本地软冷却",
+                        id
                     );
                 } else {
                     tracing::warn!(
@@ -3954,6 +3964,8 @@ impl MultiTokenManager {
         if new_unlimited_concurrency {
             let mut entries = self.entries.lock();
             for entry in entries.iter_mut() {
+                entry.rate_limit_count = 0;
+                entry.rate_limit_until = None;
                 entry.rate_limit_concurrency_limit = None;
                 entry.rate_limit_success_streak = 0;
             }
@@ -4504,6 +4516,7 @@ mod tests {
 
         let first_report = manager.report_rate_limited(1);
         assert!(first_report.concurrency_limit > 0);
+        assert!(manager.snapshot().entries[0].rate_limit_until.is_some());
         assert!(manager.snapshot().entries[0]
             .rate_limit_concurrency_limit
             .is_some());
@@ -4511,12 +4524,19 @@ mod tests {
         manager
             .set_account_throttle_config(None, None, Some(true), None)
             .unwrap();
+        assert_eq!(manager.snapshot().entries[0].rate_limit_count, 0);
+        assert!(manager.snapshot().entries[0].rate_limit_until.is_none());
         assert!(manager.snapshot().entries[0]
             .rate_limit_concurrency_limit
             .is_none());
 
         let unlimited_report = manager.report_rate_limited(1);
+        assert_eq!(unlimited_report.cooldown_secs, 0);
+        assert_eq!(unlimited_report.consecutive_count, 0);
         assert_eq!(unlimited_report.concurrency_limit, 0);
+        assert_eq!(unlimited_report.remaining_available, 1);
+        assert_eq!(manager.snapshot().entries[0].rate_limit_count, 0);
+        assert!(manager.snapshot().entries[0].rate_limit_until.is_none());
         assert!(manager.snapshot().entries[0]
             .rate_limit_concurrency_limit
             .is_none());
