@@ -128,6 +128,26 @@ pub struct KiroCredentials {
     #[serde(default)]
     pub disabled: bool,
 
+    /// 禁用原因。与 `disabled` 一起持久化，避免重启后把自动禁用误判为手动禁用。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disabled_reason: Option<String>,
+
+    /// 当前凭据连续执行自愈的轮数。成功调用后清零。
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub self_heal_consecutive_rounds: u32,
+
+    /// 当前凭据累计被自愈恢复的次数，仅用于观测。
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub self_heal_total_count: u64,
+
+    /// 最近一次自愈时间（RFC3339）。用于让冷却窗口跨进程重启生效。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_self_heal_at: Option<String>,
+
+    /// 触发当前连续自愈轮次的模型。`None` 表示 MCP/无模型请求。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub self_heal_model: Option<String>,
+
     /// Kiro API Key（headless 模式）
     /// 格式: ksk_xxxxxxxx
     /// 设置后直接作为 Bearer Token 使用，无需 refreshToken
@@ -159,6 +179,10 @@ pub struct KiroCredentials {
 
 /// 判断是否为零（用于跳过序列化）
 fn is_zero(value: &u32) -> bool {
+    *value == 0
+}
+
+fn is_zero_u64(value: &u64) -> bool {
     *value == 0
 }
 
@@ -199,6 +223,14 @@ impl std::fmt::Debug for KiroCredentials {
             .field("proxy_username", &self.proxy_username)
             .field("proxy_password", &fmt_redacted(&self.proxy_password))
             .field("disabled", &self.disabled)
+            .field("disabled_reason", &self.disabled_reason)
+            .field(
+                "self_heal_consecutive_rounds",
+                &self.self_heal_consecutive_rounds,
+            )
+            .field("self_heal_total_count", &self.self_heal_total_count)
+            .field("last_self_heal_at", &self.last_self_heal_at)
+            .field("self_heal_model", &self.self_heal_model)
             .field("kiro_api_key", &fmt_redacted(&self.kiro_api_key))
             .field("endpoint", &self.endpoint)
             .field("groups", &self.groups)
@@ -217,6 +249,65 @@ fn canonicalize_auth_method_value(value: &str) -> &str {
     }
 }
 
+/// 导入路径的 auth_method 归一化。
+///
+/// 在别名规范化之外，额外做一步推断：若显式声明的方式不是企业 SSO，但携带了
+/// `tokenEndpoint`（social/idc 均无此字段），则判定为 `external_idp`。这样即便粘贴的
+/// JSON 未写 authMethod，只要带 tokenEndpoint 就能被正确识别。
+pub(crate) fn normalize_import_auth_method(raw: &str, token_endpoint: Option<&str>) -> String {
+    let canonical = canonicalize_auth_method_value(raw.trim());
+    if canonical.eq_ignore_ascii_case("external_idp") {
+        return "external_idp".to_string();
+    }
+    if token_endpoint.is_some_and(|e| !e.trim().is_empty()) {
+        return "external_idp".to_string();
+    }
+    canonical.to_string()
+}
+
+/// 企业 SSO IdP 端点允许列表（后缀锚定）。
+///
+/// `tokenEndpoint` 是外发 refreshToken 的目标，属新的信任边界；导入的凭据可能来自不可信
+/// 来源（如共享账号包），若指向内网/攻击者控制的主机会导致 refreshToken 泄露。故限制到
+/// 已知企业 IdP 主机（Microsoft Entra / Azure AD）。前导点锚定到真实子域边界，
+/// `evil-microsoftonline.com` 无法命中。新增其它 IdP 时扩展此列表。
+pub const ALLOWED_EXTERNAL_IDP_SUFFIXES: &[&str] = &[
+    ".microsoftonline.com",
+    ".microsoftonline.us",
+    ".microsoftonline.cn",
+];
+
+/// 校验企业 SSO IdP 端点 URL 是否可安全外发。
+///
+/// 要求：可解析、必须 https、host 非 IP 字面量、host 命中 [`ALLOWED_EXTERNAL_IDP_SUFFIXES`]。
+/// 用于 Token 刷新（外发 refreshToken 前）与导入校验两处，防 SSRF / 凭据外泄。
+pub fn validate_external_idp_endpoint(raw_url: &str) -> Result<(), String> {
+    let url =
+        reqwest::Url::parse(raw_url.trim()).map_err(|e| format!("IdP 端点 URL 无法解析: {}", e))?;
+
+    if !url.scheme().eq_ignore_ascii_case("https") {
+        return Err("IdP 端点 URL 必须为 https".to_string());
+    }
+
+    let host = match url.host_str() {
+        Some(h) if !h.is_empty() => h.to_ascii_lowercase(),
+        _ => return Err("IdP 端点 URL 缺少 host".to_string()),
+    };
+
+    // 拒绝 IP 字面量（含 IPv6，url 的 host_str 对 IPv6 返回不带方括号的形式）
+    if host.parse::<std::net::IpAddr>().is_ok() {
+        return Err("IdP 端点 host 不能是 IP 字面量".to_string());
+    }
+
+    if ALLOWED_EXTERNAL_IDP_SUFFIXES
+        .iter()
+        .any(|suffix| host.ends_with(suffix))
+    {
+        Ok(())
+    } else {
+        Err(format!("IdP 端点 host {:?} 不在允许列表内", host))
+    }
+}
 /// 凭据配置（支持单对象或数组格式）
 ///
 /// 自动识别配置文件格式：
@@ -533,6 +624,11 @@ mod tests {
             proxy_username: None,
             proxy_password: None,
             disabled: false,
+            disabled_reason: None,
+            self_heal_consecutive_rounds: 0,
+            self_heal_total_count: 0,
+            last_self_heal_at: None,
+            self_heal_model: None,
             kiro_api_key: None,
             endpoint: None,
             groups: vec![],
@@ -545,6 +641,31 @@ mod tests {
         assert!(!json.contains("refreshToken"));
         // priority 为 0 时不序列化
         assert!(!json.contains("priority"));
+    }
+
+    #[test]
+    fn test_self_heal_runtime_state_roundtrip() {
+        let credentials = KiroCredentials {
+            disabled: true,
+            disabled_reason: Some("TooManyFailures".to_string()),
+            self_heal_consecutive_rounds: 3,
+            self_heal_total_count: 8,
+            last_self_heal_at: Some("2026-07-29T00:00:00Z".to_string()),
+            self_heal_model: Some("claude-sonnet-4.8".to_string()),
+            ..KiroCredentials::default()
+        };
+
+        let json = credentials.to_pretty_json().unwrap();
+        let parsed = KiroCredentials::from_json(&json).unwrap();
+        assert!(parsed.disabled);
+        assert_eq!(parsed.disabled_reason.as_deref(), Some("TooManyFailures"));
+        assert_eq!(parsed.self_heal_consecutive_rounds, 3);
+        assert_eq!(parsed.self_heal_total_count, 8);
+        assert_eq!(
+            parsed.last_self_heal_at.as_deref(),
+            Some("2026-07-29T00:00:00Z")
+        );
+        assert_eq!(parsed.self_heal_model.as_deref(), Some("claude-sonnet-4.8"));
     }
 
     #[test]
@@ -770,6 +891,11 @@ mod tests {
             proxy_username: None,
             proxy_password: None,
             disabled: false,
+            disabled_reason: None,
+            self_heal_consecutive_rounds: 0,
+            self_heal_total_count: 0,
+            last_self_heal_at: None,
+            self_heal_model: None,
             kiro_api_key: None,
             endpoint: None,
             groups: vec![],
@@ -808,6 +934,11 @@ mod tests {
             proxy_username: None,
             proxy_password: None,
             disabled: false,
+            disabled_reason: None,
+            self_heal_consecutive_rounds: 0,
+            self_heal_total_count: 0,
+            last_self_heal_at: None,
+            self_heal_model: None,
             kiro_api_key: None,
             endpoint: None,
             groups: vec![],
@@ -929,6 +1060,11 @@ mod tests {
             proxy_username: None,
             proxy_password: None,
             disabled: false,
+            disabled_reason: None,
+            self_heal_consecutive_rounds: 0,
+            self_heal_total_count: 0,
+            last_self_heal_at: None,
+            self_heal_model: None,
             kiro_api_key: None,
             endpoint: None,
             groups: vec![],
@@ -1234,5 +1370,132 @@ mod tests {
         let creds = KiroCredentials::default();
         let result = creds.effective_proxy(None);
         assert_eq!(result, None);
+    }
+
+    // ============ 企业 SSO (external_idp) 测试 ============
+
+    #[test]
+    fn test_canonicalize_external_idp_aliases() {
+        for alias in [
+            "external_idp",
+            "AzureAD",
+            "azure",
+            "Entra",
+            "entra-id",
+            "microsoft",
+            "M365",
+            "office365",
+            "external",
+        ] {
+            assert_eq!(
+                canonicalize_auth_method_value(alias),
+                "external_idp",
+                "别名 {:?} 应规范化为 external_idp",
+                alias
+            );
+        }
+        // 不误伤其它方式
+        assert_eq!(canonicalize_auth_method_value("social"), "social");
+        assert_eq!(canonicalize_auth_method_value("builder-id"), "idc");
+        assert_eq!(canonicalize_auth_method_value("apikey"), "api_key");
+    }
+
+    #[test]
+    fn test_normalize_import_auth_method_inference() {
+        // 显式别名 → external_idp
+        assert_eq!(
+            normalize_import_auth_method("azuread", None),
+            "external_idp"
+        );
+        // 带 tokenEndpoint 但未声明（默认 social）→ 推断 external_idp
+        assert_eq!(
+            normalize_import_auth_method(
+                "social",
+                Some("https://login.microsoftonline.com/t/oauth2/v2.0/token")
+            ),
+            "external_idp"
+        );
+        // 空 tokenEndpoint 不触发推断
+        assert_eq!(
+            normalize_import_auth_method("social", Some("   ")),
+            "social"
+        );
+        assert_eq!(normalize_import_auth_method("social", None), "social");
+        // idc 保持
+        assert_eq!(normalize_import_auth_method("idc", None), "idc");
+    }
+
+    #[test]
+    fn test_validate_external_idp_endpoint() {
+        // 合法 Microsoft 主机
+        assert!(
+            validate_external_idp_endpoint(
+                "https://login.microsoftonline.com/tenant/oauth2/v2.0/token"
+            )
+            .is_ok()
+        );
+        assert!(validate_external_idp_endpoint("https://login.microsoftonline.us/t/token").is_ok());
+        // 非 https 拒绝
+        assert!(validate_external_idp_endpoint("http://login.microsoftonline.com/t").is_err());
+        // IP 字面量拒绝
+        assert!(validate_external_idp_endpoint("https://127.0.0.1/token").is_err());
+        assert!(validate_external_idp_endpoint("https://[::1]/token").is_err());
+        // 允许列表外拒绝
+        assert!(validate_external_idp_endpoint("https://evil.example.com/token").is_err());
+        // 前导点锚定：evil-microsoftonline.com 不应命中
+        assert!(validate_external_idp_endpoint("https://evil-microsoftonline.com/token").is_err());
+        // 裸域（无子域）不应命中 .microsoftonline.com 后缀
+        assert!(validate_external_idp_endpoint("https://microsoftonline.com/token").is_err());
+    }
+
+    #[test]
+    fn test_is_external_idp_and_token_type_header() {
+        let mut cred = KiroCredentials {
+            auth_method: Some("azuread".to_string()), // 别名也应识别
+            ..Default::default()
+        };
+        assert!(cred.is_external_idp_credential());
+        assert_eq!(cred.token_type_header(), Some("EXTERNAL_IDP"));
+
+        cred.auth_method = Some("social".to_string());
+        assert!(!cred.is_external_idp_credential());
+        assert_eq!(cred.token_type_header(), None);
+
+        cred.auth_method = Some("api_key".to_string());
+        assert_eq!(cred.token_type_header(), Some("API_KEY"));
+    }
+
+    #[test]
+    fn test_external_idp_credentials_serde_roundtrip() {
+        let json = r#"{
+            "authMethod": "external_idp",
+            "refreshToken": "rt",
+            "clientId": "fa6d79bf-xxxx",
+            "tokenEndpoint": "https://login.microsoftonline.com/t/oauth2/v2.0/token",
+            "issuerUrl": "https://login.microsoftonline.com/t/v2.0",
+            "scopes": "openid profile offline_access",
+            "region": "eu-central-1"
+        }"#;
+        let cred = KiroCredentials::from_json(json).unwrap();
+        assert_eq!(cred.auth_method.as_deref(), Some("external_idp"));
+        assert_eq!(
+            cred.token_endpoint.as_deref(),
+            Some("https://login.microsoftonline.com/t/oauth2/v2.0/token")
+        );
+        assert_eq!(
+            cred.scopes.as_deref(),
+            Some("openid profile offline_access")
+        );
+
+        // 序列化后应保留新字段（camelCase）
+        let serialized = cred.to_pretty_json().unwrap();
+        assert!(serialized.contains("\"tokenEndpoint\""));
+        assert!(serialized.contains("\"issuerUrl\""));
+        assert!(serialized.contains("\"scopes\""));
+
+        // 空字段不应出现在序列化结果中
+        let empty = KiroCredentials::default();
+        let empty_json = empty.to_pretty_json().unwrap();
+        assert!(!empty_json.contains("tokenEndpoint"));
     }
 }

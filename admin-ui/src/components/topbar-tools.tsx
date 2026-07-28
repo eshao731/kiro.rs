@@ -926,10 +926,10 @@ const SELF_HEAL_INTERVAL_PRESETS = [
 
 /**
  * 自愈治理设置（下拉）：
- * - 开关：是否启用"全账号自愈"
+ * - 开关：是否启用凭据自愈
  * - 冷却间隔：两次自愈的最小间隔（打断持续 403 死循环的关键）
  * - 连续上限：连续自愈达到该轮数且期间无成功则停止（0=不限）
- * - 只读观测：当前连续轮数 / 累计自愈次数
+ * - 只读观测：凭据最大连续轮数 / 累计恢复凭据次数
  */
 function SelfHealConfigButton() {
   const { data: config, isLoading } = useSelfHealConfig()
@@ -969,7 +969,7 @@ function SelfHealConfigButton() {
           variant="outline"
           size="sm"
           disabled={busy}
-          title={enabled ? '全账号自愈：已启用' : '全账号自愈：已关闭'}
+          title={enabled ? '凭据自愈：已启用' : '凭据自愈：已关闭'}
         >
           {enabled ? (
             <HeartPulse className="h-3.5 w-3.5 text-emerald-600" />
@@ -982,25 +982,25 @@ function SelfHealConfigButton() {
         </Button>
       </DropdownMenuTrigger>
       <DropdownMenuContent align="end" className="w-72">
-        <DropdownMenuLabel>全账号自愈</DropdownMenuLabel>
+        <DropdownMenuLabel>凭据自愈</DropdownMenuLabel>
         <div className="px-2 pb-2">
           <div className="flex items-center justify-between gap-2 rounded-md bg-secondary/40 px-2.5 py-2">
             <div className="text-xs">
               <div className="font-medium">{enabled ? '已启用' : '已关闭'}</div>
               <div className="text-muted-foreground">
-                全部凭据被自动禁用时重置并重启
+                当前请求池全灭时按作用域恢复凭据
               </div>
             </div>
             <Switch
               checked={enabled}
               disabled={busy}
-              onCheckedChange={(v) => save({ enabled: v }, v ? '已开启全账号自愈' : '已关闭全账号自愈')}
+              onCheckedChange={(v) => save({ enabled: v }, v ? '已开启凭据自愈' : '已关闭凭据自愈')}
             />
           </div>
           {config && (
             <div className="mt-2 flex items-center justify-between rounded-md bg-secondary/20 px-2.5 py-1.5 text-xs text-muted-foreground">
               <span>连续 {config.consecutiveRounds} 轮</span>
-              <span>累计 {config.totalCount} 次</span>
+              <span>累计恢复 {config.totalCount} 次</span>
             </div>
           )}
         </div>
@@ -1081,14 +1081,14 @@ function SelfHealCompactItems() {
 
   return (
     <>
-      <DropdownMenuLabel>全账号自愈</DropdownMenuLabel>
+      <DropdownMenuLabel>凭据自愈</DropdownMenuLabel>
       <DropdownMenuItem
         disabled={busy}
         onSelect={() =>
           mutate(
             { enabled: !enabled },
             {
-              onSuccess: () => toast.success(!enabled ? '已开启全账号自愈' : '已关闭全账号自愈'),
+              onSuccess: () => toast.success(!enabled ? '已开启凭据自愈' : '已关闭凭据自愈'),
               onError: (err) => toast.error(`切换失败: ${extractErrorMessage(err)}`),
             },
           )

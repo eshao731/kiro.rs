@@ -484,7 +484,7 @@ export async function setAccountThrottleConfig(
 }
 
 // 自愈治理配置。suspendedDetectionEnabled/enabled/minIntervalSecs/maxConsecutiveRounds
-// 可写；consecutiveRounds/totalCount 为只读观测值。
+// 可写；consecutiveRounds 为凭据最大连续轮数，totalCount 为累计恢复凭据次数。
 export interface SelfHealConfig {
   suspendedDetectionEnabled: boolean
   enabled: boolean

@@ -249,14 +249,14 @@ pub struct Config {
     #[serde(default = "default_suspended_detection_enabled")]
     pub suspended_detection_enabled: bool,
 
-    /// 是否启用"全账号自愈"（默认 true）。
+    /// 是否启用凭据自愈（默认 true）。
     ///
-    /// 当所有凭据均因 `TooManyFailures` 被自动禁用时，重置其失败计数并重新启用
-    /// （等价于重启）。关闭后：全灭即直接失败，不再重置。
+    /// 当前请求的 model/group 作用域没有可用凭据时，只恢复该作用域内因
+    /// `TooManyFailures` 被自动禁用且仍满足冷却/上限的凭据。
     #[serde(default = "default_self_heal_enabled")]
     pub self_heal_enabled: bool,
 
-    /// 两次自愈之间的最小冷却间隔（秒，默认 300 = 5 分钟）。
+    /// 同一凭据两次自愈之间的最小冷却间隔（秒，默认 300 = 5 分钟）。
     ///
     /// 冷却窗口内即使再次全灭也不触发自愈。这是打断 issue #51「全禁 → 自愈 →
     /// 403 → 再禁」死循环的关键：持续故障时自愈频率被限到每 5 分钟一次，
@@ -266,9 +266,8 @@ pub struct Config {
 
     /// 连续自愈的最大轮数（默认 5，`0` 表示不限）。
     ///
-    /// 连续自愈达到此值且期间**没有任何一次成功调用**时，停止自愈并记录
-    /// 错误日志提示人工介入（账号可能已被封禁/额度耗尽）。任意一次成功都会把
-    /// 连续计数清零，故瞬态故障恢复后自愈能力不受影响。
+    /// 同一凭据连续自愈达到此值且同一模型期间没有成功调用时，停止自愈并记录
+    /// 错误日志提示人工介入。其它凭据、分组或模型的成功不会清零该计数。
     #[serde(default = "default_self_heal_max_consecutive_rounds")]
     pub self_heal_max_consecutive_rounds: u32,
 

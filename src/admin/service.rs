@@ -1311,6 +1311,11 @@ impl AdminService {
             proxy_username: req.proxy_username,
             proxy_password: req.proxy_password,
             disabled: false, // 新添加的凭据默认启用
+            disabled_reason: None,
+            self_heal_consecutive_rounds: 0,
+            self_heal_total_count: 0,
+            last_self_heal_at: None,
+            self_heal_model: None,
             kiro_api_key: req.kiro_api_key,
             endpoint: req.endpoint,
             groups: req.groups,
@@ -1467,18 +1472,8 @@ impl AdminService {
     ///
     /// 每次读最新文件再写，避免多次调用之间字段互相覆盖。
     fn update_config_file(&self, updater: impl FnOnce(&mut Config)) {
-        let base = self.token_manager.config();
-        let Some(path) = base.config_path() else {
-            return;
-        };
-        match Config::load(path) {
-            Ok(mut fresh) => {
-                updater(&mut fresh);
-                if let Err(e) = fresh.save() {
-                    tracing::warn!("保存配置文件失败: {}", e);
-                }
-            }
-            Err(e) => tracing::warn!("读取配置文件失败（跳过持久化）: {}", e),
+        if let Err(error) = self.token_manager.update_config_file(updater) {
+            tracing::warn!("保存配置文件失败: {}", error);
         }
     }
 
@@ -2257,29 +2252,17 @@ impl AdminService {
         &self,
         req: &SetLogGovernanceConfigRequest,
     ) -> anyhow::Result<()> {
-        use anyhow::Context;
-        let config_path = match self.token_manager.config().config_path() {
-            Some(p) => p.to_path_buf(),
-            None => {
-                tracing::warn!("配置文件路径未知，日志治理配置仅在当前进程生效");
-                return Ok(());
+        self.token_manager.update_config_file(|config| {
+            if let Some(value) = req.trace_enabled {
+                config.trace_enabled = value;
             }
-        };
-        let mut config = crate::model::config::Config::load(&config_path)
-            .with_context(|| format!("重新加载配置失败: {}", config_path.display()))?;
-        if let Some(v) = req.trace_enabled {
-            config.trace_enabled = v;
-        }
-        if let Some(v) = req.trace_retention_days {
-            config.trace_retention_days = v;
-        }
-        if let Some(v) = req.usage_log_retention_days {
-            config.usage_log_retention_days = v;
-        }
-        config
-            .save()
-            .with_context(|| format!("持久化日志治理配置失败: {}", config_path.display()))?;
-        Ok(())
+            if let Some(value) = req.trace_retention_days {
+                config.trace_retention_days = value;
+            }
+            if let Some(value) = req.usage_log_retention_days {
+                config.usage_log_retention_days = value;
+            }
+        })
     }
 
     /// 更新指定凭据的 refreshToken（仅限已禁用凭据）

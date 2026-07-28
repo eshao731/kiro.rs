@@ -611,9 +611,9 @@ pub struct SelfHealConfigResponse {
     pub min_interval_secs: u64,
     /// 连续自愈最大轮数（0=不限）
     pub max_consecutive_rounds: u32,
-    /// 当前连续自愈轮数（只读观测，任意成功清零）
+    /// 所有凭据中的最大连续自愈轮数（只读观测，同一凭据成功后清零）
     pub consecutive_rounds: u32,
-    /// 累计自愈次数（只读观测，只增）
+    /// 累计恢复凭据次数（只读观测，只增）
     pub total_count: u64,
 }
 
