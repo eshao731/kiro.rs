@@ -4637,6 +4637,7 @@ impl MultiTokenManager {
             entry.credentials.region = Some(update.region.clone());
             entry.credentials.auth_region = Some(update.region);
             entry.credentials.start_url = Some(update.start_url);
+            entry.credentials.profile_arn = None;
             entry.credentials.token_endpoint = None;
             entry.credentials.issuer_url = None;
             entry.credentials.scopes = None;
@@ -4657,25 +4658,26 @@ impl MultiTokenManager {
     /// 无条件调用上游 API 重新获取 access token，不检查是否过期。
     /// 适用于排查问题、Token 异常但未过期、主动更新凭据状态等场景。
     pub async fn force_refresh_token_for(&self, id: u64) -> anyhow::Result<()> {
-        // Read after locking so token rotation or relogin cannot leave this refresh with a
-        // stale refresh token or OIDC client registration snapshot.
-        let _guard = self.refresh_lock.lock().await;
-        let credentials = {
-            let entries = self.entries.lock();
-            entries
-                .iter()
-                .find(|e| e.id == id)
-                .map(|e| e.credentials.clone())
-                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
-        };
-
-        // 无条件调用 refresh_token
-        let global_proxy = self.proxy.lock().clone();
-        let effective_proxy = credentials.effective_proxy(global_proxy.as_ref());
-        let new_creds = refresh_token(&credentials, &self.config, effective_proxy.as_ref()).await?;
-
-        // 更新 entries 中对应凭据
         {
+            // Read after locking so token rotation or relogin cannot leave this refresh with a
+            // stale refresh token or OIDC client registration snapshot.
+            let _guard = self.refresh_lock.lock().await;
+            let credentials = {
+                let entries = self.entries.lock();
+                entries
+                    .iter()
+                    .find(|e| e.id == id)
+                    .map(|e| e.credentials.clone())
+                    .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
+            };
+
+            // 无条件调用 refresh_token
+            let global_proxy = self.proxy.lock().clone();
+            let effective_proxy = credentials.effective_proxy(global_proxy.as_ref());
+            let new_creds =
+                refresh_token(&credentials, &self.config, effective_proxy.as_ref()).await?;
+
+            // 更新 entries 中对应凭据
             let mut entries = self.entries.lock();
             if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
                 entry.credentials = new_creds;
@@ -5223,10 +5225,9 @@ mod tests {
         assert_eq!(stored.email.as_deref(), Some("user@example.com"));
         assert_eq!(stored.groups, vec!["team-a"]);
         assert_eq!(stored.api_region.as_deref(), Some("eu-central-1"));
-        assert_eq!(
-            stored.profile_arn.as_deref(),
-            Some("arn:aws:codewhisperer:us-east-1:123456789012:profile/REAL")
-        );
+        // profileArn belongs to the authenticated identity. A relogin can select a
+        // different account or provider, so the old ARN must be resolved again.
+        assert!(stored.profile_arn.is_none());
 
         // 落盘同样是完整替换（内存态已在上面逐字段断言，这里只验证持久化本身）
         let persisted: Vec<KiroCredentials> =
@@ -5236,6 +5237,7 @@ mod tests {
             Some(new_refresh_token.as_str())
         );
         assert_eq!(persisted[0].client_id.as_deref(), Some("new-client-id"));
+        assert!(persisted[0].profile_arn.is_none());
 
         let _ = std::fs::remove_file(path);
     }
