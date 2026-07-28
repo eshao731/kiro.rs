@@ -967,6 +967,9 @@ enum DisabledReason {
     Manual,
     /// 连续失败达到阈值后自动禁用
     TooManyFailures,
+    /// 上游明确返回账号封禁/停用（403 + 封禁文案）后立即禁用。
+    /// 不可自动恢复、**不参与自愈**，需人工联系客服核实后手动重置。
+    Suspended,
     /// Token 刷新连续失败达到阈值后自动禁用
     TooManyRefreshFailures,
     /// 额度已用尽（如 MONTHLY_REQUEST_COUNT）
@@ -1148,6 +1151,8 @@ pub struct MultiTokenManager {
     /// 是否禁止失败过多后的自动自愈（运行时可修改）
     disable_failure_auto_recovery: AtomicBool,
 
+    /// 是否识别 403 封禁文案并立即禁用（运行时可修改）
+    suspended_detection_enabled: AtomicBool,
     /// 全账号自愈总开关（运行时可修改）
     self_heal_enabled: AtomicBool,
     /// 两次自愈的最小冷却间隔（秒，运行时可修改）
@@ -1431,6 +1436,7 @@ impl MultiTokenManager {
         let unlimited_concurrency = config.unlimited_concurrency;
         let ordinary_429_retry_count = config.ordinary_429_retry_count;
         let disable_failure_auto_recovery = config.disable_failure_auto_recovery;
+        let suspended_detection_enabled = config.suspended_detection_enabled;
         let self_heal_enabled = config.self_heal_enabled;
         let self_heal_min_interval_secs = config.self_heal_min_interval_secs;
         let self_heal_max_consecutive_rounds = config.self_heal_max_consecutive_rounds;
@@ -1452,6 +1458,7 @@ impl MultiTokenManager {
             unlimited_concurrency: AtomicBool::new(unlimited_concurrency),
             ordinary_429_retry_count: AtomicI32::new(ordinary_429_retry_count),
             disable_failure_auto_recovery: AtomicBool::new(disable_failure_auto_recovery),
+            suspended_detection_enabled: AtomicBool::new(suspended_detection_enabled),
             self_heal_enabled: AtomicBool::new(self_heal_enabled),
             self_heal_min_interval_secs: AtomicU64::new(self_heal_min_interval_secs),
             self_heal_max_consecutive_rounds: AtomicU32::new(self_heal_max_consecutive_rounds),
@@ -2675,6 +2682,64 @@ impl MultiTokenManager {
         result
     }
 
+    /// 报告指定凭据被上游封禁/停用（403 + 明确封禁文案）。
+    ///
+    /// 立即禁用并标记 [`DisabledReason::Suspended`]，**不累计、不参与自愈**——
+    /// 账号封禁是不可自动恢复的终态，无脑自愈复活只会立刻再次 403 形成死循环
+    /// （issue #51）。误判可经 Admin API 手动重置。切换到下一个可用凭据。
+    /// 返回是否还有可用凭据可以重试。
+    pub fn report_suspended(&self, id: u64) -> bool {
+        let result = {
+            let mut entries = self.entries.lock();
+            let mut current_id = self.current_id.lock();
+
+            let entry = match entries.iter_mut().find(|e| e.id == id) {
+                Some(e) => e,
+                None => return entries.iter().any(|e| !e.disabled),
+            };
+
+            if entry.disabled {
+                return entries.iter().any(|e| !e.disabled);
+            }
+
+            entry.disabled = true;
+            entry.disabled_reason = Some(DisabledReason::Suspended);
+            entry.last_used_at = Some(Utc::now().to_rfc3339());
+            // 设为阈值，便于在管理面板中直观看到该凭据已不可用
+            entry.failure_count = MAX_FAILURES_PER_CREDENTIAL;
+            entry.total_failure_count += 1;
+
+            tracing::error!(
+                "凭据 #{} 被上游封禁/停用（账号 suspended），已禁用且不参与自愈，请人工联系客服核实后在管理面板手动重置",
+                id
+            );
+
+            if let Some(next) = entries
+                .iter()
+                .filter(|e| !e.disabled)
+                .min_by_key(|e| e.credentials.priority)
+            {
+                *current_id = next.id;
+                tracing::info!(
+                    "已切换到凭据 #{}（优先级 {}）",
+                    next.id,
+                    next.credentials.priority
+                );
+                true
+            } else {
+                tracing::error!("所有凭据均已禁用！");
+                false
+            }
+        };
+        self.save_stats_debounced();
+        result
+    }
+
+    /// 是否启用 403 封禁文案识别（provider 调用，决定 403 是否走 report_suspended）。
+    pub fn get_suspended_detection_enabled(&self) -> bool {
+        self.suspended_detection_enabled.load(Ordering::Relaxed)
+    }
+
     /// 受控的"全账号自愈"。
     ///
     /// 当所有凭据均不可用、且存在因 [`DisabledReason::TooManyFailures`] 被禁用的凭据时，
@@ -3061,6 +3126,7 @@ impl MultiTokenManager {
                         match r {
                             DisabledReason::Manual => "Manual",
                             DisabledReason::TooManyFailures => "TooManyFailures",
+                            DisabledReason::Suspended => "Suspended",
                             DisabledReason::TooManyRefreshFailures => "TooManyRefreshFailures",
                             DisabledReason::QuotaExceeded => "QuotaExceeded",
                             DisabledReason::InvalidRefreshToken => "InvalidRefreshToken",
@@ -4572,10 +4638,11 @@ impl MultiTokenManager {
 
     /// 获取自愈治理配置（Admin API）。
     ///
-    /// 返回：(自愈开关, 自愈冷却秒, 连续自愈上限, 当前连续自愈轮数, 累计自愈次数)。
-    /// 后两项为只读观测值。
-    pub fn get_self_heal_config(&self) -> (bool, u64, u32, u32, u64) {
+    /// 返回：(封禁识别开关, 自愈开关, 自愈冷却秒, 连续自愈上限, 当前连续自愈轮数,
+    /// 累计自愈次数)。后两项为只读观测值。
+    pub fn get_self_heal_config(&self) -> (bool, bool, u64, u32, u32, u64) {
         (
+            self.suspended_detection_enabled.load(Ordering::Relaxed),
             self.self_heal_enabled.load(Ordering::Relaxed),
             self.self_heal_min_interval_secs.load(Ordering::Relaxed),
             self.self_heal_max_consecutive_rounds.load(Ordering::Relaxed),
@@ -4589,6 +4656,7 @@ impl MultiTokenManager {
     /// 运行时立即生效并持久化到 config.json。持久化失败时回滚内存值。
     pub fn set_self_heal_config(
         &self,
+        suspended_detection_enabled: Option<bool>,
         self_heal_enabled: Option<bool>,
         self_heal_min_interval_secs: Option<u64>,
         self_heal_max_consecutive_rounds: Option<u32>,
@@ -4607,34 +4675,47 @@ impl MultiTokenManager {
         }
 
         let prev = self.get_self_heal_config();
-        let new_enabled = self_heal_enabled.unwrap_or(prev.0);
-        let new_interval = self_heal_min_interval_secs.unwrap_or(prev.1);
-        let new_max_rounds = self_heal_max_consecutive_rounds.unwrap_or(prev.2);
+        let new_suspend_detect = suspended_detection_enabled.unwrap_or(prev.0);
+        let new_enabled = self_heal_enabled.unwrap_or(prev.1);
+        let new_interval = self_heal_min_interval_secs.unwrap_or(prev.2);
+        let new_max_rounds = self_heal_max_consecutive_rounds.unwrap_or(prev.3);
 
-        if new_enabled == prev.0 && new_interval == prev.1 && new_max_rounds == prev.2 {
+        if new_suspend_detect == prev.0
+            && new_enabled == prev.1
+            && new_interval == prev.2
+            && new_max_rounds == prev.3
+        {
             return Ok(());
         }
 
+        self.suspended_detection_enabled
+            .store(new_suspend_detect, Ordering::Relaxed);
         self.self_heal_enabled.store(new_enabled, Ordering::Relaxed);
         self.self_heal_min_interval_secs
             .store(new_interval, Ordering::Relaxed);
         self.self_heal_max_consecutive_rounds
             .store(new_max_rounds, Ordering::Relaxed);
 
-        if let Err(err) =
-            self.persist_self_heal_config(new_enabled, new_interval, new_max_rounds)
-        {
+        if let Err(err) = self.persist_self_heal_config(
+            new_suspend_detect,
+            new_enabled,
+            new_interval,
+            new_max_rounds,
+        ) {
             // 回滚内存值
-            self.self_heal_enabled.store(prev.0, Ordering::Relaxed);
+            self.suspended_detection_enabled
+                .store(prev.0, Ordering::Relaxed);
+            self.self_heal_enabled.store(prev.1, Ordering::Relaxed);
             self.self_heal_min_interval_secs
-                .store(prev.1, Ordering::Relaxed);
-            self.self_heal_max_consecutive_rounds
                 .store(prev.2, Ordering::Relaxed);
+            self.self_heal_max_consecutive_rounds
+                .store(prev.3, Ordering::Relaxed);
             return Err(err);
         }
 
         tracing::info!(
-            "自愈治理配置已更新: self_heal_enabled={}, min_interval_secs={}, max_rounds={}",
+            "自愈治理配置已更新: suspended_detection_enabled={}, self_heal_enabled={}, min_interval_secs={}, max_rounds={}",
+            new_suspend_detect,
             new_enabled,
             new_interval,
             new_max_rounds
@@ -4644,6 +4725,7 @@ impl MultiTokenManager {
 
     fn persist_self_heal_config(
         &self,
+        suspended_detection_enabled: bool,
         self_heal_enabled: bool,
         self_heal_min_interval_secs: u64,
         self_heal_max_consecutive_rounds: u32,
@@ -4660,6 +4742,7 @@ impl MultiTokenManager {
 
         let mut config = Config::load(&config_path)
             .with_context(|| format!("重新加载配置失败: {}", config_path.display()))?;
+        config.suspended_detection_enabled = suspended_detection_enabled;
         config.self_heal_enabled = self_heal_enabled;
         config.self_heal_min_interval_secs = self_heal_min_interval_secs;
         config.self_heal_max_consecutive_rounds = self_heal_max_consecutive_rounds;
@@ -5092,7 +5175,7 @@ mod tests {
         assert!(manager.try_self_heal(), "全灭且启用时应执行自愈");
         assert_eq!(manager.available_count(), 2, "自愈后应恢复全部凭据");
 
-        let (_, _, _, consecutive, total) = manager.get_self_heal_config();
+        let (_, _, _, _, consecutive, total) = manager.get_self_heal_config();
         assert_eq!(consecutive, 1);
         assert_eq!(total, 1);
     }
@@ -5118,7 +5201,7 @@ mod tests {
         assert!(!manager.try_self_heal(), "冷却窗口内不应再次自愈");
         assert_eq!(manager.available_count(), 0);
 
-        let (_, _, _, consecutive, total) = manager.get_self_heal_config();
+        let (_, _, _, _, consecutive, total) = manager.get_self_heal_config();
         assert_eq!(consecutive, 1, "冷却拦截不增加轮数");
         assert_eq!(total, 1);
     }
@@ -5168,12 +5251,63 @@ mod tests {
 
         // 一次成功清零连续计数
         manager.report_success(1);
-        let (_, _, _, consecutive, _) = manager.get_self_heal_config();
+        let (_, _, _, _, consecutive, _) = manager.get_self_heal_config();
         assert_eq!(consecutive, 0, "成功后连续轮数应清零");
 
         // 清零后应能重新自愈（不受之前上限影响）
         disable_all_via_failures(&manager, &[1]);
         assert!(manager.try_self_heal(), "成功清零后应可再次自愈");
+    }
+
+    #[test]
+    fn report_suspended_disables_immediately_and_excluded_from_self_heal() {
+        let mut config = Config::default();
+        config.self_heal_min_interval_secs = 0;
+        let manager = MultiTokenManager::new(
+            config,
+            vec![KiroCredentials::default(), KiroCredentials::default()],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        // 凭据 #1 被封禁：立即禁用（无需累计），切换到 #2 仍可用
+        assert!(manager.report_suspended(1), "封禁 #1 后 #2 仍可用");
+        assert_eq!(manager.available_count(), 1);
+        {
+            let snapshot = manager.snapshot();
+            let e1 = snapshot.entries.iter().find(|e| e.id == 1).unwrap();
+            assert!(e1.disabled);
+            assert_eq!(e1.disabled_reason.as_deref(), Some("Suspended"));
+        }
+
+        // 凭据 #2 也被封禁 → 全灭
+        assert!(!manager.report_suspended(2), "封禁 #2 后应全灭");
+        assert_eq!(manager.available_count(), 0);
+
+        // 自愈不应复活 Suspended 凭据
+        assert!(!manager.try_self_heal(), "Suspended 凭据不参与自愈");
+        assert_eq!(manager.available_count(), 0);
+    }
+
+    #[test]
+    fn suspended_credential_recovers_via_manual_reset() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![KiroCredentials::default()],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        manager.report_suspended(1);
+        assert_eq!(manager.available_count(), 0);
+
+        // 手动重置可恢复（误判逃生途径）
+        manager.reset_and_enable(1).unwrap();
+        assert_eq!(manager.available_count(), 1);
     }
 
     #[test]

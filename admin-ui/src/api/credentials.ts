@@ -483,9 +483,10 @@ export async function setAccountThrottleConfig(
   return data
 }
 
-// 自愈治理配置。enabled/minIntervalSecs/maxConsecutiveRounds 可写；
-// consecutiveRounds/totalCount 为只读观测值。
+// 自愈治理配置。suspendedDetectionEnabled/enabled/minIntervalSecs/maxConsecutiveRounds
+// 可写；consecutiveRounds/totalCount 为只读观测值。
 export interface SelfHealConfig {
+  suspendedDetectionEnabled: boolean
   enabled: boolean
   minIntervalSecs: number
   maxConsecutiveRounds: number
@@ -495,7 +496,10 @@ export interface SelfHealConfig {
 
 // 可写字段（PUT 时提交的子集）
 export type SelfHealConfigPatch = Partial<
-  Pick<SelfHealConfig, 'enabled' | 'minIntervalSecs' | 'maxConsecutiveRounds'>
+  Pick<
+    SelfHealConfig,
+    'suspendedDetectionEnabled' | 'enabled' | 'minIntervalSecs' | 'maxConsecutiveRounds'
+  >
 >
 
 // 获取自愈治理配置

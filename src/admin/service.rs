@@ -2130,9 +2130,16 @@ impl AdminService {
 
     /// 获取自愈治理配置
     pub fn get_self_heal_config(&self) -> SelfHealConfigResponse {
-        let (enabled, min_interval_secs, max_consecutive_rounds, consecutive_rounds, total_count) =
-            self.token_manager.get_self_heal_config();
+        let (
+            suspended_detection_enabled,
+            enabled,
+            min_interval_secs,
+            max_consecutive_rounds,
+            consecutive_rounds,
+            total_count,
+        ) = self.token_manager.get_self_heal_config();
         SelfHealConfigResponse {
+            suspended_detection_enabled,
             enabled,
             min_interval_secs,
             max_consecutive_rounds,
@@ -2146,17 +2153,20 @@ impl AdminService {
         &self,
         req: SetSelfHealConfigRequest,
     ) -> Result<SelfHealConfigResponse, AdminServiceError> {
-        if req.enabled.is_none()
+        if req.suspended_detection_enabled.is_none()
+            && req.enabled.is_none()
             && req.min_interval_secs.is_none()
             && req.max_consecutive_rounds.is_none()
         {
             return Err(AdminServiceError::InvalidCredential(
-                "至少提供 enabled / minIntervalSecs / maxConsecutiveRounds 一个字段".to_string(),
+                "至少提供 suspendedDetectionEnabled / enabled / minIntervalSecs / maxConsecutiveRounds 一个字段"
+                    .to_string(),
             ));
         }
 
         self.token_manager
             .set_self_heal_config(
+                req.suspended_detection_enabled,
                 req.enabled,
                 req.min_interval_secs,
                 req.max_consecutive_rounds,

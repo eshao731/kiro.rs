@@ -603,6 +603,8 @@ pub struct SetAccountThrottleConfigRequest {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SelfHealConfigResponse {
+    /// 是否识别 403 封禁文案并立即禁用凭据
+    pub suspended_detection_enabled: bool,
     /// 是否启用全账号自愈
     pub enabled: bool,
     /// 两次自愈的最小冷却间隔（秒）
@@ -619,6 +621,9 @@ pub struct SelfHealConfigResponse {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SetSelfHealConfigRequest {
+    /// 是否识别 403 封禁文案；缺省表示不修改
+    #[serde(default)]
+    pub suspended_detection_enabled: Option<bool>,
     /// 是否启用自愈；缺省表示不修改
     #[serde(default)]
     pub enabled: Option<bool>,

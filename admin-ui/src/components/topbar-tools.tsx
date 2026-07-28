@@ -27,6 +27,7 @@ import {
   updateAdminKey,
   type AccountThrottleConfig,
   type LoadBalancingMode,
+  type SelfHealConfigPatch,
   LB_LABEL,
   nextLbMode,
 } from '@/api/credentials'
@@ -943,7 +944,7 @@ function SelfHealConfigButton() {
   const enabled = config?.enabled ?? true
   const busy = isLoading || isPending
 
-  const save = (patch: { enabled?: boolean; minIntervalSecs?: number; maxConsecutiveRounds?: number }, msg: string) => {
+  const save = (patch: SelfHealConfigPatch, msg: string) => {
     mutate(patch, {
       onSuccess: () => toast.success(msg),
       onError: (err) => toast.error(`保存失败: ${extractErrorMessage(err)}`),
@@ -1002,6 +1003,27 @@ function SelfHealConfigButton() {
               <span>累计 {config.totalCount} 次</span>
             </div>
           )}
+        </div>
+
+        <DropdownMenuLabel className="pt-1">403 封禁识别</DropdownMenuLabel>
+        <div className="px-2 pb-2">
+          <div className="flex items-center justify-between gap-2 rounded-md bg-secondary/40 px-2.5 py-2">
+            <div className="text-xs">
+              <div className="font-medium">
+                {config?.suspendedDetectionEnabled ?? true ? '已启用' : '已关闭'}
+              </div>
+              <div className="text-muted-foreground">
+                命中封禁文案的 403 立即禁用，不参与自愈
+              </div>
+            </div>
+            <Switch
+              checked={config?.suspendedDetectionEnabled ?? true}
+              disabled={busy}
+              onCheckedChange={(v) =>
+                save({ suspendedDetectionEnabled: v }, v ? '已开启 403 封禁识别' : '已关闭 403 封禁识别')
+              }
+            />
+          </div>
         </div>
 
         <DropdownMenuLabel className="pt-1">自愈冷却间隔</DropdownMenuLabel>

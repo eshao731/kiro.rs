@@ -238,6 +238,17 @@ pub struct Config {
     #[serde(default = "default_input_cache_long_ttl_secs")]
     pub input_cache_long_ttl_secs: u64,
 
+    /// 是否识别 403 账号封禁文案并立即禁用凭据（默认 true）。
+    ///
+    /// 开启后：某凭据收到 403 且响应体命中明确封禁文案（同时含 "suspended" 与
+    /// "locked your account"）时，立即标记为 `Suspended` 并禁用。这类凭据**不参与
+    /// 自愈**，需人工联系客服核实后手动重置，从根上打断持续 403 死循环（issue #51）。
+    ///
+    /// 只匹配这两个高特异短语同时出现的情形，不影响普通 403（权限/WAF/区域抖动），
+    /// 后者仍按既有 `report_failure` 累计路径处理。关闭后：完全回退旧行为。
+    #[serde(default = "default_suspended_detection_enabled")]
+    pub suspended_detection_enabled: bool,
+
     /// 是否启用"全账号自愈"（默认 true）。
     ///
     /// 当所有凭据均因 `TooManyFailures` 被自动禁用时，重置其失败计数并重新启用
@@ -376,6 +387,10 @@ fn default_input_cache_long_ttl_secs() -> u64 {
     60 * 60
 }
 
+fn default_suspended_detection_enabled() -> bool {
+    true
+}
+
 fn default_self_heal_enabled() -> bool {
     true
 }
@@ -459,6 +474,7 @@ impl Default for Config {
             cache_max_savings_ratio: default_cache_max_savings_ratio(),
             input_cache_short_ttl_secs: default_input_cache_short_ttl_secs(),
             input_cache_long_ttl_secs: default_input_cache_long_ttl_secs(),
+            suspended_detection_enabled: default_suspended_detection_enabled(),
             self_heal_enabled: default_self_heal_enabled(),
             self_heal_min_interval_secs: default_self_heal_min_interval_secs(),
             self_heal_max_consecutive_rounds: default_self_heal_max_consecutive_rounds(),
@@ -557,11 +573,13 @@ mod tests {
     #[test]
     fn self_heal_config_defaults_for_existing_configs() {
         let config: Config = serde_json::from_str("{}").unwrap();
+        assert!(config.suspended_detection_enabled);
         assert!(config.self_heal_enabled);
         assert_eq!(config.self_heal_min_interval_secs, 300);
         assert_eq!(config.self_heal_max_consecutive_rounds, 5);
 
         let default = Config::default();
+        assert!(default.suspended_detection_enabled);
         assert!(default.self_heal_enabled);
         assert_eq!(default.self_heal_min_interval_secs, 300);
         assert_eq!(default.self_heal_max_consecutive_rounds, 5);
@@ -571,12 +589,14 @@ mod tests {
     fn self_heal_config_accepts_explicit_values() {
         let config: Config = serde_json::from_str(
             r#"{
+                "suspendedDetectionEnabled": false,
                 "selfHealEnabled": false,
                 "selfHealMinIntervalSecs": 60,
                 "selfHealMaxConsecutiveRounds": 0
             }"#,
         )
         .unwrap();
+        assert!(!config.suspended_detection_enabled);
         assert!(!config.self_heal_enabled);
         assert_eq!(config.self_heal_min_interval_secs, 60);
         assert_eq!(config.self_heal_max_consecutive_rounds, 0);
