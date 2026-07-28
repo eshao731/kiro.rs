@@ -74,9 +74,14 @@ fn mask_api_key(key: &str) -> String {
 pub(crate) fn validate_refresh_token(credentials: &KiroCredentials) -> anyhow::Result<()> {
     let refresh_token = credentials
         .refresh_token
-        .as_ref()
+        .as_deref()
         .ok_or_else(|| anyhow::anyhow!("缺少 refreshToken"))?;
 
+    validate_refresh_token_str(refresh_token)
+}
+
+/// 验证 refreshToken 字符串本身（调用方已确认 Token 存在）
+pub(crate) fn validate_refresh_token_str(refresh_token: &str) -> anyhow::Result<()> {
     if refresh_token.is_empty() {
         bail!("refreshToken 为空");
     }
@@ -969,6 +974,35 @@ struct CredentialEntry {
     self_heal_model: Option<String>,
 }
 
+impl CredentialEntry {
+    /// 清空失败计数与禁用/冷却状态，让凭据重新参与调度
+    fn reset_health(&mut self) {
+        self.failure_count = 0;
+        self.total_failure_count = 0;
+        self.refresh_failure_count = 0;
+        self.disabled = false;
+        self.disabled_reason = None;
+        self.disabled_at = None;
+        self.throttled_until = None;
+        self.rate_limit_until = None;
+        self.rate_limit_count = 0;
+        self.rate_limit_concurrency_limit = None;
+        self.rate_limit_success_streak = 0;
+        self.clear_self_heal_streak();
+    }
+}
+
+/// 判断 `entries` 中除 `skip_idx` 外是否已存在相同的 refreshToken
+fn refresh_token_duplicate_exists(
+    entries: &[CredentialEntry],
+    refresh_token: &str,
+    skip_idx: Option<usize>,
+) -> bool {
+    entries.iter().enumerate().any(|(idx, entry)| {
+        Some(idx) != skip_idx && entry.credentials.refresh_token.as_deref() == Some(refresh_token)
+    })
+}
+
 /// 禁用原因
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DisabledReason {
@@ -1317,6 +1351,17 @@ impl Drop for InFlightGuard {
             e.in_flight = e.in_flight.saturating_sub(1);
         }
     }
+}
+
+pub struct IdcReloginCredentials {
+    pub access_token: String,
+    pub refresh_token: String,
+    pub expires_at: Option<String>,
+    pub client_id: String,
+    pub client_secret: String,
+    pub region: String,
+    pub start_url: String,
+    pub provider: String,
 }
 
 /// 判断某账号的分组集合是否匹配请求所属分组（严格隔离）
@@ -3272,6 +3317,20 @@ impl MultiTokenManager {
             .ok_or_else(|| anyhow::anyhow!("凭据 #{} 不是 API Key 凭据", id))
     }
 
+    /// 克隆单个凭据（含敏感字段），不存在时返回 `None`
+    ///
+    /// 需要读取某个凭据完整配置时用它，避免 `clone_all_credentials` 的全量克隆。
+    pub fn clone_credential(&self, id: u64) -> Option<KiroCredentials> {
+        let entries = self.entries.lock();
+        entries.iter().find(|e| e.id == id).map(|e| {
+            let mut cred = e.credentials.clone();
+            cred.canonicalize_auth_method();
+            cred.disabled = e.disabled;
+            cred.id = Some(e.id);
+            cred
+        })
+    }
+
     /// 获取管理器状态快照（用于 Admin API）
     pub fn snapshot(&self) -> ManagerSnapshot {
         let entries = self.entries.lock();
@@ -3619,18 +3678,7 @@ impl MultiTokenManager {
             if entry.disabled_reason == Some(DisabledReason::InvalidConfig) {
                 anyhow::bail!("凭据 #{} 因配置无效被禁用，请修正配置后重启服务", id);
             }
-            entry.failure_count = 0;
-            entry.total_failure_count = 0;
-            entry.refresh_failure_count = 0;
-            entry.disabled = false;
-            entry.disabled_reason = None;
-            entry.disabled_at = None;
-            entry.throttled_until = None;
-            entry.rate_limit_until = None;
-            entry.rate_limit_count = 0;
-            entry.rate_limit_concurrency_limit = None;
-            entry.rate_limit_success_streak = 0;
-            entry.clear_self_heal_streak();
+            entry.reset_health();
         }
         // 持久化更改
         self.persist_credentials()?;
@@ -4525,23 +4573,10 @@ impl MultiTokenManager {
             }
 
             // 验证新 refreshToken 格式
-            let tmp_creds = KiroCredentials {
-                refresh_token: Some(new_refresh_token.clone()),
-                ..entries[idx].credentials.clone()
-            };
-            validate_refresh_token(&tmp_creds)?;
+            validate_refresh_token_str(&new_refresh_token)?;
 
             // 检查是否与现有其他凭据重复
-            let new_hash = sha256_hex(&new_refresh_token);
-            let duplicate = entries.iter().enumerate().any(|(i, e)| {
-                i != idx
-                    && e.credentials
-                        .refresh_token
-                        .as_ref()
-                        .map(|t| sha256_hex(t) == new_hash)
-                        .unwrap_or(false)
-            });
-            if duplicate {
+            if refresh_token_duplicate_exists(&entries, &new_refresh_token, Some(idx)) {
                 anyhow::bail!("refreshToken 与其他凭据重复");
             }
 
@@ -4559,11 +4594,72 @@ impl MultiTokenManager {
         Ok(())
     }
 
+    /// Replaces an existing account with the complete credential set from one AWS IdC login.
+    pub async fn replace_idc_relogin_credentials(
+        &self,
+        id: u64,
+        update: IdcReloginCredentials,
+    ) -> anyhow::Result<()> {
+        validate_refresh_token_str(&update.refresh_token)?;
+
+        if update.access_token.is_empty()
+            || update.client_id.is_empty()
+            || update.client_secret.is_empty()
+            || update.region.is_empty()
+            || update.start_url.is_empty()
+        {
+            anyhow::bail!("IdC 重新登录返回的凭据不完整");
+        }
+
+        {
+            // The refresh token is bound to its OIDC client registration. Serialize the
+            // mutation with refreshes so an in-flight old refresh cannot overwrite this login.
+            // Released before persisting so disk I/O does not stall every other refresh.
+            let _guard = self.refresh_lock.lock().await;
+            let mut entries = self.entries.lock();
+            let idx = entries
+                .iter()
+                .position(|entry| entry.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+
+            if refresh_token_duplicate_exists(&entries, &update.refresh_token, Some(idx)) {
+                anyhow::bail!("refreshToken 与其他凭据重复");
+            }
+
+            let entry = &mut entries[idx];
+            entry.credentials.access_token = Some(update.access_token);
+            entry.credentials.refresh_token = Some(update.refresh_token);
+            entry.credentials.expires_at = update.expires_at;
+            entry.credentials.auth_method = Some("idc".to_string());
+            entry.credentials.provider = Some(update.provider);
+            entry.credentials.client_id = Some(update.client_id);
+            entry.credentials.client_secret = Some(update.client_secret);
+            entry.credentials.region = Some(update.region.clone());
+            entry.credentials.auth_region = Some(update.region);
+            entry.credentials.start_url = Some(update.start_url);
+            entry.credentials.token_endpoint = None;
+            entry.credentials.issuer_url = None;
+            entry.credentials.scopes = None;
+            entry.credentials.kiro_api_key = None;
+
+            entry.reset_health();
+        }
+
+        self.invalidate_model_cache(id);
+        self.persist_credentials()?;
+        self.select_highest_priority();
+        tracing::info!("凭据 #{} IdC 登录凭据已完整更新", id);
+        Ok(())
+    }
+
     /// 强制刷新指定凭据的 Token（Admin API）
     ///
     /// 无条件调用上游 API 重新获取 access token，不检查是否过期。
     /// 适用于排查问题、Token 异常但未过期、主动更新凭据状态等场景。
     pub async fn force_refresh_token_for(&self, id: u64) -> anyhow::Result<()> {
+        // Read after locking so token rotation or relogin cannot leave this refresh with a
+        // stale refresh token or OIDC client registration snapshot.
+        let _guard = self.refresh_lock.lock().await;
         let credentials = {
             let entries = self.entries.lock();
             entries
@@ -4572,9 +4668,6 @@ impl MultiTokenManager {
                 .map(|e| e.credentials.clone())
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
         };
-
-        // 获取刷新锁防止并发刷新
-        let _guard = self.refresh_lock.lock().await;
 
         // 无条件调用 refresh_token
         let global_proxy = self.proxy.lock().clone();
@@ -5037,6 +5130,114 @@ mod tests {
             "期望错误消息包含 'API Key 凭据不支持刷新'，实际: {}",
             err_msg
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn idc_relogin_replaces_complete_client_bound_credentials() {
+        let path = std::env::temp_dir().join(format!(
+            "kiro_test_idc_relogin_{}_{}.json",
+            std::process::id(),
+            fastrand::u64(..)
+        ));
+        std::fs::write(&path, "[]").unwrap();
+
+        let existing = KiroCredentials {
+            id: Some(7),
+            profile_arn: Some(
+                "arn:aws:codewhisperer:us-east-1:123456789012:profile/REAL".to_string(),
+            ),
+            access_token: Some("old-access-token".to_string()),
+            refresh_token: Some("old-refresh-token-".repeat(10)),
+            expires_at: Some("2025-01-01T00:00:00Z".to_string()),
+            auth_method: Some("idc".to_string()),
+            provider: Some("Enterprise".to_string()),
+            client_id: Some("old-client-id".to_string()),
+            client_secret: Some("old-client-secret".to_string()),
+            start_url: Some("https://old.awsapps.com/start".to_string()),
+            token_endpoint: Some(
+                "https://login.microsoftonline.com/tenant/oauth2/v2.0/token".to_string(),
+            ),
+            issuer_url: Some("https://login.microsoftonline.com/tenant/v2.0".to_string()),
+            scopes: Some("openid offline_access".to_string()),
+            region: Some("us-west-2".to_string()),
+            auth_region: Some("us-west-2".to_string()),
+            api_region: Some("eu-central-1".to_string()),
+            email: Some("user@example.com".to_string()),
+            disabled: true,
+            kiro_api_key: Some("ksk_old".to_string()),
+            groups: vec!["team-a".to_string()],
+            ..KiroCredentials::default()
+        };
+
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![existing],
+            None,
+            Some(path.clone()),
+            true,
+        )
+        .unwrap();
+        let new_refresh_token = "new-refresh-token-".repeat(10);
+        let new_expires_at = "2026-07-28T04:00:00Z".to_string();
+
+        manager
+            .replace_idc_relogin_credentials(
+                7,
+                IdcReloginCredentials {
+                    access_token: "new-access-token".to_string(),
+                    refresh_token: new_refresh_token.clone(),
+                    expires_at: Some(new_expires_at.clone()),
+                    client_id: "new-client-id".to_string(),
+                    client_secret: "new-client-secret".to_string(),
+                    region: "ap-southeast-1".to_string(),
+                    start_url: "https://view.awsapps.com/start".to_string(),
+                    provider: "BuilderId".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let stored = manager.clone_all_credentials().remove(0);
+        assert_eq!(stored.access_token.as_deref(), Some("new-access-token"));
+        assert_eq!(
+            stored.refresh_token.as_deref(),
+            Some(new_refresh_token.as_str())
+        );
+        assert_eq!(stored.expires_at.as_deref(), Some(new_expires_at.as_str()));
+        assert_eq!(stored.client_id.as_deref(), Some("new-client-id"));
+        assert_eq!(stored.client_secret.as_deref(), Some("new-client-secret"));
+        assert_eq!(stored.auth_method.as_deref(), Some("idc"));
+        assert_eq!(stored.provider.as_deref(), Some("BuilderId"));
+        assert_eq!(stored.region.as_deref(), Some("ap-southeast-1"));
+        assert_eq!(stored.auth_region.as_deref(), Some("ap-southeast-1"));
+        assert_eq!(
+            stored.start_url.as_deref(),
+            Some("https://view.awsapps.com/start")
+        );
+        assert!(stored.token_endpoint.is_none());
+        assert!(stored.issuer_url.is_none());
+        assert!(stored.scopes.is_none());
+        assert!(stored.kiro_api_key.is_none());
+        assert!(!stored.disabled);
+
+        assert_eq!(stored.email.as_deref(), Some("user@example.com"));
+        assert_eq!(stored.groups, vec!["team-a"]);
+        assert_eq!(stored.api_region.as_deref(), Some("eu-central-1"));
+        assert_eq!(
+            stored.profile_arn.as_deref(),
+            Some("arn:aws:codewhisperer:us-east-1:123456789012:profile/REAL")
+        );
+
+        // 落盘同样是完整替换（内存态已在上面逐字段断言，这里只验证持久化本身）
+        let persisted: Vec<KiroCredentials> =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            persisted[0].refresh_token.as_deref(),
+            Some(new_refresh_token.as_str())
+        );
+        assert_eq!(persisted[0].client_id.as_deref(), Some("new-client-id"));
+
+        let _ = std::fs::remove_file(path);
     }
 
     #[tokio::test]
