@@ -20,12 +20,14 @@ use super::{
         get_credential_models, get_global_proxy,
         get_load_balancing_mode, get_log_governance_config, get_proxy_pool, get_update_config,
         import_kiro_api_key, list_client_keys, list_groups, list_traces, poll_idc_login,
+        get_self_heal_config,
         poll_idc_relogin, poll_social_login, poll_social_relogin, pull_update_image,
         reset_all_success_count, reset_client_key_stats, reset_failure_count, reset_success_count,
         rollback_image_update, rotate_client_key, set_account_throttle_config,
         set_client_key_disabled, set_credential_disabled, set_credential_overage,
         set_credential_priority, set_global_proxy, set_load_balancing_mode,
         set_log_governance_config, set_proxy_enabled, set_update_config, social_oauth_callback,
+        set_self_heal_config,
         start_idc_login, start_idc_relogin, start_social_login, start_social_relogin,
         stats_by_credential, stats_by_model, stats_overview, stats_timeseries, get_current_models,
         test_model,
@@ -111,6 +113,10 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route(
             "/config/account-throttle",
             get(get_account_throttle_config).put(set_account_throttle_config),
+        )
+        .route(
+            "/config/self-heal",
+            get(get_self_heal_config).put(set_self_heal_config),
         )
         .route(
             "/config/log-governance",

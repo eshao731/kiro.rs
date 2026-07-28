@@ -238,6 +238,29 @@ pub struct Config {
     #[serde(default = "default_input_cache_long_ttl_secs")]
     pub input_cache_long_ttl_secs: u64,
 
+    /// 是否启用"全账号自愈"（默认 true）。
+    ///
+    /// 当所有凭据均因 `TooManyFailures` 被自动禁用时，重置其失败计数并重新启用
+    /// （等价于重启）。关闭后：全灭即直接失败，不再重置。
+    #[serde(default = "default_self_heal_enabled")]
+    pub self_heal_enabled: bool,
+
+    /// 两次自愈之间的最小冷却间隔（秒，默认 300 = 5 分钟）。
+    ///
+    /// 冷却窗口内即使再次全灭也不触发自愈。这是打断 issue #51「全禁 → 自愈 →
+    /// 403 → 再禁」死循环的关键：持续故障时自愈频率被限到每 5 分钟一次，
+    /// 而非每个请求都重置刷屏并无效打上游。
+    #[serde(default = "default_self_heal_min_interval_secs")]
+    pub self_heal_min_interval_secs: u64,
+
+    /// 连续自愈的最大轮数（默认 5，`0` 表示不限）。
+    ///
+    /// 连续自愈达到此值且期间**没有任何一次成功调用**时，停止自愈并记录
+    /// 错误日志提示人工介入（账号可能已被封禁/额度耗尽）。任意一次成功都会把
+    /// 连续计数清零，故瞬态故障恢复后自愈能力不受影响。
+    #[serde(default = "default_self_heal_max_consecutive_rounds")]
+    pub self_heal_max_consecutive_rounds: u32,
+
     /// 按凭据缓存上游可用模型列表的 TTL（秒，默认 3600）。
     #[serde(default = "default_model_cache_ttl_secs")]
     pub model_cache_ttl_secs: u64,
@@ -353,6 +376,18 @@ fn default_input_cache_long_ttl_secs() -> u64 {
     60 * 60
 }
 
+fn default_self_heal_enabled() -> bool {
+    true
+}
+
+fn default_self_heal_min_interval_secs() -> u64 {
+    5 * 60
+}
+
+fn default_self_heal_max_consecutive_rounds() -> u32 {
+    5
+}
+
 fn default_model_cache_ttl_secs() -> u64 {
     60 * 60
 }
@@ -424,6 +459,9 @@ impl Default for Config {
             cache_max_savings_ratio: default_cache_max_savings_ratio(),
             input_cache_short_ttl_secs: default_input_cache_short_ttl_secs(),
             input_cache_long_ttl_secs: default_input_cache_long_ttl_secs(),
+            self_heal_enabled: default_self_heal_enabled(),
+            self_heal_min_interval_secs: default_self_heal_min_interval_secs(),
+            self_heal_max_consecutive_rounds: default_self_heal_max_consecutive_rounds(),
             model_cache_ttl_secs: default_model_cache_ttl_secs(),
             extract_thinking: default_extract_thinking(),
             tool_compatibility_mode: default_tool_compatibility_mode(),
@@ -514,5 +552,33 @@ mod tests {
     fn model_cache_ttl_accepts_explicit_value() {
         let config: Config = serde_json::from_str(r#"{"modelCacheTtlSecs":120}"#).unwrap();
         assert_eq!(config.model_cache_ttl_secs, 120);
+    }
+
+    #[test]
+    fn self_heal_config_defaults_for_existing_configs() {
+        let config: Config = serde_json::from_str("{}").unwrap();
+        assert!(config.self_heal_enabled);
+        assert_eq!(config.self_heal_min_interval_secs, 300);
+        assert_eq!(config.self_heal_max_consecutive_rounds, 5);
+
+        let default = Config::default();
+        assert!(default.self_heal_enabled);
+        assert_eq!(default.self_heal_min_interval_secs, 300);
+        assert_eq!(default.self_heal_max_consecutive_rounds, 5);
+    }
+
+    #[test]
+    fn self_heal_config_accepts_explicit_values() {
+        let config: Config = serde_json::from_str(
+            r#"{
+                "selfHealEnabled": false,
+                "selfHealMinIntervalSecs": 60,
+                "selfHealMaxConsecutiveRounds": 0
+            }"#,
+        )
+        .unwrap();
+        assert!(!config.self_heal_enabled);
+        assert_eq!(config.self_heal_min_interval_secs, 60);
+        assert_eq!(config.self_heal_max_consecutive_rounds, 0);
     }
 }

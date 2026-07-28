@@ -483,6 +483,35 @@ export async function setAccountThrottleConfig(
   return data
 }
 
+// 自愈治理配置。enabled/minIntervalSecs/maxConsecutiveRounds 可写；
+// consecutiveRounds/totalCount 为只读观测值。
+export interface SelfHealConfig {
+  enabled: boolean
+  minIntervalSecs: number
+  maxConsecutiveRounds: number
+  consecutiveRounds: number
+  totalCount: number
+}
+
+// 可写字段（PUT 时提交的子集）
+export type SelfHealConfigPatch = Partial<
+  Pick<SelfHealConfig, 'enabled' | 'minIntervalSecs' | 'maxConsecutiveRounds'>
+>
+
+// 获取自愈治理配置
+export async function getSelfHealConfig(): Promise<SelfHealConfig> {
+  const { data } = await api.get<SelfHealConfig>('/config/self-heal')
+  return data
+}
+
+// 更新自愈治理配置
+export async function setSelfHealConfig(
+  patch: SelfHealConfigPatch,
+): Promise<SelfHealConfig> {
+  const { data } = await api.put<SelfHealConfig>('/config/self-heal', patch)
+  return data
+}
+
 export interface LogGovernanceConfig {
   traceEnabled: boolean
   traceRetentionDays: number
