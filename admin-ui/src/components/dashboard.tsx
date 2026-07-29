@@ -37,6 +37,7 @@ import {
   ArrowUpDown,
   ArrowUp,
   ArrowDown,
+  Loader2,
 } from "lucide-react";
 
 function GithubIcon({ className }: { className?: string }) {
@@ -271,6 +272,11 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   const [verifyResults, setVerifyResults] = useState<Map<number, VerifyResult>>(
     new Map(),
   );
+  const [batchDeleting, setBatchDeleting] = useState(false);
+  const [deleteProgress, setDeleteProgress] = useState({
+    current: 0,
+    total: 0,
+  });
   const [balanceMap, setBalanceMap] = useState<Map<number, BalanceResponse>>(
     new Map(),
   );
@@ -683,9 +689,13 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
       }))
     )
       return;
+
+    setBatchDeleting(true);
+    setDeleteProgress({ current: 0, total: ids.length });
     let s = 0,
       f = 0;
-    for (const id of ids) {
+    for (let i = 0; i < ids.length; i++) {
+      const id = ids[i];
       try {
         await new Promise<void>((resolve, reject) => {
           deleteCredential(id, {
@@ -700,7 +710,9 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
           });
         });
       } catch {}
+      setDeleteProgress({ current: i + 1, total: ids.length });
     }
+    setBatchDeleting(false);
     if (f === 0) toast.success(`成功删除 ${s} 个凭据`);
     else toast.warning(`删除凭据：成功 ${s} 个，失败 ${f} 个`);
     deselectAll();
@@ -1520,6 +1532,12 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                 验活中… {verifyProgress.current}/{verifyProgress.total}
               </Button>
             )}
+            {batchDeleting && (
+              <Button size="sm" variant="secondary" disabled>
+                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                删除中… {deleteProgress.current}/{deleteProgress.total}
+              </Button>
+            )}
           </div>
 
           {/* 第二行：筛选（左） + 操作（右） */}
@@ -1778,9 +1796,13 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                     size="sm"
                     variant="destructive"
                     className="w-full sm:w-auto"
-                    disabled={selectedIds.size === 0}
+                    disabled={selectedIds.size === 0 || batchDeleting}
                   >
-                    <Trash2 className="h-3.5 w-3.5" />
+                    {batchDeleting ? (
+                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                    ) : (
+                      <Trash2 className="h-3.5 w-3.5" />
+                    )}
                     删除
                   </Button>
                   <span className="mx-1 hidden h-5 w-px bg-border/70 sm:inline-block" />
