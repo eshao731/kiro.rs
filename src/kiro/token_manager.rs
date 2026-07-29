@@ -2712,6 +2712,24 @@ impl MultiTokenManager {
         model: Option<&str>,
         group: Option<&str>,
     ) -> usize {
+        self.report_temporary_cooldown_for_request(
+            id,
+            cooldown,
+            model,
+            group,
+            "账号级风控",
+        )
+    }
+
+    /// 标记凭据进入指定原因的临时冷却，并返回当前请求范围内的剩余凭据数。
+    pub(crate) fn report_temporary_cooldown_for_request(
+        &self,
+        id: u64,
+        cooldown: StdDuration,
+        model: Option<&str>,
+        group: Option<&str>,
+        reason: &str,
+    ) -> usize {
         let now = Instant::now();
         let mut entries = self.entries.lock();
         if let Some(entry) = entries.iter_mut().find(|entry| entry.id == id) {
@@ -2722,9 +2740,10 @@ impl MultiTokenManager {
             });
             entry.total_failure_count += 1;
             tracing::warn!(
-                "凭据 #{} 触发账号级风控，冷却 {} 秒",
+                "凭据 #{} 进入请求级临时冷却 {} 秒：{}",
                 id,
-                cooldown.as_secs()
+                cooldown.as_secs(),
+                reason
             );
         }
         let throttled_now = Instant::now();

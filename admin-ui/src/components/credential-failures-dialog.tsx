@@ -113,7 +113,7 @@ function FailureRow({
   attempt: TraceAttempt;
 }) {
   const style = outcomeStyle(attempt.outcome);
-  // 整条 trace 后续是否成功了（用别的凭据救回）
+  // 整条 trace 后续是否成功了（可能是换凭据，也可能是同凭据切备用端点）
   const traceRecovered = rec.finalStatus === "success";
   return (
     <div className="rounded-lg border border-border/50 bg-secondary/30 p-3">
@@ -134,7 +134,7 @@ function FailureRow({
           </span>
         )}
         {traceRecovered && (
-          <Badge variant="outline">本次请求最终由其他凭据成功</Badge>
+          <Badge variant="outline">本次请求后续重试成功</Badge>
         )}
         {rec.finalStatus === "interrupted" && (
           <Badge variant="warning">中断</Badge>

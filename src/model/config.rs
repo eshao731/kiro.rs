@@ -153,7 +153,7 @@ pub struct Config {
     #[serde(default = "default_account_throttle_failover")]
     pub account_throttle_failover: bool,
 
-    /// 账号级风控冷却时长（秒，默认 300 = 5 分钟）。
+    /// 账号级风控及单端点 429 冷却时长（秒，默认 300 = 5 分钟）。
     #[serde(default = "default_account_throttle_cooldown_secs")]
     pub account_throttle_cooldown_secs: u64,
 

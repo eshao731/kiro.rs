@@ -89,6 +89,12 @@ pub struct KiroCallResult {
     pub credential_id: u64,
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("凭据所有上游端点均在冷却，请 {retry_after_secs} 秒后重试")]
+struct AllEndpointsCoolingError {
+    retry_after_secs: u64,
+}
+
 /// Kiro API Provider
 ///
 /// 核心组件，负责与 Kiro API 通信
@@ -108,6 +114,11 @@ pub struct KiroProvider {
     endpoints: HashMap<String, Arc<dyn KiroEndpoint>>,
     /// 默认端点名称（凭据未指定 endpoint 时使用）
     default_endpoint: String,
+    /// 凭据 × 端点的临时冷却。
+    ///
+    /// 端点 429 后即使备用端点成功，也必须保留主端点冷却；否则下一次请求会再次
+    /// 先撞同一个已限流端点，持续放大上游风控风险。
+    endpoint_cooldowns: Mutex<HashMap<(u64, String), Instant>>,
     /// 已尝试过 profileArn 解析的凭据 ID（进程内）。
     ///
     /// 避免对「无 Enterprise profile」的账号（如纯 BuilderID）在每次请求都重复调用
@@ -148,6 +159,7 @@ impl KiroProvider {
             tls_backend,
             endpoints,
             default_endpoint,
+            endpoint_cooldowns: Mutex::new(HashMap::new()),
             profile_resolution_attempted: Mutex::new(HashSet::new()),
         }
     }
@@ -218,6 +230,90 @@ impl KiroProvider {
             .get(name)
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("未知端点: {}", name))
+    }
+
+    /// API 请求选择端点；配置的首选端点仍在冷却时直接使用未冷却的备用端点。
+    fn endpoint_for_api_request(
+        &self,
+        credential_id: u64,
+        credentials: &KiroCredentials,
+    ) -> anyhow::Result<Arc<dyn KiroEndpoint>> {
+        let endpoint = self.endpoint_for(credentials)?;
+        let endpoint_name = endpoint.name();
+        let Some(primary_remaining) =
+            self.endpoint_cooldown_remaining(credential_id, endpoint_name)
+        else {
+            return Ok(endpoint);
+        };
+
+        let mut retry_after = primary_remaining;
+        if let Some(fallback_name) = endpoint.fallback_endpoint() {
+            match self.endpoint_cooldown_remaining(credential_id, fallback_name) {
+                None => {
+                    if let Some(fallback) = self.endpoints.get(fallback_name).cloned() {
+                        tracing::warn!(
+                            "凭据 #{} 端点 [{}] 仍在冷却（剩余 {}s），本次直接使用备用端点 [{}]",
+                            credential_id,
+                            endpoint_name,
+                            primary_remaining.as_secs().max(1),
+                            fallback_name
+                        );
+                        return Ok(fallback);
+                    }
+                }
+                Some(fallback_remaining) => {
+                    retry_after = retry_after.min(fallback_remaining);
+                }
+            }
+        }
+
+        Err(AllEndpointsCoolingError {
+            retry_after_secs: retry_after.as_secs().max(1),
+        }
+        .into())
+    }
+
+    fn endpoint_cooldown_remaining(
+        &self,
+        credential_id: u64,
+        endpoint_name: &str,
+    ) -> Option<Duration> {
+        let key = (credential_id, endpoint_name.to_string());
+        let now = Instant::now();
+        let mut cooldowns = self.endpoint_cooldowns.lock();
+        match cooldowns.get(&key).copied() {
+            Some(until) if until > now => Some(until.duration_since(now)),
+            Some(_) => {
+                cooldowns.remove(&key);
+                None
+            }
+            None => None,
+        }
+    }
+
+    fn mark_endpoint_rate_limited(
+        &self,
+        credential_id: u64,
+        endpoint_name: &str,
+        cooldown: Duration,
+    ) {
+        let key = (credential_id, endpoint_name.to_string());
+        let until = Instant::now() + cooldown;
+        let mut cooldowns = self.endpoint_cooldowns.lock();
+        cooldowns
+            .entry(key)
+            .and_modify(|previous| {
+                if until > *previous {
+                    *previous = until;
+                }
+            })
+            .or_insert(until);
+        tracing::warn!(
+            "凭据 #{} 端点 [{}] 命中 429，端点冷却 {} 秒",
+            credential_id,
+            endpoint_name,
+            cooldown.as_secs()
+        );
     }
 
     /// 在发起请求前，确保 Enterprise / IdC 账号的真实 profileArn 已解析并写入 `ctx`。
@@ -545,13 +641,40 @@ impl KiroProvider {
             let config = self.token_manager.config();
             let machine_id = machine_id::generate_from_credentials(&ctx.credentials, config);
 
-            let endpoint = match self.endpoint_for(&ctx.credentials) {
+            let endpoint = match self.endpoint_for_api_request(ctx.id, &ctx.credentials) {
                 Ok(e) => e,
                 Err(e) => {
+                    if let Some(cooling) = e.downcast_ref::<AllEndpointsCoolingError>() {
+                        tracing::warn!(
+                            "凭据 #{} 的所有上游端点均在冷却，切换其他凭据（最早 {}s 后恢复）",
+                            ctx.id,
+                            cooling.retry_after_secs
+                        );
+                        let remaining =
+                            self.token_manager
+                                .report_temporary_cooldown_for_request(
+                                    ctx.id,
+                                    Duration::from_secs(cooling.retry_after_secs),
+                                    model.as_deref(),
+                                    group,
+                                    "所有上游端点均冷却",
+                                );
+                        let rate_limit = UpstreamRateLimitError::new(Some(
+                            cooling.retry_after_secs.to_string(),
+                        ));
+                        if remaining == 0 {
+                            return Err(rate_limit.into());
+                        }
+                        last_error = Some(rate_limit.into());
+                        continue;
+                    }
                     Self::emit_attempt(
                         sink, attempt, ctx.id, "", None, outcome::UNKNOWN,
                         Some(&e.to_string()), attempt_start,
                     );
+                    if is_rate_limit_error(&e) {
+                        return Err(e);
+                    }
                     last_error = Some(e);
                     self.token_manager.report_failure(ctx.id);
                     continue;
@@ -749,6 +872,15 @@ impl KiroProvider {
             // 429 端点降级：先用同一凭据切到备用端点换桶重试。
             // 备用端点也失败后，再按主端点响应分类为账号风控或瞬态退避。
             if status.as_u16() == 429 {
+                let endpoint_cooldown_secs = self
+                    .token_manager
+                    .get_account_throttle_cooldown_secs()
+                    .max(1);
+                self.mark_endpoint_rate_limited(
+                    ctx.id,
+                    endpoint_name,
+                    Duration::from_secs(endpoint_cooldown_secs),
+                );
                 let account_throttled = self.token_manager.get_account_throttle_failover()
                     && endpoint.is_account_throttled(&body);
                 Self::emit_attempt(
@@ -767,7 +899,23 @@ impl KiroProvider {
                 );
 
                 if let Some(fb_name) = endpoint.fallback_endpoint() {
-                    if let Some(fb_endpoint) = self.endpoints.get(fb_name).cloned() {
+                    let fallback_available = if let Some(remaining) =
+                        self.endpoint_cooldown_remaining(ctx.id, fb_name)
+                    {
+                        tracing::warn!(
+                            "备用端点 [{}] 仍在冷却（凭据 #{}，剩余 {}s），跳过本次降级",
+                            fb_name,
+                            ctx.id,
+                            remaining.as_secs().max(1)
+                        );
+                        false
+                    } else {
+                        true
+                    };
+                    if let Some(fb_endpoint) = fallback_available
+                        .then(|| self.endpoints.get(fb_name).cloned())
+                        .flatten()
+                    {
                         tracing::info!(
                             "端点 [{}] 限流 429，凭据 #{} 降级到备用端点 [{}] 重试（换桶不换号）",
                             endpoint_name,
@@ -812,6 +960,13 @@ impl KiroProvider {
                             Ok(fb_resp) => {
                                 let fb_status = fb_resp.status();
                                 let fb_body = fb_resp.text().await.unwrap_or_default();
+                                if fb_status.as_u16() == 429 {
+                                    self.mark_endpoint_rate_limited(
+                                        ctx.id,
+                                        fb_name,
+                                        Duration::from_secs(endpoint_cooldown_secs),
+                                    );
+                                }
                                 Self::emit_attempt(
                                     sink,
                                     attempt,
@@ -1156,6 +1311,54 @@ fn account_rate_limit_with_fallback(
 #[cfg(test)]
 mod rate_limit_tests {
     use super::*;
+    use crate::kiro::endpoint::{IdeEndpoint, RuntimeEndpoint};
+
+    fn endpoint_cooldown_test_provider() -> (KiroProvider, KiroCredentials) {
+        let credentials = KiroCredentials::default();
+        let token_manager = Arc::new(
+            MultiTokenManager::new(
+                crate::model::config::Config::default(),
+                vec![credentials.clone()],
+                None,
+                None,
+                false,
+            )
+            .unwrap(),
+        );
+        let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
+        endpoints.insert("ide".to_string(), Arc::new(IdeEndpoint::new()));
+        endpoints.insert("runtime".to_string(), Arc::new(RuntimeEndpoint::new()));
+        (
+            KiroProvider::with_proxy(token_manager, None, endpoints, "ide".to_string()),
+            credentials,
+        )
+    }
+
+    #[test]
+    fn endpoint_429_cooldown_routes_next_request_directly_to_fallback() {
+        let (provider, credentials) = endpoint_cooldown_test_provider();
+        provider.mark_endpoint_rate_limited(1, "ide", Duration::from_secs(300));
+
+        let selected = provider
+            .endpoint_for_api_request(1, &credentials)
+            .expect("备用端点未冷却时应直接降级");
+
+        assert_eq!(selected.name(), "runtime");
+    }
+
+    #[test]
+    fn both_endpoint_cooldowns_exhaust_the_credential() {
+        let (provider, credentials) = endpoint_cooldown_test_provider();
+        provider.mark_endpoint_rate_limited(1, "ide", Duration::from_secs(300));
+        provider.mark_endpoint_rate_limited(1, "runtime", Duration::from_secs(300));
+
+        let error = match provider.endpoint_for_api_request(1, &credentials) {
+            Ok(_) => panic!("两个端点都冷却时不应继续撞上游"),
+            Err(error) => error,
+        };
+
+        assert!(error.downcast_ref::<AllEndpointsCoolingError>().is_some());
+    }
 
     #[test]
     fn preserves_typed_rate_limit_when_later_credential_selection_fails() {
