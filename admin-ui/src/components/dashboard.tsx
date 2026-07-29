@@ -34,6 +34,9 @@ import {
   List,
   Search,
   X,
+  ArrowUpDown,
+  ArrowUp,
+  ArrowDown,
 } from "lucide-react";
 
 function GithubIcon({ className }: { className?: string }) {
@@ -139,7 +142,7 @@ import {
   formatNumber,
   overageFailureMessage,
 } from "@/lib/utils";
-import type { BalanceResponse } from "@/types/api";
+import type { BalanceResponse, CredentialStatusItem } from "@/types/api";
 
 interface DashboardProps {
   onLogout: () => void;
@@ -165,6 +168,81 @@ const TIER_LABELS: Record<Tier, string> = {
 
 // 每页数量可选项；另有“全部”（pageSize = 0）由下拉单独追加
 const PAGE_SIZE_OPTIONS = [12, 24, 48, 96] as const;
+
+// 字段排序：'manual' = 服务端顺序（保留拖拽调优先级）；其余字段选中后拖拽自动禁用
+type SortField =
+  | "manual"
+  | "priority"
+  | "successCount"
+  | "totalFailureCount"
+  | "lastUsedAt"
+  | "id";
+type SortDir = "asc" | "desc";
+const SORT_OPTIONS: { value: Exclude<SortField, "manual">; label: string }[] = [
+  { value: "priority", label: "优先级" },
+  { value: "successCount", label: "成功次数" },
+  { value: "totalFailureCount", label: "累计失败" },
+  { value: "lastUsedAt", label: "最后使用" },
+  { value: "id", label: "ID" },
+];
+const SORT_LABELS: Record<SortField, string> = {
+  manual: "手动顺序",
+  priority: "优先级",
+  successCount: "成功次数",
+  totalFailureCount: "累计失败",
+  lastUsedAt: "最后使用",
+  id: "ID",
+};
+
+// 按状态隐藏：勾选即隐藏对应状态的凭据。状态含义与卡片徽章一致。
+type StatusKey =
+  | "current"
+  | "enabled"
+  | "disabled"
+  | "throttled"
+  | "quotaExceeded";
+const STATUS_OPTIONS: { value: StatusKey; label: string }[] = [
+  { value: "current", label: "当前优先" },
+  { value: "enabled", label: "已启用" },
+  { value: "disabled", label: "已禁用" },
+  { value: "throttled", label: "冷却中" },
+  { value: "quotaExceeded", label: "已超额" },
+];
+
+/**
+ * 判断凭据是否命中某个隐藏状态。
+ *
+ * `enabled` 指“正常启用且无异常态”（非禁用 / 非冷却 / 非超额）；`current` 与
+ * 主状态正交（一个当前优先的凭据同时也可能是 enabled），勾选任一命中即隐藏。
+ * 超额判定优先用本地验活/缓存余额，回落到 disabledReason。
+ */
+function credentialHasStatus(
+  c: CredentialStatusItem,
+  key: StatusKey,
+  balance: BalanceResponse | undefined,
+): boolean {
+  const quotaByBalance = balance
+    ? balance.remaining <= 0 || balance.usagePercentage >= 100
+    : false;
+  const quotaExceeded =
+    (!c.disabled && quotaByBalance) ||
+    (c.disabled && c.disabledReason === "QuotaExceeded");
+  const throttled = !c.disabled && (c.throttledRemainingSecs ?? 0) > 0;
+  switch (key) {
+    case "current":
+      return c.isCurrent;
+    case "disabled":
+      return c.disabled;
+    case "throttled":
+      return throttled;
+    case "quotaExceeded":
+      return quotaExceeded;
+    case "enabled":
+      return !c.disabled && !throttled && !quotaExceeded;
+    default:
+      return false;
+  }
+}
 
 export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   const confirm = useConfirm();
@@ -254,6 +332,35 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   const [tierFilter, setTierFilter] = useState<Set<Tier>>(new Set());
   // 模糊搜索：按来源渠道（备注）/ 邮箱做大小写不敏感的子串匹配；空串 = 不限
   const [searchQuery, setSearchQuery] = useState("");
+  // 字段排序：'manual' 保留服务端顺序与拖拽调优先级；其余字段按方向排序并禁用拖拽
+  const [sortField, setSortField] = useState<SortField>("manual");
+  const [sortDir, setSortDir] = useState<SortDir>("asc");
+  // 按状态隐藏（多选）：集合内的状态对应的凭据不显示；空集合 = 不隐藏任何状态
+  const [hiddenStatuses, setHiddenStatuses] = useState<Set<StatusKey>>(
+    new Set(),
+  );
+  // 选中排序字段：点已选字段则切换升/降序；换字段时用该字段的直观默认方向
+  const applySort = (field: SortField) => {
+    if (field === "manual") {
+      setSortField("manual");
+      return;
+    }
+    if (sortField === field) {
+      setSortDir((d) => (d === "asc" ? "desc" : "asc"));
+      return;
+    }
+    setSortField(field);
+    // 成功次数/最后使用默认降序（大/新在前），其余默认升序
+    setSortDir(field === "successCount" || field === "lastUsedAt" ? "desc" : "asc");
+  };
+  const toggleStatus = (s: StatusKey) => {
+    setHiddenStatuses((prev) => {
+      const next = new Set(prev);
+      if (next.has(s)) next.delete(s);
+      else next.add(s);
+      return next;
+    });
+  };
   const toggleTier = (t: Tier) => {
     setTierFilter((prev) => {
       const next = new Set(prev);
@@ -286,13 +393,55 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
           (c.email ?? "").toLowerCase().includes(q),
       );
     }
+    // 按状态隐藏：命中任一被勾选状态的凭据不显示
+    if (hiddenStatuses.size > 0) {
+      out = out.filter(
+        (c) =>
+          ![...hiddenStatuses].some((s) =>
+            credentialHasStatus(c, s, balanceMap.get(c.id) || c.balance),
+          ),
+      );
+    }
+    // 字段排序（'manual' 保留服务端顺序）。复制后排序，不修改筛选中间数组。
+    if (sortField !== "manual") {
+      const dir = sortDir === "asc" ? 1 : -1;
+      out = [...out].sort((a, b) => {
+        let cmp = 0;
+        switch (sortField) {
+          case "lastUsedAt": {
+            // 从未使用（null）恒排在最后，不受升降序影响
+            const ta = a.lastUsedAt ? Date.parse(a.lastUsedAt) : null;
+            const tb = b.lastUsedAt ? Date.parse(b.lastUsedAt) : null;
+            if (ta === null && tb === null) cmp = 0;
+            else if (ta === null) return 1;
+            else if (tb === null) return -1;
+            else cmp = ta - tb;
+            break;
+          }
+          case "priority":
+            cmp = a.priority - b.priority;
+            break;
+          case "successCount":
+            cmp = a.successCount - b.successCount;
+            break;
+          case "totalFailureCount":
+            cmp = a.totalFailureCount - b.totalFailureCount;
+            break;
+          case "id":
+            cmp = a.id - b.id;
+            break;
+        }
+        // 主键相等时用 id 稳定兜底，避免同值行顺序抖动
+        return cmp !== 0 ? cmp * dir : a.id - b.id;
+      });
+    }
     return out;
   })();
 
-  // 切换分组 / 分级筛选 / 搜索时复位到第 1 页，避免空页
+  // 切换分组 / 分级筛选 / 搜索 / 状态隐藏 / 排序时复位到第 1 页，避免空页
   useEffect(() => {
     setCurrentPage(1);
-  }, [groupFilter, tierFilter, searchQuery]);
+  }, [groupFilter, tierFilter, searchQuery, hiddenStatuses, sortField, sortDir]);
 
   // pageSize === 0 表示“全部”：单页容纳全部已筛选凭据
   const effectivePageSize =
@@ -338,7 +487,11 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
     useSensor(PointerSensor, { activationConstraint: { distance: 5 } }),
   );
 
+  // 字段排序开启时禁止拖拽调优先级（拖拽只在“手动顺序”下有意义）
+  const dragDisabled = sortField !== "manual";
+
   const handleDragEnd = (event: DragEndEvent) => {
+    if (dragDisabled) return;
     const { active, over } = event;
     if (!over || active.id === over.id) return;
     const ids = currentCredentials.map((c) => c.id);
@@ -1463,6 +1616,117 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                 </DropdownMenuContent>
               </DropdownMenu>
 
+              {/* 字段排序 */}
+              <DropdownMenu modal={false}>
+                <DropdownMenuTrigger asChild>
+                  <button
+                    type="button"
+                    title="按字段排序凭据（再次点击同一字段切换升 / 降序）"
+                    className="inline-flex h-8 w-full items-center justify-between gap-1 rounded-full border border-border bg-card/60 px-3 text-sm backdrop-blur hover:bg-accent sm:w-[136px]"
+                  >
+                    <span className="inline-flex min-w-0 items-center gap-1">
+                      {sortField === "manual" ? (
+                        <ArrowUpDown className="h-3.5 w-3.5 shrink-0 opacity-70" />
+                      ) : sortDir === "asc" ? (
+                        <ArrowUp className="h-3.5 w-3.5 shrink-0 text-primary" />
+                      ) : (
+                        <ArrowDown className="h-3.5 w-3.5 shrink-0 text-primary" />
+                      )}
+                      <span className="truncate">{SORT_LABELS[sortField]}</span>
+                    </span>
+                    <ChevronDown className="h-3.5 w-3.5 shrink-0 opacity-60" />
+                  </button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="end" className="min-w-[11rem]">
+                  <DropdownMenuLabel>排序字段</DropdownMenuLabel>
+                  <DropdownMenuItem
+                    onSelect={(e) => {
+                      e.preventDefault();
+                      applySort("manual");
+                    }}
+                    className="gap-2"
+                  >
+                    <ArrowUpDown className="h-3.5 w-3.5 opacity-70" />
+                    <span>手动顺序（可拖拽）</span>
+                  </DropdownMenuItem>
+                  <DropdownMenuSeparator />
+                  {SORT_OPTIONS.map((o) => {
+                    const active = sortField === o.value;
+                    return (
+                      <DropdownMenuItem
+                        key={o.value}
+                        onSelect={(e) => {
+                          e.preventDefault();
+                          applySort(o.value);
+                        }}
+                        className="justify-between gap-2"
+                      >
+                        <span>{o.label}</span>
+                        {active &&
+                          (sortDir === "asc" ? (
+                            <ArrowUp className="h-3.5 w-3.5 text-primary" />
+                          ) : (
+                            <ArrowDown className="h-3.5 w-3.5 text-primary" />
+                          ))}
+                      </DropdownMenuItem>
+                    );
+                  })}
+                </DropdownMenuContent>
+              </DropdownMenu>
+
+              {/* 按状态隐藏（多选） */}
+              <DropdownMenu modal={false}>
+                <DropdownMenuTrigger asChild>
+                  <button
+                    type="button"
+                    title="隐藏指定状态的凭据（可多选）"
+                    className="inline-flex h-8 w-full items-center justify-between gap-1 rounded-full border border-border bg-card/60 px-3 text-sm backdrop-blur hover:bg-accent sm:w-[128px]"
+                  >
+                    <span className="inline-flex min-w-0 items-center gap-1">
+                      <EyeOff
+                        className={`h-3.5 w-3.5 shrink-0 ${hiddenStatuses.size > 0 ? "text-primary" : "opacity-70"}`}
+                      />
+                      <span className="truncate">
+                        {hiddenStatuses.size > 0
+                          ? `隐藏 ·${hiddenStatuses.size}`
+                          : "隐藏状态"}
+                      </span>
+                    </span>
+                    <ChevronDown className="h-3.5 w-3.5 shrink-0 opacity-60" />
+                  </button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="end" className="min-w-[10rem]">
+                  <DropdownMenuLabel>隐藏这些状态</DropdownMenuLabel>
+                  {STATUS_OPTIONS.map((s) => (
+                    <DropdownMenuItem
+                      key={s.value}
+                      onSelect={(e) => {
+                        e.preventDefault();
+                        toggleStatus(s.value);
+                      }}
+                      className="gap-2"
+                    >
+                      <Checkbox checked={hiddenStatuses.has(s.value)} />
+                      <span>{s.label}</span>
+                    </DropdownMenuItem>
+                  ))}
+                  {hiddenStatuses.size > 0 && (
+                    <>
+                      <DropdownMenuSeparator />
+                      <DropdownMenuItem
+                        onSelect={(e) => {
+                          e.preventDefault();
+                          setHiddenStatuses(new Set());
+                        }}
+                        className="text-muted-foreground"
+                      >
+                        显示全部状态
+                      </DropdownMenuItem>
+                    </>
+                  )}
+                </DropdownMenuContent>
+              </DropdownMenu>
+
               {/* 卡片 / 列表 视图切换（iOS 分段控件） */}
               <div className="col-span-2 inline-flex h-8 shrink-0 items-center justify-self-start rounded-full border border-border bg-card/60 p-0.5 backdrop-blur sm:col-span-1">
                 <button
@@ -1787,6 +2051,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                         handleRefreshBalance(credential.id)
                       }
                       failureStats={failureStatsMap?.[String(credential.id)]}
+                      dragDisabled={dragDisabled}
                     />
                   ))}
                 </div>

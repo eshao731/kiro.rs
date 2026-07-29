@@ -72,6 +72,8 @@ interface CredentialCardProps {
   failureStats?: { auth: number; throttle: number; other: number };
   /** 展示形态：卡片（默认）或紧凑列表行 */
   view?: "card" | "list";
+  /** 字段排序开启时禁用拖拽调优先级（隐藏拖拽手柄） */
+  dragDisabled?: boolean;
 }
 
 function formatLastUsed(lastUsedAt: string | null): string {
@@ -215,6 +217,7 @@ export function CredentialCard({
   onRefreshBalance,
   failureStats,
   view = "card",
+  dragDisabled = false,
 }: CredentialCardProps) {
   const [editingPriority, setEditingPriority] = useState(false);
   const [priorityValue, setPriorityValue] = useState(
@@ -245,7 +248,7 @@ export function CredentialCard({
     transform,
     transition,
     isDragging,
-  } = useSortable({ id: credential.id });
+  } = useSortable({ id: credential.id, disabled: dragDisabled });
   const dragStyle: React.CSSProperties = {
     transform: CSS.Transform.toString(transform),
     // 拖拽中关掉过渡，避免 Card 基类的 transition-all 把每帧 transform 动画化导致"不跟手"；
@@ -624,19 +627,21 @@ export function CredentialCard({
           : "hover:bg-accent/40 hover:shadow-apple-sm"
       } ${stateClasses}`}
     >
-      {/* 拖拽手柄 */}
-      <Button
-        ref={setActivatorNodeRef}
-        size="icon"
-        variant="ghost"
-        data-no-rect-select
-        className="h-8 w-8 shrink-0 cursor-grab touch-none active:cursor-grabbing"
-        title="拖拽调整优先级"
-        {...attributes}
-        {...listeners}
-      >
-        <GripVertical className="h-4 w-4 text-muted-foreground" />
-      </Button>
+      {/* 拖拽手柄（字段排序开启时隐藏，此时拖拽无意义） */}
+      {!dragDisabled && (
+        <Button
+          ref={setActivatorNodeRef}
+          size="icon"
+          variant="ghost"
+          data-no-rect-select
+          className="h-8 w-8 shrink-0 cursor-grab touch-none active:cursor-grabbing"
+          title="拖拽调整优先级"
+          {...attributes}
+          {...listeners}
+        >
+          <GripVertical className="h-4 w-4 text-muted-foreground" />
+        </Button>
+      )}
 
       {/* 选择框 */}
       <label
@@ -1156,19 +1161,23 @@ export function CredentialCard({
           {/* 操作区 */}
           <div className="mt-auto flex flex-col gap-2 border-t border-border/50 pt-3 min-[420px]:flex-row min-[420px]:items-center min-[420px]:justify-between">
             <div className="grid grid-cols-3 gap-1 min-[420px]:flex min-[420px]:items-center">
-              <Button
-                ref={setActivatorNodeRef}
-                size="icon"
-                variant="ghost"
-                data-no-rect-select
-                className="w-full cursor-grab touch-none active:cursor-grabbing min-[420px]:w-9"
-                title="拖拽调整优先级"
-                {...attributes}
-                {...listeners}
-              >
-                <GripVertical className="h-4 w-4 text-muted-foreground" />
-              </Button>
-              <span className="mx-1 hidden h-5 w-px bg-border/70 min-[420px]:inline-block" />
+              {!dragDisabled && (
+                <>
+                  <Button
+                    ref={setActivatorNodeRef}
+                    size="icon"
+                    variant="ghost"
+                    data-no-rect-select
+                    className="w-full cursor-grab touch-none active:cursor-grabbing min-[420px]:w-9"
+                    title="拖拽调整优先级"
+                    {...attributes}
+                    {...listeners}
+                  >
+                    <GripVertical className="h-4 w-4 text-muted-foreground" />
+                  </Button>
+                  <span className="mx-1 hidden h-5 w-px bg-border/70 min-[420px]:inline-block" />
+                </>
+              )}
               <Button
                 size="sm"
                 variant="ghost"
