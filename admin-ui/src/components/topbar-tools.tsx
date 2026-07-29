@@ -2,6 +2,7 @@ import { forwardRef, useEffect, useState, type ComponentPropsWithoutRef } from '
 import {
   Activity, RefreshCw, UploadCloud, Settings, Key, Wand2, Eye, EyeOff, Copy,
   MoreHorizontal, ShieldAlert, ShieldCheck, Boxes, HeartPulse, HeartCrack,
+  Gauge,
 } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
@@ -20,6 +21,7 @@ import {
 import {
   useLoadBalancingMode, useSetLoadBalancingMode,
   useAccountThrottleConfig, useSetAccountThrottleConfig,
+  useAccountRpmLimitConfig, useSetAccountRpmLimitConfig,
   useSelfHealConfig, useSetSelfHealConfig,
 } from '@/hooks/use-credentials'
 import { useUpdateCheck } from '@/hooks/use-update-check'
@@ -324,6 +326,7 @@ function FullTools({ controls }: { controls: ToolControls }) {
         onChangeCooldown={controls.updateCooldown}
       />
       <SelfHealConfigButton />
+      <AccountRpmLimitButton />
       <ModelsButton onOpen={controls.openModels} />
       <RefreshButton onRefresh={controls.handleRefresh} />
       <ImageUpdateButton controls={controls} />
@@ -375,6 +378,7 @@ function CompactTools({ controls }: { controls: ToolControls }) {
         </DropdownMenuItem>
         <ThrottleCompactItems {...throttleProps} />
         <SelfHealCompactItems />
+        <AccountRpmLimitCompactItems />
         <DropdownMenuLabel>密钥管理</DropdownMenuLabel>
         <DropdownMenuItem onSelect={controls.openKeyDialog}>
           <Key />修改登录API密钥（管理面板登录）
@@ -1100,6 +1104,161 @@ function SelfHealCompactItems() {
           : enabled
             ? `关闭自愈（连续 ${config?.consecutiveRounds ?? 0} 轮）`
             : '开启全账号自愈'}
+      </DropdownMenuItem>
+    </>
+  )
+}
+
+const RPM_LIMIT_PRESETS = [10, 30, 60, 120, 300]
+const MIN_RPM_LIMIT = 1
+const MAX_RPM_LIMIT = 100000
+
+/**
+ * 单账号 RPM 主动限流：开关 + 每分钟上限设置（紧凑下拉）。
+ *
+ * 开启后每个账号独立维护 60 秒滑动窗口，达到上限时该账号被临时排除出候选，
+ * 请求自动故障转移到下一个可用账号；全部超限时返回 429。
+ */
+function AccountRpmLimitButton() {
+  const { data: config, isLoading } = useAccountRpmLimitConfig()
+  const { mutate, isPending } = useSetAccountRpmLimitConfig()
+  const [open, setOpen] = useState(false)
+  const [limitInput, setLimitInput] = useState('')
+
+  useEffect(() => {
+    if (!open) setLimitInput('')
+  }, [open])
+
+  const enabled = config?.enabled ?? false
+  const limit = config?.limit ?? 60
+  const busy = isLoading || isPending
+
+  const save = (patch: { enabled?: boolean; limit?: number }, msg: string) => {
+    mutate(patch, {
+      onSuccess: () => toast.success(msg),
+      onError: (err) => toast.error(`保存失败: ${extractErrorMessage(err)}`),
+    })
+  }
+
+  const submitLimit = (e: React.FormEvent) => {
+    e.preventDefault()
+    const n = parseInt(limitInput, 10)
+    if (Number.isNaN(n) || n < MIN_RPM_LIMIT || n > MAX_RPM_LIMIT) {
+      toast.error(`请输入 ${MIN_RPM_LIMIT}-${MAX_RPM_LIMIT} 之间的次数`)
+      return
+    }
+    save({ limit: n }, `单账号 RPM 上限已设为 ${n} 次/分钟`)
+    setLimitInput('')
+  }
+
+  return (
+    <DropdownMenu open={open} onOpenChange={setOpen}>
+      <DropdownMenuTrigger asChild>
+        <Button
+          variant="outline"
+          size="sm"
+          disabled={busy}
+          title={enabled ? `单账号限流：${limit} 次/分钟` : '单账号限流：已关闭'}
+        >
+          <Gauge className={enabled ? 'h-3.5 w-3.5 text-emerald-600' : 'h-3.5 w-3.5 text-muted-foreground'} />
+          <span className="hidden md:inline">
+            {isLoading ? '限流…' : enabled ? `限流 ${limit}/分` : '限流关'}
+          </span>
+        </Button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="end" className="w-72">
+        <DropdownMenuLabel>单账号每分钟请求限流</DropdownMenuLabel>
+        <div className="px-2 pb-2">
+          <div className="flex items-center justify-between gap-2 rounded-md bg-secondary/40 px-2.5 py-2">
+            <div className="text-xs">
+              <div className="font-medium">{enabled ? '已启用' : '已关闭'}</div>
+              <div className="text-muted-foreground leading-snug">
+                单账号超过每分钟上限时临时跳过并切换到下一个可用账号
+              </div>
+            </div>
+            <Switch
+              checked={enabled}
+              disabled={busy}
+              onCheckedChange={(v) => save({ enabled: v }, v ? '已开启单账号限流' : '已关闭单账号限流')}
+            />
+          </div>
+        </div>
+
+        <DropdownMenuLabel className="pt-1">每分钟上限</DropdownMenuLabel>
+        <div className={cooldownPanelClassName(enabled)}>
+          <div className="grid grid-cols-3 gap-1.5">
+            {RPM_LIMIT_PRESETS.map((n) => (
+              <Button
+                key={n}
+                size="sm"
+                variant={limit === n ? 'default' : 'outline'}
+                className="h-7 text-xs"
+                disabled={busy || !enabled}
+                onClick={() => save({ limit: n }, `单账号 RPM 上限已设为 ${n} 次/分钟`)}
+              >
+                {n}
+              </Button>
+            ))}
+          </div>
+
+          <DropdownMenuLabel className="px-0 pt-2">自定义（次/分钟）</DropdownMenuLabel>
+          <form onSubmit={submitLimit} className="mt-1 flex items-center gap-1.5">
+            <Input
+              type="number"
+              min={MIN_RPM_LIMIT}
+              max={MAX_RPM_LIMIT}
+              placeholder={`当前 ${limit} 次`}
+              value={limitInput}
+              onChange={(e) => setLimitInput(e.target.value)}
+              disabled={busy || !enabled}
+              className="h-7 text-xs"
+            />
+            <span className="text-xs text-muted-foreground">次</span>
+            <Button
+              type="submit"
+              size="sm"
+              variant="outline"
+              className="h-7 text-xs"
+              disabled={busy || !enabled || !limitInput.trim()}
+            >
+              保存
+            </Button>
+          </form>
+        </div>
+      </DropdownMenuContent>
+    </DropdownMenu>
+  )
+}
+
+/** 紧凑模式（下拉菜单内）的单账号限流开关项 */
+function AccountRpmLimitCompactItems() {
+  const { data: config, isLoading } = useAccountRpmLimitConfig()
+  const { mutate, isPending } = useSetAccountRpmLimitConfig()
+  const enabled = config?.enabled ?? false
+  const limit = config?.limit ?? 60
+  const busy = isLoading || isPending
+
+  return (
+    <>
+      <DropdownMenuLabel>单账号限流</DropdownMenuLabel>
+      <DropdownMenuItem
+        disabled={busy}
+        onSelect={() =>
+          mutate(
+            { enabled: !enabled },
+            {
+              onSuccess: () => toast.success(!enabled ? '已开启单账号限流' : '已关闭单账号限流'),
+              onError: (err) => toast.error(`切换失败: ${extractErrorMessage(err)}`),
+            },
+          )
+        }
+      >
+        <Gauge />
+        {isLoading
+          ? '限流加载中'
+          : enabled
+            ? `关闭限流（${limit} 次/分钟）`
+            : '开启单账号限流'}
       </DropdownMenuItem>
     </>
   )

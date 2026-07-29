@@ -599,6 +599,28 @@ pub struct SetAccountThrottleConfigRequest {
     pub ordinary_429_retry_count: Option<i32>,
 }
 
+/// 单账号 RPM 限流配置响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountRpmLimitConfigResponse {
+    /// 是否启用单账号 RPM 主动限流
+    pub enabled: bool,
+    /// 每账号每分钟请求次数上限
+    pub limit: u32,
+}
+
+/// 更新单账号 RPM 限流配置
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetAccountRpmLimitConfigRequest {
+    /// 是否启用限流；缺省表示不修改
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    /// 每分钟上限；缺省表示不修改，1..=100000
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
 /// 自愈治理配置响应
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]

@@ -238,6 +238,19 @@ pub struct Config {
     #[serde(default = "default_input_cache_long_ttl_secs")]
     pub input_cache_long_ttl_secs: u64,
 
+    /// 是否启用单账号每分钟请求次数（RPM）主动限流（默认 false）。
+    ///
+    /// 开启后：每个凭据独立维护最近 60 秒的滑动窗口计数，达到 `account_rpm_limit`
+    /// 上限时，该凭据在窗口内被临时排除出候选，请求自动故障转移到下一个可用凭据；
+    /// 所有凭据都超限时返回 429。窗口计数不持久化，进程重启后清空。
+    /// 关闭时（默认）完全不计数、不影响调度，存量用户无感知。
+    #[serde(default = "default_account_rpm_limit_enabled")]
+    pub account_rpm_limit_enabled: bool,
+
+    /// 单账号每分钟请求次数上限（默认 60）。仅在 `account_rpm_limit_enabled` 为 true 时生效。
+    #[serde(default = "default_account_rpm_limit")]
+    pub account_rpm_limit: u32,
+
     /// 是否识别 403 账号封禁文案并立即禁用凭据（默认 true）。
     ///
     /// 开启后：某凭据收到 403 且响应体命中明确封禁文案（同时含 "suspended" 与
@@ -386,6 +399,14 @@ fn default_input_cache_long_ttl_secs() -> u64 {
     60 * 60
 }
 
+fn default_account_rpm_limit_enabled() -> bool {
+    false
+}
+
+fn default_account_rpm_limit() -> u32 {
+    60
+}
+
 fn default_suspended_detection_enabled() -> bool {
     true
 }
@@ -473,6 +494,8 @@ impl Default for Config {
             cache_max_savings_ratio: default_cache_max_savings_ratio(),
             input_cache_short_ttl_secs: default_input_cache_short_ttl_secs(),
             input_cache_long_ttl_secs: default_input_cache_long_ttl_secs(),
+            account_rpm_limit_enabled: default_account_rpm_limit_enabled(),
+            account_rpm_limit: default_account_rpm_limit(),
             suspended_detection_enabled: default_suspended_detection_enabled(),
             self_heal_enabled: default_self_heal_enabled(),
             self_heal_min_interval_secs: default_self_heal_min_interval_secs(),
@@ -599,5 +622,29 @@ mod tests {
         assert!(!config.self_heal_enabled);
         assert_eq!(config.self_heal_min_interval_secs, 60);
         assert_eq!(config.self_heal_max_consecutive_rounds, 0);
+    }
+
+    #[test]
+    fn account_rpm_limit_defaults_for_existing_configs() {
+        let config: Config = serde_json::from_str("{}").unwrap();
+        assert!(!config.account_rpm_limit_enabled);
+        assert_eq!(config.account_rpm_limit, 60);
+
+        let default = Config::default();
+        assert!(!default.account_rpm_limit_enabled);
+        assert_eq!(default.account_rpm_limit, 60);
+    }
+
+    #[test]
+    fn account_rpm_limit_accepts_explicit_values() {
+        let config: Config = serde_json::from_str(
+            r#"{
+                "accountRpmLimitEnabled": true,
+                "accountRpmLimit": 120
+            }"#,
+        )
+        .unwrap();
+        assert!(config.account_rpm_limit_enabled);
+        assert_eq!(config.account_rpm_limit, 120);
     }
 }
