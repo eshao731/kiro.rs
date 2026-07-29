@@ -447,7 +447,7 @@ impl KiroProvider {
 
         for attempt in 0..max_retries {
             // MCP 调用不涉及模型选择，但必须遵守客户端 Key 的凭据分组隔离。
-            let ctx = match self.token_manager.acquire_context(None, group).await {
+            let mut ctx = match self.token_manager.acquire_context(None, group).await {
                 Ok(c) => c,
                 Err(e) => {
                     if is_rate_limit_error(&e) {
@@ -461,6 +461,10 @@ impl KiroProvider {
                 }
             };
             let _in_flight = self.token_manager.in_flight_guard(ctx.id);
+
+            // Pure MCP routes (including Web Search) require the same Enterprise / IdC
+            // profileArn resolution as regular model calls.
+            self.ensure_profile_arn(&mut ctx).await?;
 
             let config = self.token_manager.config();
             let machine_id = machine_id::generate_from_credentials(&ctx.credentials, config);

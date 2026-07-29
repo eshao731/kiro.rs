@@ -84,13 +84,66 @@ struct RoundOutcome {
     tool_name_map: std::collections::HashMap<String, String>,
 }
 
-/// 提取工具调用入参里的 `query` 字段（web_search 专用便捷函数）。
-fn tool_query(tu: &CompletedToolUse) -> String {
-    tu.input
-        .get("query")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
+/// Normalize model-produced Web Search input into one non-empty query.
+///
+/// Codex-compatible providers can emit `query`, `search_query`, `q`, a
+/// `queries` array, or wrap the text in `text`/`value`. Kiro's MCP
+/// endpoint accepts only one string in `arguments.query`.
+fn normalized_query_value(value: &Value) -> Option<String> {
+    match value {
+        Value::String(s) => {
+            let query = s.trim();
+            (!query.is_empty()).then(|| query.to_string())
+        }
+        Value::Array(values) => values.iter().find_map(normalized_query_value),
+        Value::Object(object) => ["query", "search_query", "q", "text", "value"]
+            .iter()
+            .find_map(|key| object.get(*key).and_then(normalized_query_value)),
+        _ => None,
+    }
+}
+
+/// Extract a usable Web Search query from a model tool-use input.
+fn tool_query(tu: &CompletedToolUse) -> Option<String> {
+    ["query", "search_query", "q", "queries"]
+        .iter()
+        .find_map(|key| tu.input.get(*key).and_then(normalized_query_value))
+        .or_else(|| normalized_query_value(&tu.input))
+}
+
+fn log_invalid_web_search_input(tu: &CompletedToolUse) {
+    let (input_kind, input_details) = match &tu.input {
+        Value::Object(object) => {
+            let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+            keys.sort_unstable();
+            ("object", keys.join(","))
+        }
+        Value::Array(values) => ("array", format!("len={}", values.len())),
+        Value::String(value) => ("string", format!("len={}", value.chars().count())),
+        Value::Number(_) => ("number", String::new()),
+        Value::Bool(_) => ("bool", String::new()),
+        Value::Null => ("null", String::new()),
+    };
+    tracing::warn!(
+        tool_use_id = %tu.id,
+        input_kind,
+        input_details = %input_details,
+        "web_search tool input has no usable non-empty query; returning an empty result without calling MCP"
+    );
+}
+
+fn is_no_results_mcp_error(error: &anyhow::Error) -> bool {
+    error
         .to_string()
+        .contains("MCP error: -32602 - Tool returned no results")
+}
+
+fn log_normalized_web_search_query(tu: &CompletedToolUse, query: &str) {
+    tracing::info!(
+        tool_use_id = %tu.id,
+        query_chars = query.chars().count(),
+        "web_search normalized a non-empty query before calling Kiro MCP"
+    );
 }
 
 /// Decides whether this round should keep searching (enter the next loop round)
@@ -379,7 +432,7 @@ fn append_search_round(
     // user: each web_search tool_use is paired with a tool_result (content = search summary, shown to the upstream)
     let mut user_content: Vec<Value> = Vec::new();
     for (tu, results) in round.tool_uses.iter().zip(searched.iter()) {
-        let query = tool_query(tu);
+        let query = tool_query(tu).unwrap_or_default();
         let summary = websearch::generate_search_summary(&query, results);
         user_content.push(json!({
             "type": "tool_result", "tool_use_id": tu.id, "content": summary
@@ -575,7 +628,7 @@ fn build_flush_content(
         if tu.name == "web_search" {
             // INVARIANT: present as server_tool_use + web_search_tool_result,
             // never as a raw tool_use.
-            let query = tool_query(tu);
+            let query = tool_query(tu).unwrap_or_default();
             let (srv_id, _mcp) = websearch::create_mcp_request(&query);
             content.push(json!({
                 "type": "server_tool_use", "id": srv_id, "name": "web_search",
@@ -709,9 +762,19 @@ pub(super) async fn run_web_search_loop(
             // Real search: if any one fails -> propagate the error, never silently turn it into "No results found"
             let mut searched: Vec<Option<WebSearchResults>> = Vec::with_capacity(round.tool_uses.len());
             for tu in &round.tool_uses {
-                let (_id, mcp_request) = websearch::create_mcp_request(&tool_query(tu));
+                let Some(query) = tool_query(tu) else {
+                    log_invalid_web_search_input(tu);
+                    searched.push(None);
+                    continue;
+                };
+                log_normalized_web_search_query(tu, &query);
+                let (_id, mcp_request) = websearch::create_mcp_request(&query);
                 match websearch::call_mcp_api(&provider, &mcp_request, group.as_deref()).await {
                     Ok(resp) => searched.push(websearch::parse_search_results(&resp)),
+                    Err(e) if is_no_results_mcp_error(&e) => {
+                        tracing::warn!("web_search MCP returned no results; continuing with an empty result");
+                        searched.push(None);
+                    }
                     Err(e) => {
                         tracing::warn!("web_search MCP call failed: {}", e);
                         hook.record(
@@ -748,12 +811,20 @@ pub(super) async fn run_web_search_loop(
         let mut searched: Vec<Option<WebSearchResults>> = Vec::with_capacity(round.tool_uses.len());
         for tu in &round.tool_uses {
             if tu.name == "web_search" {
-                let (_id, mcp_request) = websearch::create_mcp_request(&tool_query(tu));
+                let Some(query) = tool_query(tu) else {
+                    log_invalid_web_search_input(tu);
+                    searched.push(None);
+                    continue;
+                };
+                log_normalized_web_search_query(tu, &query);
+                let (_id, mcp_request) = websearch::create_mcp_request(&query);
                 match websearch::call_mcp_api(&provider, &mcp_request, group.as_deref()).await {
                     Ok(resp) => searched.push(websearch::parse_search_results(&resp)),
+                    Err(e) if is_no_results_mcp_error(&e) => {
+                        tracing::warn!("web_search MCP returned no results in final round; continuing with an empty result");
+                        searched.push(None);
+                    }
                     Err(e) => {
-                        // Same pass-through discipline as the continue branch: a failed
-                        // search must surface as an error, never a silent success.
                         tracing::warn!("web_search MCP call (final round) failed: {}", e);
                         hook.record(
                             last_credential_id,
@@ -1034,6 +1105,35 @@ mod tests {
             name: name.to_string(),
             input: json!({"query": "rust 2026"}),
         }
+    }
+
+    fn tu_with_input(input: Value) -> CompletedToolUse {
+        CompletedToolUse {
+            id: "toolu_web_search".to_string(),
+            name: "web_search".to_string(),
+            input,
+        }
+    }
+
+    #[test]
+    fn tool_query_normalizes_supported_input_shapes() {
+        assert_eq!(tool_query(&tu_with_input(json!({"query": "  rust 2026  "}))), Some("rust 2026".to_string()));
+        assert_eq!(tool_query(&tu_with_input(json!({"search_query": "南京演唱会"}))), Some("南京演唱会".to_string()));
+        assert_eq!(tool_query(&tu_with_input(json!({"queries": ["", "上海天气"]}))), Some("上海天气".to_string()));
+        assert_eq!(tool_query(&tu_with_input(json!({"query": {"text": "Paris weather"}}))), Some("Paris weather".to_string()));
+    }
+
+    #[test]
+    fn tool_query_rejects_missing_or_non_string_input() {
+        assert_eq!(tool_query(&tu_with_input(json!({"query": "   "}))), None);
+        assert_eq!(tool_query(&tu_with_input(json!({"query": 42}))), None);
+        assert_eq!(tool_query(&tu_with_input(json!({"other": true}))), None);
+    }
+
+    #[test]
+    fn no_results_mcp_error_is_nonfatal() {
+        assert!(is_no_results_mcp_error(&anyhow::anyhow!("MCP error: -32602 - Tool returned no results")));
+        assert!(!is_no_results_mcp_error(&anyhow::anyhow!("MCP error: -32602 - Invalid tool parameters provided")));
     }
 
     /// Build a known-tool-names set for build_flush_content tests.
