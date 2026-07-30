@@ -307,10 +307,65 @@ function ExpandedTraceRow({ rec }: { rec: TraceRecord }) {
   )
 }
 
-/** 展开后的链路详情：错误摘要 + 每跳时间线 */
+/**
+ * 计费面板：以 credit（上游 meteringEvent 的真实计费）为核心，直观体现缓存省钱效果。
+ *
+ * 关键指标「每千输入 token 的 credit」：Kiro 后端对命中缓存的输入按更低费率计费，
+ * 所以同规模输入下，该比值越低 = 缓存命中越多 = 越省钱。冷启动请求（大前缀首次进
+ * 缓存）该比值偏高，之后重复内容命中后明显下降——对比同类请求的这个值即可看出缓存
+ * 有没有帮你省钱。
+ *
+ * 注：input token 为 contextUsage 推算的粗粒度估算；credit 是上游真实计费口径，
+ * 是判断成本的可信信号（缓存的 cache_read token 为中转层估算，仅供参考）。
+ */
+function CacheBillingPanel({ rec }: { rec: TraceRecord }) {
+  const credit = rec.credits ?? 0
+  if (credit <= 0) return null
+  const input = rec.inputTokens ?? 0
+  const perK = input > 0 ? credit / (input / 1000) : null
+
+  const items: Array<{ label: string; value: string; hint?: string }> = [
+    { label: '真实计费', value: credit.toFixed(4), hint: 'credit（上游 metering）' },
+    { label: '输入 Token', value: formatTokens(input), hint: '估算' },
+  ]
+  if (perK != null) {
+    items.push({
+      label: '每千输入 credit',
+      value: perK.toFixed(4),
+      hint: '越低=缓存命中越多',
+    })
+  }
+
+  return (
+    <div className="rounded-lg border border-border/50 bg-secondary/30 p-3">
+      <div className="mb-2 flex items-center gap-2 text-[12px] font-medium text-muted-foreground">
+        <span>计费与缓存效率</span>
+        <span className="text-[11px] font-normal text-muted-foreground/70">
+          credit 为上游真实计费，是判断缓存省钱的可信信号
+        </span>
+      </div>
+      <div className="grid grid-cols-2 gap-x-6 gap-y-2 sm:grid-cols-3">
+        {items.map((it) => (
+          <div key={it.label} className="min-w-0">
+            <div className="text-[11px] text-muted-foreground">{it.label}</div>
+            <div className="font-mono tabular-nums text-[15px] font-semibold text-pink-600 dark:text-pink-400">
+              {it.value}
+            </div>
+            {it.hint && (
+              <div className="text-[10px] text-muted-foreground/70">{it.hint}</div>
+            )}
+          </div>
+        ))}
+      </div>
+    </div>
+  )
+}
+
+/** 展开后的链路详情：计费/缓存效率 + 错误摘要 + 每跳时间线 */
 function ExpandedDetail({ rec }: { rec: TraceRecord }) {
   return (
     <div className="space-y-3">
+      <CacheBillingPanel rec={rec} />
       {rec.errorMessage && (
         <div className="rounded-lg border border-destructive/30 bg-destructive/5 p-3 text-[13px] text-destructive">
           {rec.errorMessage}
