@@ -321,18 +321,32 @@ function ExpandedTraceRow({ rec }: { rec: TraceRecord }) {
 function CacheBillingPanel({ rec }: { rec: TraceRecord }) {
   const credit = rec.credits ?? 0
   if (credit <= 0) return null
-  const input = rec.inputTokens ?? 0
-  const perK = input > 0 ? credit / (input / 1000) : null
+  // 总输入 = 未缓存输入 + 缓存创建 + 缓存读取。
+  // 这是缓存拆分的不变量（split_against_total 保证三者之和 == 总 prompt），
+  // 用作分母才稳定；rec.inputTokens 在有缓存拆分时只剩「未缓存那部分」，不能当分母。
+  const freshInput = rec.inputTokens ?? 0
+  const cacheCreation = rec.cacheCreationTokens ?? 0
+  const cacheRead = rec.cacheReadTokens ?? 0
+  const promptTotal = freshInput + cacheCreation + cacheRead
+  const perK = promptTotal > 0 ? credit / (promptTotal / 1000) : null
 
   const items: Array<{ label: string; value: string; hint?: string }> = [
     { label: '真实计费', value: credit.toFixed(4), hint: 'credit（上游 metering）' },
-    { label: '输入 Token', value: formatTokens(input), hint: '估算' },
+    { label: '总输入 Token', value: formatTokens(promptTotal), hint: '含缓存命中·估算' },
   ]
   if (perK != null) {
     items.push({
       label: '每千输入 credit',
       value: perK.toFixed(4),
       hint: '越低=缓存命中越多',
+    })
+  }
+  // 有缓存拆分时，额外展示「未缓存输入」（真正按全价计费的部分）
+  if (cacheRead > 0 || cacheCreation > 0) {
+    items.push({
+      label: '未缓存输入',
+      value: formatTokens(freshInput),
+      hint: '按全价计费部分·估算',
     })
   }
 
