@@ -106,6 +106,26 @@ function formatDuration(totalSeconds: number): string {
   return `${seconds} 秒`;
 }
 
+/** 添加时间用绝对日期展示（凭据的创建时刻是固定事实，相对时间意义不大） */
+function formatCreatedAt(createdAt: string | null | undefined): string {
+  if (!createdAt) return "未知";
+  const date = new Date(createdAt);
+  if (Number.isNaN(date.getTime())) return "未知";
+  return date.toLocaleDateString("zh-CN", {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  });
+}
+
+/** 完整时间戳，用于 hover 提示 */
+function formatCreatedAtFull(createdAt: string | null | undefined): string {
+  if (!createdAt) return "添加时间未知（该凭据在此功能上线前导入）";
+  const date = new Date(createdAt);
+  if (Number.isNaN(date.getTime())) return "添加时间未知";
+  return `添加于 ${date.toLocaleString("zh-CN")}`;
+}
+
 function formatNumber(n: number): string {
   return n.toLocaleString("zh-CN", {
     minimumFractionDigits: 2,
@@ -819,9 +839,17 @@ export function CredentialCard({
         )}
       </div>
 
-      {/* 最后调用（中大屏） */}
-      <div className="hidden w-24 shrink-0 truncate text-right text-xs text-muted-foreground md:block">
-        {formatLastUsed(credential.lastUsedAt)}
+      {/* 最后调用 + 添加时间（中大屏） */}
+      <div className="hidden w-24 shrink-0 truncate text-right text-xs md:block">
+        <div className="truncate text-muted-foreground">
+          {formatLastUsed(credential.lastUsedAt)}
+        </div>
+        <div
+          className="truncate text-[11px] tabular-nums text-muted-foreground/60"
+          title={formatCreatedAtFull(credential.createdAt)}
+        >
+          添加 {formatCreatedAt(credential.createdAt)}
+        </div>
       </div>
 
       {/* 操作区 */}
@@ -1043,9 +1071,12 @@ export function CredentialCard({
               </dd>
             </div>
             <div className="flex min-w-0 items-center justify-between gap-2 min-[420px]:col-span-2">
-              <dt className="shrink-0 text-muted-foreground">导入 / 生成</dt>
-              <dd className="min-w-0 truncate text-right font-medium">
-                {formatDateTime(credential.createdAt)}
+              <dt className="shrink-0 text-muted-foreground">添加时间</dt>
+              <dd
+                className="min-w-0 truncate text-right font-medium tabular-nums"
+                title={formatCreatedAtFull(credential.createdAt)}
+              >
+                {formatCreatedAt(credential.createdAt)}
               </dd>
             </div>
             {credential.survivalSeconds !== undefined && (

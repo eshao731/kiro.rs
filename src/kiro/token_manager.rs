@@ -1155,6 +1155,9 @@ pub struct CredentialEntrySnapshot {
     /// 账号来源渠道（纯备注）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_channel: Option<String>,
+    /// 凭据添加（创建）时间（RFC3339 格式）；旧凭据缺失时为 None
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
 }
 
 /// 凭据管理器状态快照
@@ -3482,6 +3485,7 @@ impl MultiTokenManager {
                     endpoint: e.credentials.endpoint.clone(),
                     groups: e.credentials.groups.clone(),
                     source_channel: e.credentials.source_channel.clone(),
+                    created_at: e.credentials.created_at.clone(),
                 })
                 .collect(),
             current_id,
@@ -4322,6 +4326,13 @@ impl MultiTokenManager {
         validated_cred.proxy_username = new_cred.proxy_username;
         validated_cred.proxy_password = new_cred.proxy_password;
         validated_cred.kiro_api_key = new_cred.kiro_api_key;
+        // 记录添加时间：保留导入时携带的原值（如 KAM 迁移），否则以当前时间入库。
+        // 此处为所有添加路径（单条添加 / 批量导入 / 登录回调）的唯一收口。
+        if validated_cred.created_at.is_none() {
+            validated_cred.created_at = new_cred
+                .created_at
+                .or_else(|| Some(Utc::now().to_rfc3339()));
+        }
 
         {
             let mut entries = self.entries.lock();
@@ -5482,6 +5493,31 @@ mod tests {
         assert!(id > 0);
         assert_eq!(manager.total_count(), 1);
         assert_eq!(manager.available_count(), 1);
+    }
+
+    /// add_credential 应在入库时为新凭据写入 created_at（RFC3339），
+    /// 且值可被解析。旧凭据（未携带该字段）由调用方决定是否补齐。
+    #[tokio::test]
+    async fn test_add_credential_sets_created_at() {
+        let config = Config::default();
+        let manager = MultiTokenManager::new(config, vec![], None, None, false).unwrap();
+
+        let mut api_key_cred = KiroCredentials::default();
+        api_key_cred.kiro_api_key = Some("ksk_created_at_probe".to_string());
+        api_key_cred.auth_method = Some("api_key".to_string());
+
+        manager.add_credential(api_key_cred).await.unwrap();
+
+        let snapshot = manager.snapshot();
+        let entry = snapshot.entries.first().expect("凭据应已入库");
+        let created_at = entry
+            .created_at
+            .as_deref()
+            .expect("新凭据应写入 created_at");
+        assert!(
+            DateTime::parse_from_rfc3339(created_at).is_ok(),
+            "created_at 应为合法 RFC3339: {created_at}"
+        );
     }
 
     #[tokio::test]
