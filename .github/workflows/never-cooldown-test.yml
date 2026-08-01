@@ -2,6 +2,9 @@ name: Temporary never-cooldown tests
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - codex/zyphr-channel5-cache-config
 
 jobs:
   test:
