@@ -1,0 +1,21 @@
+name: Temporary never-cooldown tests
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: rust-cache-x86_64-unknown-linux-gnu
+          cache-on-failure: true
+          save-if: false
+      - uses: rui314/setup-mold@v1
+      - name: Run never-cooldown tests
+        env:
+          RUSTFLAGS: -C link-arg=-fuse-ld=mold
+        run: cargo test --locked never_cooldown
