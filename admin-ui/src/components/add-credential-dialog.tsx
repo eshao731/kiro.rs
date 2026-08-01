@@ -28,6 +28,10 @@ interface AddCredentialDialogProps {
 
 type AuthMethod = 'social' | 'idc' | 'external_idp' | 'api_key'
 
+const API_REGION_PRESETS = [
+  { value: 'eu-central-1', label: 'eu-central-1 (Frankfurt)' },
+]
+
 export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogProps) {
   const [refreshToken, setRefreshToken] = useState('')
   const [kiroApiKey, setKiroApiKey] = useState('')
@@ -212,10 +216,28 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                     disabled={isPending}
                   />
                 </div>
-                <div>
+                <div className="space-y-2">
+                  <Select
+                    value={
+                      API_REGION_PRESETS.some(({ value }) => value === apiRegion) ? apiRegion : ''
+                    }
+                    onValueChange={setApiRegion}
+                    disabled={isPending}
+                  >
+                    <SelectTrigger className="h-10" aria-label="选择常用 API Region">
+                      <SelectValue placeholder="选择常用 API Region" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {API_REGION_PRESETS.map(({ value, label }) => (
+                        <SelectItem key={value} value={value}>
+                          {label}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
                   <Input
                     id="apiRegion"
-                    placeholder="API Region"
+                    placeholder="API Region，也可自行输入"
                     value={apiRegion}
                     onChange={(e) => setApiRegion(e.target.value)}
                     disabled={isPending}

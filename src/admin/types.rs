@@ -238,6 +238,10 @@ pub struct ImportKiroApiKeyRequest {
     /// Kiro API Key（格式: ksk_xxxxxxxx）
     pub kiro_api_key: String,
 
+    /// 凭据级 API Region（可选，用于 API 请求）
+    #[serde(default)]
+    pub api_region: Option<String>,
+
     /// 优先级（可选，默认 0）
     #[serde(default)]
     pub priority: u32,
@@ -269,7 +273,10 @@ impl From<ImportKiroApiKeyRequest> for AddCredentialRequest {
             priority: req.priority,
             region: None,
             auth_region: None,
-            api_region: None,
+            api_region: req
+                .api_region
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty()),
             machine_id: None,
             email: None,
             proxy_url: None,
@@ -1205,6 +1212,7 @@ mod tests {
     fn import_kiro_api_key_request_maps_to_standard_add_flow() {
         let import: ImportKiroApiKeyRequest = serde_json::from_value(serde_json::json!({
             "kiroApiKey": "ksk_test",
+            "apiRegion": " eu-central-1 ",
             "priority": 7,
             "groups": ["operations"]
         }))
@@ -1213,6 +1221,7 @@ mod tests {
         let add: AddCredentialRequest = import.into();
         assert_eq!(add.auth_method, "api_key");
         assert_eq!(add.kiro_api_key.as_deref(), Some("ksk_test"));
+        assert_eq!(add.api_region.as_deref(), Some("eu-central-1"));
         assert_eq!(add.priority, 7);
         assert_eq!(add.groups, vec!["operations"]);
         assert_eq!(add.source_channel.as_deref(), Some("operations-api"));
@@ -1229,5 +1238,18 @@ mod tests {
 
         let add: AddCredentialRequest = import.into();
         assert_eq!(add.source_channel.as_deref(), Some("account-manager"));
+        assert!(add.api_region.is_none());
+    }
+
+    #[test]
+    fn import_kiro_api_key_request_ignores_blank_api_region() {
+        let import: ImportKiroApiKeyRequest = serde_json::from_value(serde_json::json!({
+            "kiroApiKey": "ksk_test",
+            "apiRegion": "   "
+        }))
+        .expect("请求应可反序列化");
+
+        let add: AddCredentialRequest = import.into();
+        assert!(add.api_region.is_none());
     }
 }

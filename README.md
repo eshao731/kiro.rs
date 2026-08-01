@@ -273,12 +273,13 @@ Admin API 鉴权同样支持：
 curl -X POST http://127.0.0.1:8990/api/admin/credentials/kiro-api-key \
   -H 'content-type: application/json' \
   -H 'x-credential-import-key: sk-credential-import-change-me' \
-  -d '{"kiroApiKey":"ksk_xxx"}'
+  -d '{"kiroApiKey":"ksk_xxx","apiRegion":"eu-central-1"}'
 ```
 
 该接口只接受 `x-credential-import-key`，不会接受 `adminApiKey`。请求还可携带
-`priority`、`groups` 和 `sourceChannel`；成功后会复用标准新增凭据流程完成去重、分配 ID、
-持久化与余额刷新。未配置或配置为空时，该路由不会挂载。
+`apiRegion`、`priority`、`groups` 和 `sourceChannel`；`apiRegion` 不传或传空字符串时保持
+原有回退行为。成功后会复用标准新增凭据流程完成去重、分配 ID、持久化与余额刷新。
+未配置或配置为空时，该路由不会挂载。
 
 <a id="configuration"></a>
 ## ⚙️ 配置
