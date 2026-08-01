@@ -88,6 +88,13 @@ export function TopbarTools({ compact = false }: TopbarToolsProps) {
     })
   }
 
+  const updateNeverCooldown = (enabled: boolean) => {
+    setThrottleConfig({ neverCooldown: enabled }, {
+      onSuccess: () => toast.success(enabled ? '已开启永远不冷却' : '已恢复本地冷却保护'),
+      onError: (err) => toast.error(`切换失败: ${extractErrorMessage(err)}`),
+    })
+  }
+
   const updateDisableFailureAutoRecovery = (enabled: boolean) => {
     setThrottleConfig({ disableFailureAutoRecovery: enabled }, {
       onSuccess: () => toast.success(
@@ -138,6 +145,7 @@ export function TopbarTools({ compact = false }: TopbarToolsProps) {
     throttleConfig,
     updateCheck,
     updateDisableFailureAutoRecovery,
+    updateNeverCooldown,
     updateUnlimitedConcurrency,
     updateCooldown: (secs: number) =>
       setThrottleConfig({ cooldownSecs: secs }, {
@@ -260,6 +268,7 @@ interface ToolControls {
   throttleConfig?: AccountThrottleConfig
   updateCheck?: { hasUpdate: boolean; latestVersion: string; currentVersion: string }
   updateDisableFailureAutoRecovery: (enabled: boolean) => void
+  updateNeverCooldown: (enabled: boolean) => void
   updateUnlimitedConcurrency: (enabled: boolean) => void
   updateCooldown: (secs: number) => void
 }
@@ -274,6 +283,7 @@ function FullTools({ controls }: { controls: ToolControls }) {
         saving={controls.isSettingThrottle}
         onToggleFailover={controls.handleToggleFailover}
         onChangeDisableFailureAutoRecovery={controls.updateDisableFailureAutoRecovery}
+        onChangeNeverCooldown={controls.updateNeverCooldown}
         onChangeUnlimitedConcurrency={controls.updateUnlimitedConcurrency}
         onChangeCooldown={controls.updateCooldown}
       />
@@ -291,6 +301,7 @@ function CompactTools({ controls }: { controls: ToolControls }) {
     saving: controls.isSettingThrottle,
     onToggleFailover: controls.handleToggleFailover,
     onChangeDisableFailureAutoRecovery: controls.updateDisableFailureAutoRecovery,
+    onChangeNeverCooldown: controls.updateNeverCooldown,
     onChangeUnlimitedConcurrency: controls.updateUnlimitedConcurrency,
     onChangeCooldown: controls.updateCooldown,
   }
@@ -409,6 +420,7 @@ interface ThrottleConfigButtonProps {
   saving: boolean
   onToggleFailover: () => void
   onChangeDisableFailureAutoRecovery: (enabled: boolean) => void
+  onChangeNeverCooldown: (enabled: boolean) => void
   onChangeUnlimitedConcurrency: (enabled: boolean) => void
   onChangeCooldown: (secs: number) => void
 }
@@ -418,6 +430,7 @@ interface ThrottleState {
   cooldownSecs: number
   disableFailureAutoRecovery: boolean
   failover: boolean
+  neverCooldown: boolean
   unlimitedConcurrency: boolean
 }
 
@@ -457,7 +470,8 @@ const MAX_CUSTOM_COOLDOWN_MINUTES = 1440
  */
 function ThrottleConfigButton({
   config, loading, saving, onToggleFailover, onChangeCooldown,
-  onChangeDisableFailureAutoRecovery, onChangeUnlimitedConcurrency,
+  onChangeDisableFailureAutoRecovery, onChangeNeverCooldown,
+  onChangeUnlimitedConcurrency,
 }: ThrottleConfigButtonProps) {
   const [open, setOpen] = useState(false)
   const [customMin, setCustomMin] = useState('')
@@ -493,6 +507,7 @@ function ThrottleConfigButton({
           saving={saving}
           state={state}
           onChangeDisableFailureAutoRecovery={onChangeDisableFailureAutoRecovery}
+          onChangeNeverCooldown={onChangeNeverCooldown}
           onChangeUnlimitedConcurrency={onChangeUnlimitedConcurrency}
         />
         <ThrottleCooldownPanel
@@ -513,17 +528,34 @@ function ThrottleBehaviorPanel({
   saving,
   state,
   onChangeDisableFailureAutoRecovery,
+  onChangeNeverCooldown,
   onChangeUnlimitedConcurrency,
 }: {
   saving: boolean
   state: ThrottleState
   onChangeDisableFailureAutoRecovery: (enabled: boolean) => void
+  onChangeNeverCooldown: (enabled: boolean) => void
   onChangeUnlimitedConcurrency: (enabled: boolean) => void
 }) {
   return (
     <>
       <DropdownMenuLabel className="pt-1">保护策略</DropdownMenuLabel>
       <div className="space-y-1.5 px-2 pb-2">
+        <label className="flex cursor-pointer items-start justify-between gap-3 rounded-md bg-secondary/40 px-2.5 py-2">
+          <div className="text-xs">
+            <div className="font-medium text-foreground">永远不冷却</div>
+            <div className="leading-snug text-muted-foreground">
+              收到任何 429 都不建立端点或凭据冷却，仍保留当次降级与重试
+            </div>
+          </div>
+          <Checkbox
+            aria-label="永远不冷却"
+            className="mt-0.5"
+            checked={state.neverCooldown}
+            disabled={saving}
+            onCheckedChange={(checked) => onChangeNeverCooldown(checked === true)}
+          />
+        </label>
         <label className="flex cursor-pointer items-start justify-between gap-3 rounded-md bg-secondary/40 px-2.5 py-2">
           <div className="text-xs">
             <div className="font-medium text-foreground">不限并发</div>
@@ -597,7 +629,7 @@ function ThrottleStatusPanel({
       <DropdownMenuLabel>账号级风控故障转移</DropdownMenuLabel>
       <div className="px-2 pb-2">
         <div className="flex items-center justify-between gap-2 rounded-md bg-secondary/40 px-2.5 py-2">
-          <ThrottleStatusText failover={state.failover} />
+          <ThrottleStatusText failover={state.failover} neverCooldown={state.neverCooldown} />
           <Switch
             checked={state.failover}
             disabled={saving}
@@ -609,14 +641,21 @@ function ThrottleStatusPanel({
   )
 }
 
-function ThrottleStatusText({ failover }: { failover: boolean }) {
+function ThrottleStatusText({
+  failover, neverCooldown,
+}: {
+  failover: boolean
+  neverCooldown: boolean
+}) {
   return (
     <div className="text-xs">
       <div className="font-medium text-foreground">
         {failover ? '开启' : '关闭'}
       </div>
       <div className="text-muted-foreground leading-snug">
-        {failover
+        {neverCooldown
+          ? '永远不冷却已开启，账号 429 只按瞬态错误降级和重试'
+          : failover
           ? '上游对当前账号触发临时限速时，自动冷却该凭据并切换到下一个可用凭据'
           : '上游对当前账号触发临时限速时，仅按瞬态错误重试，不切换凭据'}
       </div>
@@ -635,12 +674,12 @@ function ThrottleCooldownPanel({
   onDone?: () => void
   onSubmitCustom: (e: React.FormEvent) => void
 }) {
-  const disabled = saving || !state.failover
+  const disabled = saving || !state.failover || state.neverCooldown
 
   return (
     <>
       <DropdownMenuLabel className="pt-1">冷却时长</DropdownMenuLabel>
-      <div className={cooldownPanelClassName(state.failover)}>
+      <div className={cooldownPanelClassName(state.failover && !state.neverCooldown)}>
         <CooldownPresetButtons
           cooldownSecs={state.cooldownSecs}
           disabled={disabled}
@@ -695,6 +734,7 @@ function ThrottleCompactItems(props: ThrottleConfigButtonProps) {
     onToggleFailover,
     onChangeCooldown,
     onChangeDisableFailureAutoRecovery,
+    onChangeNeverCooldown,
     onChangeUnlimitedConcurrency,
   } = props
   const [customMin, setCustomMin] = useState('')
@@ -726,6 +766,7 @@ function ThrottleCompactItems(props: ThrottleConfigButtonProps) {
         saving={busy}
         state={state}
         onChangeDisableFailureAutoRecovery={onChangeDisableFailureAutoRecovery}
+        onChangeNeverCooldown={onChangeNeverCooldown}
         onChangeUnlimitedConcurrency={onChangeUnlimitedConcurrency}
       />
       <ThrottleCooldownPanel
@@ -805,18 +846,21 @@ function readThrottleState(
     cooldownSecs,
     disableFailureAutoRecovery: config?.disableFailureAutoRecovery ?? false,
     failover: config?.failover ?? true,
+    neverCooldown: config?.neverCooldown ?? false,
     unlimitedConcurrency: config?.unlimitedConcurrency ?? false,
   }
 }
 
 function throttleTitle(loading: boolean, state: ThrottleState) {
   if (loading) return '加载中…'
+  if (state.neverCooldown) return '永远不冷却：开启'
   if (!state.failover) return '账号级风控故障转移：关闭'
   return `账号级风控故障转移：开启（冷却 ${state.cooldownMin} 分钟）`
 }
 
 function throttleTriggerText(loading: boolean, state: ThrottleState) {
   if (loading) return '加载中…'
+  if (state.neverCooldown) return '永不冷却'
   if (!state.failover) return '不切换'
   return `故障转移 · ${state.cooldownMin}m`
 }

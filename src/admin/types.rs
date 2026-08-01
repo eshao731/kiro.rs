@@ -525,6 +525,8 @@ pub struct AccountThrottleConfigResponse {
     pub failover: bool,
     /// 冷却时长（秒）
     pub cooldown_secs: u64,
+    /// 是否完全关闭本地冷却
+    pub never_cooldown: bool,
     /// 是否禁止普通 429 动态收缩并发
     pub unlimited_concurrency: bool,
     /// 是否禁止失败过多后的自动自愈
@@ -541,6 +543,9 @@ pub struct SetAccountThrottleConfigRequest {
     /// 冷却时长（秒）；缺省表示不修改，1..=86400
     #[serde(default)]
     pub cooldown_secs: Option<u64>,
+    /// 是否完全关闭本地冷却；缺省表示不修改
+    #[serde(default)]
+    pub never_cooldown: Option<bool>,
     /// 是否禁止普通 429 动态收缩并发；缺省表示不修改
     #[serde(default)]
     pub unlimited_concurrency: Option<bool>,

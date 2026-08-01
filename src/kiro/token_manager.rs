@@ -1107,6 +1107,8 @@ pub struct MultiTokenManager {
     account_throttle_failover: AtomicBool,
     /// 账号级风控冷却时长（秒，运行时可修改）
     account_throttle_cooldown_secs: AtomicU64,
+    /// 是否完全关闭本地冷却（运行时可修改）
+    never_cooldown: AtomicBool,
     /// 是否禁止普通 429 动态收缩并发（运行时可修改）
     unlimited_concurrency: AtomicBool,
     /// 是否禁止失败过多后的自动自愈（运行时可修改）
@@ -1366,6 +1368,7 @@ impl MultiTokenManager {
         let load_balancing_mode = config.load_balancing_mode.clone();
         let throttle_failover = config.account_throttle_failover;
         let throttle_cooldown_secs = config.account_throttle_cooldown_secs;
+        let never_cooldown = config.never_cooldown;
         let unlimited_concurrency = config.unlimited_concurrency;
         let disable_failure_auto_recovery = config.disable_failure_auto_recovery;
         let manager = Self {
@@ -1381,6 +1384,7 @@ impl MultiTokenManager {
             load_balancing_mode: Mutex::new(load_balancing_mode),
             account_throttle_failover: AtomicBool::new(throttle_failover),
             account_throttle_cooldown_secs: AtomicU64::new(throttle_cooldown_secs),
+            never_cooldown: AtomicBool::new(never_cooldown),
             unlimited_concurrency: AtomicBool::new(unlimited_concurrency),
             disable_failure_auto_recovery: AtomicBool::new(disable_failure_auto_recovery),
             last_stats_save_at: Mutex::new(None),
@@ -2195,15 +2199,17 @@ impl MultiTokenManager {
 
         {
             let mut entries = self.entries.lock();
+            let never_cooldown = self.get_never_cooldown();
             let unlimited_concurrency = self.get_unlimited_concurrency();
+            let cooldown_disabled = never_cooldown || unlimited_concurrency;
             if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
-                let count = if unlimited_concurrency {
+                let count = if cooldown_disabled {
                     0
                 } else {
                     entry.rate_limit_count.saturating_add(1)
                 };
                 let exp = count.saturating_sub(1).min(6);
-                let cooldown_secs = if unlimited_concurrency {
+                let cooldown_secs = if cooldown_disabled {
                     0
                 } else {
                     RATE_LIMIT_SOFT_COOLDOWN_BASE_SECS
@@ -2218,7 +2224,7 @@ impl MultiTokenManager {
                 let next_limit = (current_limit / 2).max(1);
 
                 entry.rate_limit_count = count;
-                entry.rate_limit_until = if unlimited_concurrency {
+                entry.rate_limit_until = if cooldown_disabled {
                     None
                 } else {
                     Some(match entry.rate_limit_until {
@@ -2226,7 +2232,7 @@ impl MultiTokenManager {
                         _ => until,
                     })
                 };
-                entry.rate_limit_concurrency_limit = if unlimited_concurrency {
+                entry.rate_limit_concurrency_limit = if cooldown_disabled {
                     None
                 } else {
                     Some(next_limit)
@@ -2237,9 +2243,14 @@ impl MultiTokenManager {
 
                 report.cooldown_secs = cooldown_secs;
                 report.consecutive_count = count;
-                report.concurrency_limit = if unlimited_concurrency { 0 } else { next_limit };
+                report.concurrency_limit = if cooldown_disabled { 0 } else { next_limit };
 
-                if unlimited_concurrency {
+                if never_cooldown {
+                    tracing::warn!(
+                        "凭据 #{} 命中普通 429，永远不冷却模式下不进入本地软冷却",
+                        id
+                    );
+                } else if unlimited_concurrency {
                     tracing::warn!(
                         "凭据 #{} 命中普通 429，不限并发模式下不进入本地软冷却",
                         id
@@ -2730,6 +2741,14 @@ impl MultiTokenManager {
         group: Option<&str>,
         reason: &str,
     ) -> usize {
+        if self.get_never_cooldown() {
+            tracing::warn!(
+                "凭据 #{} 请求级临时冷却已跳过（永远不冷却）：{}",
+                id,
+                reason
+            );
+            return self.available_count_for_request(model, group);
+        }
         let now = Instant::now();
         let mut entries = self.entries.lock();
         if let Some(entry) = entries.iter_mut().find(|entry| entry.id == id) {
@@ -2796,6 +2815,14 @@ impl MultiTokenManager {
         cooldown: StdDuration,
         reason: &str,
     ) -> usize {
+        if self.get_never_cooldown() {
+            tracing::warn!(
+                "凭据 #{} 临时冷却已跳过（永远不冷却）：{}",
+                id,
+                reason
+            );
+            return self.available_count();
+        }
         let now = Instant::now();
         {
             let mut entries = self.entries.lock();
@@ -3907,6 +3934,11 @@ impl MultiTokenManager {
         self.account_throttle_cooldown_secs.load(Ordering::Relaxed)
     }
 
+    /// 获取是否完全关闭本地冷却（Admin API）
+    pub fn get_never_cooldown(&self) -> bool {
+        self.never_cooldown.load(Ordering::Relaxed)
+    }
+
     /// 获取是否禁止普通 429 动态收缩并发（Admin API）
     pub fn get_unlimited_concurrency(&self) -> bool {
         self.unlimited_concurrency.load(Ordering::Relaxed)
@@ -3924,6 +3956,7 @@ impl MultiTokenManager {
         &self,
         failover: Option<bool>,
         cooldown_secs: Option<u64>,
+        never_cooldown: Option<bool>,
         unlimited_concurrency: Option<bool>,
         disable_failure_auto_recovery: Option<bool>,
     ) -> anyhow::Result<()> {
@@ -3936,10 +3969,12 @@ impl MultiTokenManager {
 
         let prev_failover = self.get_account_throttle_failover();
         let prev_cooldown = self.get_account_throttle_cooldown_secs();
+        let prev_never_cooldown = self.get_never_cooldown();
         let prev_unlimited_concurrency = self.get_unlimited_concurrency();
         let prev_disable_failure_auto_recovery = self.get_disable_failure_auto_recovery();
         let new_failover = failover.unwrap_or(prev_failover);
         let new_cooldown = cooldown_secs.unwrap_or(prev_cooldown);
+        let new_never_cooldown = never_cooldown.unwrap_or(prev_never_cooldown);
         let new_unlimited_concurrency =
             unlimited_concurrency.unwrap_or(prev_unlimited_concurrency);
         let new_disable_failure_auto_recovery = disable_failure_auto_recovery
@@ -3947,6 +3982,7 @@ impl MultiTokenManager {
 
         if new_failover == prev_failover
             && new_cooldown == prev_cooldown
+            && new_never_cooldown == prev_never_cooldown
             && new_unlimited_concurrency == prev_unlimited_concurrency
             && new_disable_failure_auto_recovery == prev_disable_failure_auto_recovery
         {
@@ -3957,6 +3993,8 @@ impl MultiTokenManager {
             .store(new_failover, Ordering::Relaxed);
         self.account_throttle_cooldown_secs
             .store(new_cooldown, Ordering::Relaxed);
+        self.never_cooldown
+            .store(new_never_cooldown, Ordering::Relaxed);
         self.unlimited_concurrency
             .store(new_unlimited_concurrency, Ordering::Relaxed);
         self.disable_failure_auto_recovery
@@ -3965,6 +4003,7 @@ impl MultiTokenManager {
         if let Err(err) = self.persist_account_throttle_config(
             new_failover,
             new_cooldown,
+            new_never_cooldown,
             new_unlimited_concurrency,
             new_disable_failure_auto_recovery,
         ) {
@@ -3973,6 +4012,8 @@ impl MultiTokenManager {
                 .store(prev_failover, Ordering::Relaxed);
             self.account_throttle_cooldown_secs
                 .store(prev_cooldown, Ordering::Relaxed);
+            self.never_cooldown
+                .store(prev_never_cooldown, Ordering::Relaxed);
             self.unlimited_concurrency
                 .store(prev_unlimited_concurrency, Ordering::Relaxed);
             self.disable_failure_auto_recovery
@@ -3980,9 +4021,12 @@ impl MultiTokenManager {
             return Err(err);
         }
 
-        if new_unlimited_concurrency {
+        if new_unlimited_concurrency || new_never_cooldown {
             let mut entries = self.entries.lock();
             for entry in entries.iter_mut() {
+                if new_never_cooldown {
+                    entry.throttled_until = None;
+                }
                 entry.rate_limit_count = 0;
                 entry.rate_limit_until = None;
                 entry.rate_limit_concurrency_limit = None;
@@ -3991,9 +4035,10 @@ impl MultiTokenManager {
         }
 
         tracing::info!(
-            "账号级风控配置已更新: failover={}, cooldown_secs={}, unlimited_concurrency={}, disable_failure_auto_recovery={}",
+            "账号级风控配置已更新: failover={}, cooldown_secs={}, never_cooldown={}, unlimited_concurrency={}, disable_failure_auto_recovery={}",
             new_failover,
             new_cooldown,
+            new_never_cooldown,
             new_unlimited_concurrency,
             new_disable_failure_auto_recovery
         );
@@ -4004,6 +4049,7 @@ impl MultiTokenManager {
         &self,
         failover: bool,
         cooldown_secs: u64,
+        never_cooldown: bool,
         unlimited_concurrency: bool,
         disable_failure_auto_recovery: bool,
     ) -> anyhow::Result<()> {
@@ -4021,6 +4067,7 @@ impl MultiTokenManager {
             .with_context(|| format!("重新加载配置失败: {}", config_path.display()))?;
         config.account_throttle_failover = failover;
         config.account_throttle_cooldown_secs = cooldown_secs;
+        config.never_cooldown = never_cooldown;
         config.unlimited_concurrency = unlimited_concurrency;
         config.disable_failure_auto_recovery = disable_failure_auto_recovery;
         config
@@ -4450,12 +4497,14 @@ mod tests {
                 .unwrap();
 
         manager
-            .set_account_throttle_config(None, None, Some(true), Some(true))
+            .set_account_throttle_config(None, None, Some(true), Some(true), Some(true))
             .unwrap();
 
         let persisted = Config::load(&config_path).unwrap();
+        assert!(persisted.never_cooldown);
         assert!(persisted.unlimited_concurrency);
         assert!(persisted.disable_failure_auto_recovery);
+        assert!(manager.get_never_cooldown());
         assert!(manager.get_unlimited_concurrency());
         assert!(manager.get_disable_failure_auto_recovery());
 
@@ -4541,7 +4590,7 @@ mod tests {
             .is_some());
 
         manager
-            .set_account_throttle_config(None, None, Some(true), None)
+            .set_account_throttle_config(None, None, None, Some(true), None)
             .unwrap();
         assert_eq!(manager.entries.lock()[0].rate_limit_count, 0);
         assert!(manager.entries.lock()[0].rate_limit_until.is_none());
@@ -4559,6 +4608,37 @@ mod tests {
         assert!(manager.snapshot().entries[0]
             .rate_limit_concurrency_limit
             .is_none());
+    }
+
+    #[test]
+    fn never_cooldown_clears_and_ignores_all_local_cooldowns() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![KiroCredentials::default()],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        manager.report_account_throttled(1, StdDuration::from_secs(300));
+        assert!(manager.entries.lock()[0].throttled_until.is_some());
+
+        manager
+            .set_account_throttle_config(None, None, Some(true), None, None)
+            .unwrap();
+        assert!(manager.entries.lock()[0].throttled_until.is_none());
+
+        let report = manager.report_rate_limited(1);
+        assert_eq!(report.cooldown_secs, 0);
+        assert_eq!(report.concurrency_limit, 0);
+        assert!(manager.entries.lock()[0].rate_limit_until.is_none());
+
+        assert_eq!(
+            manager.report_account_throttled(1, StdDuration::from_secs(300)),
+            1
+        );
+        assert!(manager.entries.lock()[0].throttled_until.is_none());
     }
 
     #[tokio::test]

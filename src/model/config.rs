@@ -157,9 +157,16 @@ pub struct Config {
     #[serde(default = "default_account_throttle_cooldown_secs")]
     pub account_throttle_cooldown_secs: u64,
 
+    /// 是否完全关闭本地冷却（默认 false）。
+    ///
+    /// 开启后，任何 429 都不会建立端点、账号级或普通软冷却；仍保留当前请求内的
+    /// 备用端点降级和有限重试。鉴权失败、账号封禁和手动禁用不受影响。
+    #[serde(default)]
+    pub never_cooldown: bool,
+
     /// 是否关闭普通 429 触发的动态并发收缩（默认 false）。
     ///
-    /// 开启后仍保留 429 软冷却和重试，但不会设置凭据级动态并发上限。
+    /// 开启后普通 429 不进入本地软冷却，也不会设置凭据级动态并发上限。
     #[serde(default)]
     pub unlimited_concurrency: bool,
 
@@ -339,6 +346,7 @@ impl Default for Config {
             load_balancing_mode: default_load_balancing_mode(),
             account_throttle_failover: default_account_throttle_failover(),
             account_throttle_cooldown_secs: default_account_throttle_cooldown_secs(),
+            never_cooldown: false,
             unlimited_concurrency: false,
             disable_failure_auto_recovery: false,
             cache_max_savings_ratio: default_cache_max_savings_ratio(),

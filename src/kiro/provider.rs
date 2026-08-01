@@ -278,6 +278,10 @@ impl KiroProvider {
         credential_id: u64,
         endpoint_name: &str,
     ) -> Option<Duration> {
+        if self.token_manager.get_never_cooldown() {
+            self.endpoint_cooldowns.lock().clear();
+            return None;
+        }
         let key = (credential_id, endpoint_name.to_string());
         let now = Instant::now();
         let mut cooldowns = self.endpoint_cooldowns.lock();
@@ -297,6 +301,14 @@ impl KiroProvider {
         endpoint_name: &str,
         cooldown: Duration,
     ) {
+        if self.token_manager.get_never_cooldown() {
+            tracing::warn!(
+                "凭据 #{} 端点 [{}] 命中 429，永远不冷却模式下不记录端点冷却",
+                credential_id,
+                endpoint_name
+            );
+            return;
+        }
         let key = (credential_id, endpoint_name.to_string());
         let until = Instant::now() + cooldown;
         let mut cooldowns = self.endpoint_cooldowns.lock();
@@ -881,7 +893,8 @@ impl KiroProvider {
                     endpoint_name,
                     Duration::from_secs(endpoint_cooldown_secs),
                 );
-                let account_throttled = self.token_manager.get_account_throttle_failover()
+                let account_throttled = !self.token_manager.get_never_cooldown()
+                    && self.token_manager.get_account_throttle_failover()
                     && endpoint.is_account_throttled(&body);
                 Self::emit_attempt(
                     sink,
@@ -1008,6 +1021,7 @@ impl KiroProvider {
             // 429 + suspicious activity = 账号级临时风控
             // 仅当前凭据被针对，故障转移到其它凭据可立即恢复（受配置开关控制）。
             if status.as_u16() == 429
+                && !self.token_manager.get_never_cooldown()
                 && self.token_manager.get_account_throttle_failover()
                 && endpoint.is_account_throttled(&body)
             {
@@ -1119,7 +1133,13 @@ impl KiroProvider {
                     ));
                 } else {
                     let report = self.token_manager.report_rate_limited(ctx.id);
-                    if report.concurrency_limit == 0 {
+                    if self.token_manager.get_never_cooldown() {
+                        tracing::warn!(
+                            "凭据 #{} 普通 429 已记录：永远不冷却模式，不进入任何本地冷却，剩余可调度账号 {}",
+                            ctx.id,
+                            report.remaining_available
+                        );
+                    } else if report.concurrency_limit == 0 {
                         tracing::warn!(
                             "凭据 #{} 普通 429 已记录：不限并发模式，不进入本地软冷却，剩余可调度账号 {}",
                             ctx.id,
@@ -1313,11 +1333,13 @@ mod rate_limit_tests {
     use super::*;
     use crate::kiro::endpoint::{IdeEndpoint, RuntimeEndpoint};
 
-    fn endpoint_cooldown_test_provider() -> (KiroProvider, KiroCredentials) {
+    fn endpoint_cooldown_test_provider_with_config(
+        config: crate::model::config::Config,
+    ) -> (KiroProvider, KiroCredentials) {
         let credentials = KiroCredentials::default();
         let token_manager = Arc::new(
             MultiTokenManager::new(
-                crate::model::config::Config::default(),
+                config,
                 vec![credentials.clone()],
                 None,
                 None,
@@ -1332,6 +1354,10 @@ mod rate_limit_tests {
             KiroProvider::with_proxy(token_manager, None, endpoints, "ide".to_string()),
             credentials,
         )
+    }
+
+    fn endpoint_cooldown_test_provider() -> (KiroProvider, KiroCredentials) {
+        endpoint_cooldown_test_provider_with_config(crate::model::config::Config::default())
     }
 
     #[test]
@@ -1358,6 +1384,23 @@ mod rate_limit_tests {
         };
 
         assert!(error.downcast_ref::<AllEndpointsCoolingError>().is_some());
+    }
+
+    #[test]
+    fn never_cooldown_ignores_and_clears_endpoint_cooldowns() {
+        let mut config = crate::model::config::Config::default();
+        config.never_cooldown = true;
+        let (provider, credentials) = endpoint_cooldown_test_provider_with_config(config);
+
+        provider.mark_endpoint_rate_limited(1, "ide", Duration::from_secs(300));
+        provider.mark_endpoint_rate_limited(1, "runtime", Duration::from_secs(300));
+
+        let selected = provider
+            .endpoint_for_api_request(1, &credentials)
+            .expect("永远不冷却模式应继续使用首选端点");
+
+        assert_eq!(selected.name(), "ide");
+        assert!(provider.endpoint_cooldowns.lock().is_empty());
     }
 
     #[test]

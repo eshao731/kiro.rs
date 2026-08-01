@@ -445,6 +445,7 @@ export async function setLoadBalancingMode(mode: LoadBalancingMode): Promise<{ m
 export interface AccountThrottleConfig {
   failover: boolean
   cooldownSecs: number
+  neverCooldown: boolean
   unlimitedConcurrency: boolean
   disableFailureAutoRecovery: boolean
 }

@@ -1891,6 +1891,7 @@ impl AdminService {
         AccountThrottleConfigResponse {
             failover: self.token_manager.get_account_throttle_failover(),
             cooldown_secs: self.token_manager.get_account_throttle_cooldown_secs(),
+            never_cooldown: self.token_manager.get_never_cooldown(),
             unlimited_concurrency: self.token_manager.get_unlimited_concurrency(),
             disable_failure_auto_recovery: self
                 .token_manager
@@ -1905,6 +1906,7 @@ impl AdminService {
     ) -> Result<AccountThrottleConfigResponse, AdminServiceError> {
         if req.failover.is_none()
             && req.cooldown_secs.is_none()
+            && req.never_cooldown.is_none()
             && req.unlimited_concurrency.is_none()
             && req.disable_failure_auto_recovery.is_none()
         {
@@ -1917,6 +1919,7 @@ impl AdminService {
             .set_account_throttle_config(
                 req.failover,
                 req.cooldown_secs,
+                req.never_cooldown,
                 req.unlimited_concurrency,
                 req.disable_failure_auto_recovery,
             )
