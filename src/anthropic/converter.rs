@@ -1495,17 +1495,19 @@ fn map_tool_input_from_kiro(kiro_name: &str, input: serde_json::Value) -> serde_
     serde_json::Value::Object(out)
 }
 
-/// 入站还原工具名 + 入参给客户端。名字从 `tool_name_map`（kiro名→客户端名）还原；
-/// 入参按 kiro_name 反向重写（对非内置 / 长名缩短是 no-op）。
+/// 入站还原工具名 + 入参给客户端。
+///
+/// 只有 `tool_name_map` 明确记录了本次请求发生过工具映射时，才反向重写入参。
+/// 客户端原本就声明为 Kiro 内置名（如 `read_file`）时，map 中没有对应条目，
+/// 必须原样返回，避免把其合法的 `path` 误改成 Claude Code `Read.file_path`。
 pub fn restore_tool_use_for_client(
     kiro_name: &str,
     input: serde_json::Value,
     tool_name_map: &HashMap<String, String>,
 ) -> (String, serde_json::Value) {
-    let client_name = tool_name_map
-        .get(kiro_name)
-        .cloned()
-        .unwrap_or_else(|| kiro_name.to_string());
+    let Some(client_name) = tool_name_map.get(kiro_name).cloned() else {
+        return (kiro_name.to_string(), input);
+    };
     let client_input = map_tool_input_from_kiro(kiro_name, input);
     (client_name, client_input)
 }
@@ -2712,6 +2714,46 @@ mod tests {
     }
 
     #[test]
+    fn cc_client_named_read_file_keeps_client_schema() {
+        let mut tool = cc_tool("read_file");
+        tool.input_schema.insert(
+            "properties".to_string(),
+            serde_json::json!({
+                "path": {"type": "string"}
+            }),
+        );
+        tool.input_schema
+            .insert("required".to_string(), serde_json::json!(["path"]));
+
+        let mut map = HashMap::new();
+        let out = convert_tools(
+            &Some(vec![tool]),
+            &mut map,
+            ToolCompatibilityMode::ClaudeCode,
+        )
+        .unwrap();
+
+        assert!(map.is_empty(), "客户端原生 read_file 不应记录 Claude Code 映射");
+        assert_eq!(out[0].tool_specification.name, "read_file");
+        assert_eq!(
+            out[0].tool_specification.input_schema.json["required"],
+            serde_json::json!(["path"])
+        );
+        assert!(
+            out[0].tool_specification.input_schema.json["properties"]
+                .get("path")
+                .is_some(),
+            "客户端 schema 的 path 字段必须保留"
+        );
+        assert!(
+            out[0].tool_specification.input_schema.json["properties"]
+                .get("file_path")
+                .is_none(),
+            "不得注入 Claude Code Read.file_path"
+        );
+    }
+
+    #[test]
     fn cc_raw_mode_keeps_client_tool_names() {
         let mut map = HashMap::new();
         let out = convert_tools(
@@ -2791,6 +2833,17 @@ mod tests {
         assert_eq!(restored["file_path"], serde_json::json!("/a"));
         assert_eq!(restored["offset"], serde_json::json!(10));
         assert_eq!(restored["limit"], serde_json::json!(5)); // 14 - 10 + 1
+    }
+
+    #[test]
+    fn cc_client_named_read_file_response_input_passthrough() {
+        let map = HashMap::new();
+        let input = serde_json::json!({"path": "/tmp/fishing_game/engine.py"});
+        let (name, restored) = restore_tool_use_for_client("read_file", input.clone(), &map);
+
+        assert_eq!(name, "read_file");
+        assert_eq!(restored, input, "未发生 Read 映射时必须保留 path");
+        assert!(restored.get("file_path").is_none());
     }
 
     /// 优化点回归：入站还原以 **Kiro 名** 匹配，故 Raw 模式下客户端自带、恰好叫

@@ -1664,7 +1664,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                         resetAllSuccess.isPending ? "animate-spin" : ""
                       }
                     />
-                    重置成功次数
+                    重置真实成功次数
                   </DropdownMenuItem>
                   <DropdownMenuItem
                     disabled={

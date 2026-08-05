@@ -927,8 +927,13 @@ struct CredentialEntry {
     disabled: bool,
     /// 禁用原因（用于区分手动禁用 vs 自动禁用，便于自愈）
     disabled_reason: Option<DisabledReason>,
-    /// API 调用成功次数
+    /// API 实际调用成功次数（供 Admin UI 展示）
     success_count: u64,
+    /// 负载均衡调度计数。
+    ///
+    /// 与展示用的 `success_count` 分离：动态新增凭据可从同组最低基线开始参与
+    /// balanced 调度，但 UI 仍从 0 显示该凭据实际发生的成功调用数。
+    load_balance_count: u64,
     /// 最后一次 API 调用时间（RFC3339 格式）
     last_used_at: Option<String>,
     /// 凭据首次进入当前系统的时间（RFC3339 格式）
@@ -975,6 +980,9 @@ enum DisabledReason {
 #[derive(Serialize, Deserialize)]
 struct StatsEntry {
     success_count: u64,
+    /// 旧统计文件没有该字段；缺失时用 success_count 作为调度基线平滑迁移。
+    #[serde(default)]
+    load_balance_count: Option<u64>,
     #[serde(default)]
     total_failure_count: u64,
     last_used_at: Option<String>,
@@ -1018,7 +1026,7 @@ pub struct CredentialEntrySnapshot {
     pub masked_api_key: Option<String>,
     /// 用户邮箱（用于前端显示）
     pub email: Option<String>,
-    /// API 调用成功次数
+    /// API 实际调用成功次数（供 Admin UI 展示）
     pub success_count: u64,
     /// 最后一次 API 调用时间（RFC3339 格式）
     pub last_used_at: Option<String>,
@@ -1311,6 +1319,7 @@ impl MultiTokenManager {
                         None
                     },
                     success_count: 0,
+                    load_balance_count: 0,
                     last_used_at: None,
                     created_at: created_at.clone(),
                     disabled_at: None,
@@ -1533,11 +1542,13 @@ impl MultiTokenManager {
 
         match mode {
             "balanced" => {
-                // Least-Used 策略：选择成功次数最少的凭据
+                // Least-Used 策略：选择调度计数最少的凭据。
+                // 调度计数与 UI 展示的真实成功次数分离，避免新增凭据继承基线后
+                // 在界面上显示并未实际发生的成功调用。
                 // 平局时按优先级排序（数字越小优先级越高）
                 let entry = available
                     .iter()
-                    .min_by_key(|e| (e.success_count, e.credentials.priority))?;
+                    .min_by_key(|e| (e.load_balance_count, e.credentials.priority))?;
 
                 Some((entry.id, entry.credentials.clone()))
             }
@@ -1545,7 +1556,9 @@ impl MultiTokenManager {
                 // Least-Connections 策略：选择当前在途请求数最少的凭据。
                 let entry = available
                     .iter()
-                    .min_by_key(|e| (e.in_flight, e.credentials.priority, e.success_count))?;
+                    .min_by_key(|e| {
+                        (e.in_flight, e.credentials.priority, e.load_balance_count)
+                    })?;
 
                 Some((entry.id, entry.credentials.clone()))
             }
@@ -2052,6 +2065,7 @@ impl MultiTokenManager {
         for entry in entries.iter_mut() {
             if let Some(s) = stats.get(&entry.id.to_string()) {
                 entry.success_count = s.success_count;
+                entry.load_balance_count = s.load_balance_count.unwrap_or(s.success_count);
                 entry.total_failure_count = s.total_failure_count;
                 entry.last_used_at = s.last_used_at.clone();
                 if let Some(created_at) = &s.created_at {
@@ -2081,6 +2095,7 @@ impl MultiTokenManager {
                         e.id.to_string(),
                         StatsEntry {
                             success_count: e.success_count,
+                            load_balance_count: Some(e.load_balance_count),
                             total_failure_count: e.total_failure_count,
                             last_used_at: e.last_used_at.clone(),
                             created_at: Some(e.created_at.clone()),
@@ -2149,7 +2164,8 @@ impl MultiTokenManager {
             if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
                 entry.failure_count = 0;
                 entry.refresh_failure_count = 0;
-                entry.success_count += 1;
+                entry.success_count = entry.success_count.saturating_add(1);
+                entry.load_balance_count = entry.load_balance_count.saturating_add(1);
                 entry.last_used_at = Some(Utc::now().to_rfc3339());
                 // 成功 = 风控已解除，提前结束冷却
                 entry.throttled_until = None;
@@ -2938,6 +2954,7 @@ impl MultiTokenManager {
         Ok(())
     }
 
+    /// 重置 UI 展示的真实成功次数，不改变负载均衡调度基线。
     pub fn reset_success_count(&self, id: Option<u64>) -> anyhow::Result<u32> {
         let mut count = 0u32;
         {
@@ -3527,7 +3544,7 @@ impl MultiTokenManager {
                 }
             }
             let new_groups = &validated_cred.groups;
-            let baseline_success = entries
+            let load_balance_baseline = entries
                 .iter()
                 .filter(|e| {
                     if e.disabled {
@@ -3540,7 +3557,7 @@ impl MultiTokenManager {
                             .iter()
                             .any(|g| new_groups.contains(g))
                 })
-                .map(|e| e.success_count)
+                .map(|e| e.load_balance_count)
                 .min()
                 .unwrap_or(0);
 
@@ -3552,7 +3569,8 @@ impl MultiTokenManager {
                 refresh_failure_count: 0,
                 disabled: false,
                 disabled_reason: None,
-                success_count: baseline_success,
+                success_count: 0,
+                load_balance_count: load_balance_baseline,
                 last_used_at: None,
                 created_at: Utc::now().to_rfc3339(),
                 disabled_at: None,
@@ -4210,6 +4228,61 @@ mod tests {
         assert!(id > 0);
         assert_eq!(manager.total_count(), 1);
         assert_eq!(manager.available_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_added_credential_keeps_real_success_count_separate_from_balance_baseline() {
+        let mut existing = KiroCredentials::default();
+        existing.kiro_api_key = Some("ksk_existing_balance_baseline".to_string());
+        existing.auth_method = Some("api_key".to_string());
+
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![existing],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        for _ in 0..5 {
+            manager.report_success(1);
+        }
+
+        let mut added = KiroCredentials::default();
+        added.kiro_api_key = Some("ksk_new_balance_baseline".to_string());
+        added.auth_method = Some("api_key".to_string());
+        let new_id = manager.add_credential(added).await.unwrap();
+
+        {
+            let entries = manager.entries.lock();
+            let entry = entries.iter().find(|entry| entry.id == new_id).unwrap();
+            assert_eq!(entry.success_count, 0, "新增凭据的真实成功次数必须从 0 开始");
+            assert_eq!(
+                entry.load_balance_count, 5,
+                "新增凭据仍应继承同组最低调度基线，避免独占流量"
+            );
+        }
+        let snapshot = manager.snapshot();
+        assert_eq!(
+            snapshot
+                .entries
+                .iter()
+                .find(|entry| entry.id == new_id)
+                .unwrap()
+                .success_count,
+            0,
+            "Admin UI 快照必须展示真实成功次数"
+        );
+
+        manager.report_success(new_id);
+        manager.reset_success_count(Some(new_id)).unwrap();
+        let entries = manager.entries.lock();
+        let entry = entries.iter().find(|entry| entry.id == new_id).unwrap();
+        assert_eq!(entry.success_count, 0, "重置只清空 UI 展示计数");
+        assert_eq!(
+            entry.load_balance_count, 6,
+            "重置真实成功次数不得扰乱负载均衡调度基线"
+        );
     }
 
     #[tokio::test]
@@ -5515,11 +5588,11 @@ mod tests {
         )
         .unwrap();
 
-        // 让 A(id1) 成功若干次 → balanced 应转向 success_count 更小的 B(id2)
+        // 让 A(id1) 成功若干次 → balanced 应转向调度计数更小的 B(id2)
         manager.report_success(1);
         manager.report_success(1);
         let pick = manager.select_next_credential(None, Some("g1"));
-        assert_eq!(pick.map(|(id, _)| id), Some(2), "balanced 应在 g1 内选 success_count 最小的 B");
+        assert_eq!(pick.map(|(id, _)| id), Some(2), "balanced 应在 g1 内选调度计数最小的 B");
         // g2 不受 g1 计数影响，仍只会选到 C(id3)
         let pick_g2 = manager.select_next_credential(None, Some("g2"));
         assert_eq!(pick_g2.map(|(id, _)| id), Some(3));

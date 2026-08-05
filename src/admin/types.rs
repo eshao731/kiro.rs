@@ -52,7 +52,7 @@ pub struct CredentialStatusItem {
     pub masked_api_key: Option<String>,
     /// 用户邮箱（用于前端显示）
     pub email: Option<String>,
-    /// API 调用成功次数
+    /// API 实际调用成功次数（不包含负载均衡初始化基线）
     pub success_count: u64,
     /// 最后一次 API 调用时间（RFC3339 格式）
     pub last_used_at: Option<String>,

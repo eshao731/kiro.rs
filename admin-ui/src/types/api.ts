@@ -23,6 +23,7 @@ export interface CredentialStatusItem {
   refreshTokenHash?: string
   apiKeyHash?: string
   maskedApiKey?: string
+  /** 该凭据实际完成的成功调用数；不包含负载均衡初始化基线 */
   successCount: number
   lastUsedAt: string | null
   /** 凭据首次进入当前系统的时间（RFC3339） */

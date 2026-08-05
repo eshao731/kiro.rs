@@ -768,7 +768,7 @@ export function CredentialCard({
             type="button"
             onClick={handleResetSuccess}
             className="mt-0.5 inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-sm font-medium tabular-nums transition-colors hover:bg-accent hover:text-primary"
-            title="点击重置成功次数"
+            title="真实成功次数；点击重置不影响负载均衡"
           >
             {credential.successCount}
             <RotateCcw className="h-3 w-3 opacity-70" />
@@ -1016,13 +1016,13 @@ export function CredentialCard({
               </dd>
             </div>
             <div className="flex min-w-0 items-center justify-between gap-2">
-              <dt className="shrink-0 text-muted-foreground">成功次数</dt>
+              <dt className="shrink-0 text-muted-foreground">真实成功次数</dt>
               <dd className="min-w-0">
                 <button
                   type="button"
                   onClick={handleResetSuccess}
                   className="inline-flex cursor-pointer items-center gap-1 rounded px-1.5 py-0.5 font-medium tabular-nums transition-colors hover:bg-accent hover:text-primary"
-                  title="点击重置成功次数"
+                  title="点击重置真实成功次数，不影响负载均衡"
                 >
                   {credential.successCount}
                   <RotateCcw className="h-3 w-3 opacity-70" />

@@ -392,11 +392,11 @@ pub async fn force_refresh_token(
 }
 
 /// POST /api/admin/credentials/reset-stats
-/// 重置所有凭据的 success_count
+/// 重置所有凭据的真实 success_count，不影响负载均衡调度计数
 pub async fn reset_all_success_count(State(state): State<AdminState>) -> impl IntoResponse {
     match state.service.reset_success_count(None) {
         Ok(count) => Json(SuccessResponse::new(format!(
-            "已重置 {} 个凭据的 success_count",
+            "已重置 {} 个凭据的真实成功次数（不影响负载均衡）",
             count
         )))
         .into_response(),
@@ -405,14 +405,14 @@ pub async fn reset_all_success_count(State(state): State<AdminState>) -> impl In
 }
 
 /// POST /api/admin/credentials/:id/reset-stats
-/// 重置指定凭据的 success_count
+/// 重置指定凭据的真实 success_count，不影响负载均衡调度计数
 pub async fn reset_success_count(
     State(state): State<AdminState>,
     Path(id): Path<u64>,
 ) -> impl IntoResponse {
     match state.service.reset_success_count(Some(id)) {
         Ok(_) => Json(SuccessResponse::new(format!(
-            "凭据 #{} success_count 已重置",
+            "凭据 #{} 的真实成功次数已重置（不影响负载均衡）",
             id
         )))
         .into_response(),
