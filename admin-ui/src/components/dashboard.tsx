@@ -692,30 +692,35 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
 
     setBatchDeleting(true);
     setDeleteProgress({ current: 0, total: ids.length });
-    let s = 0,
-      f = 0;
-    for (let i = 0; i < ids.length; i++) {
-      const id = ids[i];
-      try {
-        await new Promise<void>((resolve, reject) => {
-          deleteCredential(id, {
-            onSuccess: () => {
-              s++;
-              resolve();
-            },
-            onError: (err) => {
-              f++;
-              reject(err);
-            },
+    let s = 0;
+    const failedIds = new Set<number>();
+    try {
+      for (let i = 0; i < ids.length; i++) {
+        const id = ids[i];
+        try {
+          await new Promise<void>((resolve, reject) => {
+            deleteCredential(id, {
+              onSuccess: () => {
+                s++;
+                resolve();
+              },
+              onError: (err) => {
+                reject(err);
+              },
+            });
           });
-        });
-      } catch {}
-      setDeleteProgress({ current: i + 1, total: ids.length });
+        } catch {
+          failedIds.add(id);
+        }
+        setDeleteProgress({ current: i + 1, total: ids.length });
+      }
+    } finally {
+      setBatchDeleting(false);
     }
-    setBatchDeleting(false);
+    const f = failedIds.size;
     if (f === 0) toast.success(`成功删除 ${s} 个凭据`);
     else toast.warning(`删除凭据：成功 ${s} 个，失败 ${f} 个`);
-    deselectAll();
+    setSelectedIds(failedIds);
   };
 
   const handleBatchResetFailure = async () => {

@@ -1910,7 +1910,7 @@ impl MultiTokenManager {
         self.entries
             .lock()
             .iter()
-            .filter(|e| schedulable(e, now, None, None))
+            .filter(|e| self.entry_available_for_request(e, None, None, now))
             .count()
     }
 
@@ -1986,21 +1986,86 @@ impl MultiTokenManager {
         fresh as u32 >= limit
     }
 
-    /// 记录一次凭据被选中发起请求：先剔除窗口外的旧时间戳，再压入当前时间。
+    /// 当所有其它条件均满足的候选都耗尽 RPM 额度时，返回最早可重试秒数。
+    fn rpm_retry_after_secs(
+        &self,
+        entries: &[CredentialEntry],
+        model: Option<&str>,
+        group: Option<&str>,
+        now: Instant,
+    ) -> Option<u64> {
+        if !self.account_rpm_limit_enabled.load(Ordering::Relaxed) {
+            return None;
+        }
+        let limit = self.account_rpm_limit.load(Ordering::Relaxed) as usize;
+        if limit == 0 {
+            return None;
+        }
+
+        let window = StdDuration::from_secs(RPM_WINDOW_SECS);
+        let mut earliest_retry_after = None;
+
+        for entry in entries.iter().filter(|entry| {
+            schedulable(entry, now, model, group)
+                && self.cached_model_support(entry.id, model) != CachedModelSupport::Unsupported
+        }) {
+            let fresh_count = entry
+                .rpm_window
+                .iter()
+                .filter(|&&ts| now.duration_since(ts) < window)
+                .count();
+            if fresh_count < limit {
+                return None;
+            }
+
+            // 窗口可能因运行时下调 limit 而暂时多于上限；需要等到
+            // fresh_count - limit + 1 个时间戳过期后才重新有额度。
+            let release_index = fresh_count - limit;
+            let release_at = entry
+                .rpm_window
+                .iter()
+                .filter(|&&ts| now.duration_since(ts) < window)
+                .nth(release_index)
+                .copied()
+                .expect("fresh_count 与窗口迭代结果应一致")
+                + window;
+            let remaining = release_at.saturating_duration_since(now);
+            let retry_after = remaining
+                .as_secs()
+                .saturating_add(u64::from(remaining.subsec_nanos() > 0))
+                .max(1);
+            earliest_retry_after = Some(
+                earliest_retry_after
+                    .map(|current: u64| current.min(retry_after))
+                    .unwrap_or(retry_after),
+            );
+        }
+
+        earliest_retry_after
+    }
+
+    /// 尝试为一次真实业务请求预留 RPM 额度。
     ///
-    /// 限流未开启时清空窗口并直接返回，避免关闭期间残留计数在重新开启后误判。
-    fn record_request(&self, id: u64) {
+    /// 在同一把 `entries` 锁内完成过期清理、上限检查和记账，避免多个并发请求
+    /// 在选择阶段同时通过检查后全部写入窗口。返回 `false` 表示额度已被其它请求
+    /// 抢先占用，调用方应重新选择凭据。
+    fn record_request(&self, id: u64) -> bool {
         let now = Instant::now();
         let window = StdDuration::from_secs(RPM_WINDOW_SECS);
         let mut entries = self.entries.lock();
         let Some(entry) = entries.iter_mut().find(|e| e.id == id) else {
-            return;
+            return false;
         };
         if !self.account_rpm_limit_enabled.load(Ordering::Relaxed) {
             if !entry.rpm_window.is_empty() {
                 entry.rpm_window.clear();
             }
-            return;
+            return true;
+        }
+        let limit = self.account_rpm_limit.load(Ordering::Relaxed);
+        if limit == 0 {
+            entry.rpm_window.clear();
+            return true;
         }
         while let Some(&front) = entry.rpm_window.front() {
             if now.duration_since(front) >= window {
@@ -2009,7 +2074,11 @@ impl MultiTokenManager {
                 break;
             }
         }
+        if entry.rpm_window.len() >= limit as usize {
+            return false;
+        }
         entry.rpm_window.push_back(now);
+        true
     }
 
     fn has_available_for_request(
@@ -2211,6 +2280,13 @@ impl MultiTokenManager {
                             .into());
                         }
                         let entries = self.entries.lock();
+                        if let Some(retry_after) =
+                            self.rpm_retry_after_secs(&entries, model, group, Instant::now())
+                        {
+                            return Err(
+                                UpstreamRateLimitError::new(Some(retry_after.to_string())).into()
+                            );
+                        }
                         // 注意：必须在 bail! 之前计算 available_count，
                         // 因为 available_count() 会尝试获取 entries 锁，
                         // 而此时我们已经持有该锁，会导致死锁
@@ -2226,10 +2302,12 @@ impl MultiTokenManager {
             match self.try_ensure_token(id, &credentials).await {
                 Ok(ctx) => {
                     if update_current {
+                        // Token 获取期间 RPM 额度可能被其它并发请求抢先占用；重新选号。
+                        if !self.record_request(id) {
+                            continue;
+                        }
                         // 仅在最终把凭据交给真实调用方时 +1（least_conn 在途计数）。
                         self.inc_in_flight(ctx.id);
-                        // Admin 只读模型发现不消耗 RPM；真实业务请求才计入滑动窗口。
-                        self.record_request(id);
                     }
                     return Ok((ctx, is_balanced));
                 }
@@ -5264,6 +5342,35 @@ mod tests {
         mgr.record_request(1);
         let entries = mgr.entries.lock();
         assert_eq!(entries[0].rpm_window.len(), 1);
+    }
+
+    #[test]
+    fn rpm_record_never_reserves_beyond_limit() {
+        let mgr = rpm_test_manager(true, 2);
+
+        // 多个请求可能在任一请求记账前都已通过选择阶段。最终记账必须再次校验
+        // 上限，确保这些并发预选请求中最多只有 limit 个获得额度。
+        for _ in 0..8 {
+            mgr.record_request(1);
+        }
+
+        let entries = mgr.entries.lock();
+        assert_eq!(entries[0].rpm_window.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn rpm_exhaustion_returns_typed_rate_limit_error() {
+        let mgr = rpm_test_manager(true, 1);
+        mgr.record_request(1);
+
+        let error = match mgr.acquire_context(None, None).await {
+            Ok(_) => panic!("RPM 已耗尽时不应返回调用上下文"),
+            Err(error) => error,
+        };
+        let rate_limit = error
+            .downcast_ref::<UpstreamRateLimitError>()
+            .expect("RPM 已耗尽应返回类型化限流错误，以便 HTTP 层映射为 429");
+        assert!(rate_limit.retry_after().is_some());
     }
 
     #[test]
