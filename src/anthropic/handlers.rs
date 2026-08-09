@@ -1543,7 +1543,7 @@ async fn handle_non_stream_request(
             credits: if credits.is_finite() && credits > 0.0 { credits } else { 0.0 },
         },
     );
-    (StatusCode::OK, Json(response_body)).into_response()
+    return (StatusCode::OK, Json(response_body)).into_response();
     }
 
     unreachable!("non-stream tool JSON retry loop must return a response")
