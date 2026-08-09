@@ -780,6 +780,10 @@ pub async fn post_messages(
                 ConversionError::EmptyMessages => {
                     ("invalid_request_error", "消息列表为空".to_string())
                 }
+                ConversionError::EmptyCurrentMessage => (
+                    "invalid_request_error",
+                    "最后一条用户消息没有文本、图片或工具结果".to_string(),
+                ),
                 ConversionError::UnsupportedToolMapping(reason) => {
                     ("invalid_request_error", format!("工具映射不支持: {}", reason))
                 }
@@ -840,6 +844,11 @@ pub async fn post_messages(
 
     let tool_name_map = conversion_result.tool_name_map;
     let known_tool_names = conversion_result.known_tool_names;
+    let has_tools = payload
+        .tools
+        .as_ref()
+        .map(|tools| !tools.is_empty())
+        .unwrap_or(false);
 
     // CacheMeter：根据 cache_control 断点查 / 写中转层提示词缓存。
     // 返回 estimate 口径的覆盖量；真实 input/cache 互斥分摊在拿到 total 真值时进行。
@@ -859,21 +868,39 @@ pub async fn post_messages(
                 is_stream: true,
             },
         ));
-        handle_stream_request(
-            provider,
-            &request_body,
-            &payload.model,
-            total_input_tokens,
-            thinking_enabled,
-            tool_name_map,
-            known_tool_names,
-            hook,
-            cache_usage,
-            tracer,
-            key_ctx.group.clone(),
-            traffic_guard,
-        )
-        .await
+        if has_tools {
+            handle_stream_request_buffered(
+                provider,
+                &request_body,
+                &payload.model,
+                thinking_enabled,
+                tool_name_map,
+                known_tool_names,
+                hook,
+                total_input_tokens,
+                cache_usage,
+                tracer,
+                key_ctx.group.clone(),
+                traffic_guard,
+            )
+            .await
+        } else {
+            handle_stream_request(
+                provider,
+                &request_body,
+                &payload.model,
+                total_input_tokens,
+                thinking_enabled,
+                tool_name_map,
+                known_tool_names,
+                hook,
+                cache_usage,
+                tracer,
+                key_ctx.group.clone(),
+                traffic_guard,
+            )
+            .await
+        }
     } else {
         // 非流式响应：仅在配置开启时提取 thinking 块
         let extract_thinking = state.extract_thinking && thinking_enabled;
@@ -961,6 +988,7 @@ async fn handle_stream_request(
 
 /// Ping 事件间隔（25秒）
 const PING_INTERVAL_SECS: u64 = 25;
+const TOOL_JSON_INCOMPLETE_MAX_RETRIES: usize = 1;
 
 /// 创建 ping 事件的 SSE 字符串
 fn create_ping_sse() -> Bytes {
@@ -1005,19 +1033,36 @@ fn create_sse_stream(
                             // 解码事件
                             if let Err(e) = decoder.feed(&chunk) {
                                 tracing::warn!("缓冲区溢出: {}", e);
+                                ctx.record_upstream_error(
+                                    "upstream_event_decode_error",
+                                    format!("Failed to decode Kiro event stream: {e}"),
+                                );
                             }
 
                             let mut events = Vec::new();
                             for result in decoder.decode_iter() {
                                 match result {
                                     Ok(frame) => {
-                                        if let Ok(event) = Event::from_frame(frame) {
-                                            let sse_events = ctx.process_kiro_event(&event);
-                                            events.extend(sse_events);
+                                        match Event::from_frame(frame) {
+                                            Ok(event) => {
+                                                let sse_events = ctx.process_kiro_event(&event);
+                                                events.extend(sse_events);
+                                            }
+                                            Err(e) => {
+                                                tracing::warn!("解析 Kiro 事件失败: {}", e);
+                                                ctx.record_upstream_error(
+                                                    "upstream_event_parse_error",
+                                                    format!("Failed to parse Kiro event: {e}"),
+                                                );
+                                            }
                                         }
                                     }
                                     Err(e) => {
                                         tracing::warn!("解码事件失败: {}", e);
+                                        ctx.record_upstream_error(
+                                            "upstream_event_decode_error",
+                                            format!("Failed to decode Kiro event: {e}"),
+                                        );
                                     }
                                 }
                             }
@@ -1033,6 +1078,10 @@ fn create_sse_stream(
                         Some(Err(e)) => {
                             tracing::error!("读取响应流失败: {}", e);
                             // 发送最终事件并结束（记为 error）
+                            ctx.record_upstream_error(
+                                "upstream_stream_error",
+                                format!("Kiro response stream failed: {e}"),
+                            );
                             let final_events = ctx.generate_final_events();
                             record_stream_usage(&hook, &ctx, credential_id, "error");
                             // 已开始返回内容后上游断流：标记为 interrupted，带已发送字节数
@@ -1053,9 +1102,9 @@ fn create_sse_stream(
                             // 流结束，发送最终事件（generate_final_events 内部会 finish()
                             // 累积器，据此判定是否有半截 / 非法工具调用 JSON）。
                             let final_events = ctx.generate_final_events();
-                            if let Some(message) = ctx.tool_json_error_message() {
-                                // 工具调用 JSON 半截 / 非法：实时流已回 200，无法改状态码，
-                                // 只能记 error 并让 generate_final_events 补发的 `error` 事件透传给客户端。
+                            if let Some(message) = ctx.response_error_message() {
+                                // 实时流已回 200，无法改状态码；通过 Anthropic error 事件
+                                // 明确暴露上游语义错误或空响应。
                                 record_stream_usage(&hook, &ctx, credential_id, "error");
                                 tracer.finalize(
                                     "error",
@@ -1147,6 +1196,7 @@ async fn handle_non_stream_request(
     group: Option<String>,
     _traffic_guard: TrafficRequestGuard,
 ) -> Response {
+    for tool_json_retry in 0..=TOOL_JSON_INCOMPLETE_MAX_RETRIES {
     // 调用 Kiro API（支持多凭据故障转移）
     let call_result = match provider.call_api(request_body, Some(tracer.as_ref()), group.as_deref()).await {
         Ok(resp) => resp,
@@ -1206,14 +1256,18 @@ async fn handle_non_stream_request(
     // 半截 / 非法 JSON 显式暴露为错误（返回 502），不再静默回退 {} 或丢弃。
     let mut tool_accumulator = super::stream::ToolJsonAccumulator::new();
     let mut tool_json_error: Option<super::stream::ToolJsonAccumulatorError> = None;
+    let mut upstream_error: Option<(&'static str, String)> = None;
 
     for result in decoder.decode_iter() {
         match result {
             Ok(frame) => {
-                if let Ok(event) = Event::from_frame(frame) {
-                    match event {
+                match Event::from_frame(frame) {
+                    Ok(event) => match event {
                         Event::AssistantResponse(resp) => {
                             text_content.push_str(&resp.content);
+                        }
+                        Event::Code(code) => {
+                            text_content.push_str(&code.content);
                         }
                         Event::ReasoningContent(reasoning) => {
                             if let Some(text) = reasoning.text
@@ -1267,17 +1321,76 @@ async fn handle_non_stream_request(
                             credits += metering.usage;
                             tracing::debug!("metering credits +{:.6}", metering.usage);
                         }
-                        Event::Exception { exception_type, .. } => {
+                        Event::InvalidState(invalid) => {
+                            upstream_error.get_or_insert_with(|| {
+                                (
+                                    "upstream_invalid_state",
+                                    format!(
+                                        "Kiro upstream rejected the conversation state ({}): {}",
+                                        invalid.reason, invalid.message
+                                    ),
+                                )
+                            });
+                        }
+                        Event::Error {
+                            error_code,
+                            error_message,
+                        } => {
+                            upstream_error.get_or_insert_with(|| {
+                                (
+                                    "upstream_error",
+                                    format!(
+                                        "Kiro upstream error {error_code}: {error_message}"
+                                    ),
+                                )
+                            });
+                        }
+                        Event::Exception {
+                            exception_type,
+                            message,
+                        } => {
                             if exception_type == "ContentLengthExceededException" {
                                 stop_reason = "max_tokens".to_string();
                             }
+                            upstream_error.get_or_insert_with(|| {
+                                (
+                                    "upstream_exception",
+                                    format!(
+                                        "Kiro upstream exception {exception_type}: {message}"
+                                    ),
+                                )
+                            });
                         }
-                        _ => {}
+                        Event::Unknown {
+                            event_type,
+                            payload,
+                        } => {
+                            tracing::warn!(
+                                event_type = %event_type,
+                                payload_bytes = payload.len(),
+                                "忽略尚未支持的 Kiro 事件"
+                            );
+                        }
+                    },
+                    Err(e) => {
+                        tracing::warn!("解析 Kiro 事件失败: {}", e);
+                        upstream_error.get_or_insert_with(|| {
+                            (
+                                "upstream_event_parse_error",
+                                format!("Failed to parse Kiro event: {e}"),
+                            )
+                        });
                     }
                 }
             }
             Err(e) => {
                 tracing::warn!("解码事件失败: {}", e);
+                upstream_error.get_or_insert_with(|| {
+                    (
+                        "upstream_event_decode_error",
+                        format!("Failed to decode Kiro event: {e}"),
+                    )
+                });
             }
         }
     }
@@ -1295,6 +1408,16 @@ async fn handle_non_stream_request(
     // 明确暴露上游问题，而不是把无法解析的参数当成完整调用返回。
     if let Some(err) = tool_json_error {
         let message = err.message();
+        if err.is_incomplete_json() && tool_json_retry < TOOL_JSON_INCOMPLETE_MAX_RETRIES {
+            tracing::warn!(
+                credential_id = credential_id,
+                retry = tool_json_retry + 1,
+                max_retries = TOOL_JSON_INCOMPLETE_MAX_RETRIES,
+                error = %message,
+                "retrying non-stream request after incomplete upstream tool_use JSON"
+            );
+            continue;
+        }
         hook.record(credential_id, input_tokens, 0, 0, 0, 0.0, "error");
         tracer.finalize(
             "error",
@@ -1306,6 +1429,22 @@ async fn handle_non_stream_request(
         return (
             StatusCode::BAD_GATEWAY,
             Json(ErrorResponse::new("upstream_tool_json_error", message)),
+        )
+            .into_response();
+    }
+
+    if let Some((error_type, message)) = upstream_error {
+        hook.record(credential_id, input_tokens, 0, 0, 0, 0.0, "error");
+        tracer.finalize(
+            "error",
+            Some(outcome::BAD_REQUEST),
+            Some(&message),
+            None,
+            TraceUsage::zero(),
+        );
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(ErrorResponse::new(error_type, message)),
         )
             .into_response();
     }
@@ -1327,6 +1466,34 @@ async fn handle_non_stream_request(
         native_redacted_thinking,
     );
     content.extend(tool_uses);
+
+    if content.is_empty() {
+        let message =
+            "Kiro upstream ended the response without assistant content, reasoning, or a tool call"
+                .to_string();
+        if tool_json_retry < TOOL_JSON_INCOMPLETE_MAX_RETRIES {
+            tracing::warn!(
+                credential_id = credential_id,
+                retry = tool_json_retry + 1,
+                max_retries = TOOL_JSON_INCOMPLETE_MAX_RETRIES,
+                "retrying non-stream request after empty upstream response"
+            );
+            continue;
+        }
+        hook.record(credential_id, input_tokens, 0, 0, 0, 0.0, "error");
+        tracer.finalize(
+            "error",
+            Some(outcome::BAD_REQUEST),
+            Some(&message),
+            None,
+            TraceUsage::zero(),
+        );
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(ErrorResponse::new("upstream_empty_response", message)),
+        )
+            .into_response();
+    }
 
     // 估算输出 tokens（上游不下发 token，全部走估算）
     let output_tokens = token::estimate_output_tokens(&content);
@@ -1377,6 +1544,9 @@ async fn handle_non_stream_request(
         },
     );
     (StatusCode::OK, Json(response_body)).into_response()
+    }
+
+    unreachable!("non-stream tool JSON retry loop must return a response")
 }
 
 fn build_non_stream_content(
@@ -1597,6 +1767,10 @@ pub async fn post_messages_cc(
                 ConversionError::EmptyMessages => {
                     ("invalid_request_error", "消息列表为空".to_string())
                 }
+                ConversionError::EmptyCurrentMessage => (
+                    "invalid_request_error",
+                    "最后一条用户消息没有文本、图片或工具结果".to_string(),
+                ),
                 ConversionError::UnsupportedToolMapping(reason) => {
                     ("invalid_request_error", format!("工具映射不支持: {}", reason))
                 }
@@ -1754,13 +1928,22 @@ async fn handle_stream_request_buffered(
         model,
         fallback_input_tokens,
         thinking_enabled,
-        tool_name_map,
-        known_tool_names,
+        tool_name_map.clone(),
+        known_tool_names.clone(),
     );
     ctx.set_cache_usage(cache_usage);
 
     // 创建缓冲 SSE 流
     let stream = create_buffered_sse_stream(
+        provider,
+        request_body.to_string(),
+        model.to_string(),
+        thinking_enabled,
+        tool_name_map,
+        known_tool_names,
+        fallback_input_tokens,
+        cache_usage,
+        group,
         response,
         ctx,
         hook,
@@ -1779,6 +1962,88 @@ async fn handle_stream_request_buffered(
         .unwrap()
 }
 
+type KiroByteStream = futures::stream::BoxStream<'static, Result<Bytes, reqwest::Error>>;
+
+struct BufferedSseState {
+    body_stream: KiroByteStream,
+    ctx: BufferedStreamContext,
+    decoder: EventStreamDecoder,
+    finished: bool,
+    ping_interval: tokio::time::Interval,
+    hook: UsageRecordHook,
+    credential_id: u64,
+    tracer: std::sync::Arc<RequestTracer>,
+    sent_bytes: u64,
+    _traffic_guard: TrafficRequestGuard,
+    provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
+    request_body: String,
+    model: String,
+    thinking_enabled: bool,
+    tool_name_map: std::collections::HashMap<String, String>,
+    known_tool_names: std::collections::HashSet<String>,
+    fallback_input_tokens: i32,
+    cache_usage: super::cache_metering::CacheUsage,
+    group: Option<String>,
+    upstream_response_retry: usize,
+}
+
+async fn retry_buffered_stream_after_upstream_failure(
+    state: &mut BufferedSseState,
+    message: &str,
+    reason: &str,
+) -> bool {
+    if state.upstream_response_retry >= TOOL_JSON_INCOMPLETE_MAX_RETRIES {
+        return false;
+    }
+
+    let provider = state.provider.clone();
+    let request_body = state.request_body.clone();
+    let group = state.group.clone();
+    let tracer = state.tracer.clone();
+    let retry = state.upstream_response_retry + 1;
+    tracing::warn!(
+        credential_id = state.credential_id,
+        retry = retry,
+        max_retries = TOOL_JSON_INCOMPLETE_MAX_RETRIES,
+        reason = %reason,
+        error = %message,
+        "retrying buffered stream after retryable upstream response failure"
+    );
+
+    match provider
+        .call_api_stream(&request_body, Some(tracer.as_ref()), group.as_deref())
+        .await
+    {
+        Ok(call_result) => {
+            let mut ctx = BufferedStreamContext::new(
+                &state.model,
+                state.fallback_input_tokens,
+                state.thinking_enabled,
+                state.tool_name_map.clone(),
+                state.known_tool_names.clone(),
+            );
+            ctx.set_cache_usage(state.cache_usage);
+
+            state.body_stream = call_result.response.bytes_stream().boxed();
+            state.ctx = ctx;
+            state.decoder = EventStreamDecoder::new();
+            state.finished = false;
+            state.credential_id = call_result.credential_id;
+            state.sent_bytes = 0;
+            state.upstream_response_retry = retry;
+            true
+        }
+        Err(e) => {
+            tracing::error!(
+                retry = retry,
+                error = %e,
+                "retry after upstream response failure failed before stream response"
+            );
+            false
+        }
+    }
+}
+
 /// 创建缓冲 SSE 事件流
 ///
 /// 工作流程：
@@ -1787,6 +2052,15 @@ async fn handle_stream_request_buffered(
 /// 3. 流结束后，用正确的 input_tokens 更正 message_start 事件
 /// 4. 一次性发送所有事件
 fn create_buffered_sse_stream(
+    provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
+    request_body: String,
+    model: String,
+    thinking_enabled: bool,
+    tool_name_map: std::collections::HashMap<String, String>,
+    known_tool_names: std::collections::HashSet<String>,
+    fallback_input_tokens: i32,
+    cache_usage: super::cache_metering::CacheUsage,
+    group: Option<String>,
     response: reqwest::Response,
     ctx: BufferedStreamContext,
     hook: UsageRecordHook,
@@ -1794,23 +2068,33 @@ fn create_buffered_sse_stream(
     tracer: std::sync::Arc<RequestTracer>,
     traffic_guard: TrafficRequestGuard,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
-    let body_stream = response.bytes_stream();
+    let state = BufferedSseState {
+        body_stream: response.bytes_stream().boxed(),
+        ctx,
+        decoder: EventStreamDecoder::new(),
+        finished: false,
+        ping_interval: interval(Duration::from_secs(PING_INTERVAL_SECS)),
+        hook,
+        credential_id,
+        tracer,
+        sent_bytes: 0,
+        _traffic_guard: traffic_guard,
+        provider,
+        request_body,
+        model,
+        thinking_enabled,
+        tool_name_map,
+        known_tool_names,
+        fallback_input_tokens,
+        cache_usage,
+        group,
+        upstream_response_retry: 0,
+    };
 
     stream::unfold(
-        (
-            body_stream,
-            ctx,
-            EventStreamDecoder::new(),
-            false,
-            interval(Duration::from_secs(PING_INTERVAL_SECS)),
-            hook,
-            credential_id,
-            tracer,
-            0u64,
-            traffic_guard,
-        ),
-        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, hook, credential_id, tracer, mut sent_bytes, traffic_guard)| async move {
-            if finished {
+        state,
+        |mut state| async move {
+            if state.finished {
                 return None;
             }
 
@@ -1821,33 +2105,50 @@ fn create_buffered_sse_stream(
                     biased;
 
                     // 优先检查 ping 保活（等待期间唯一发送的数据）
-                    _ = ping_interval.tick() => {
+                    _ = state.ping_interval.tick() => {
                         tracing::trace!("发送 ping 保活事件（缓冲模式）");
                         let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
-                        return Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, hook, credential_id, tracer, sent_bytes, traffic_guard)));
+                        return Some((stream::iter(bytes), state));
                     }
 
                     // 然后处理数据流
-                    chunk_result = body_stream.next() => {
+                    chunk_result = state.body_stream.next() => {
                         match chunk_result {
                             Some(Ok(chunk)) => {
-                                tracer.mark_first_token();
-                                sent_bytes += chunk.len() as u64;
+                                state.tracer.mark_first_token();
+                                state.sent_bytes += chunk.len() as u64;
                                 // 解码事件
-                                if let Err(e) = decoder.feed(&chunk) {
+                                if let Err(e) = state.decoder.feed(&chunk) {
                                     tracing::warn!("缓冲区溢出: {}", e);
+                                    state.ctx.record_upstream_error(
+                                        "upstream_event_decode_error",
+                                        format!("Failed to decode Kiro event stream: {e}"),
+                                    );
                                 }
 
-                                for result in decoder.decode_iter() {
+                                for result in state.decoder.decode_iter() {
                                     match result {
                                         Ok(frame) => {
-                                            if let Ok(event) = Event::from_frame(frame) {
-                                                // 缓冲事件（复用 StreamContext 的处理逻辑）
-                                                ctx.process_and_buffer(&event);
+                                            match Event::from_frame(frame) {
+                                                Ok(event) => {
+                                                    // 缓冲事件（复用 StreamContext 的处理逻辑）
+                                                    state.ctx.process_and_buffer(&event);
+                                                }
+                                                Err(e) => {
+                                                    tracing::warn!("解析 Kiro 事件失败: {}", e);
+                                                    state.ctx.record_upstream_error(
+                                                        "upstream_event_parse_error",
+                                                        format!("Failed to parse Kiro event: {e}"),
+                                                    );
+                                                }
                                             }
                                         }
                                         Err(e) => {
                                             tracing::warn!("解码事件失败: {}", e);
+                                            state.ctx.record_upstream_error(
+                                                "upstream_event_decode_error",
+                                                format!("Failed to decode Kiro event: {e}"),
+                                            );
                                         }
                                     }
                                 }
@@ -1856,15 +2157,35 @@ fn create_buffered_sse_stream(
                             Some(Err(e)) => {
                                 tracing::error!("读取响应流失败: {}", e);
                                 // 发生错误，完成处理并返回所有事件
-                                let all_events = ctx.finish_and_get_all_events();
-                                let (i, o, cc, cr, credits) = ctx.final_usage();
-                                hook.record(credential_id, i, o, cc, cr, credits, "error");
+                                state.ctx.record_upstream_error(
+                                    "upstream_stream_error",
+                                    format!("Kiro response stream failed: {e}"),
+                                );
+                                let all_events = state.ctx.finish_and_get_all_events();
+                                let (i, o, cc, cr, credits) = state.ctx.final_usage();
+                                if state.ctx.tool_json_error_is_incomplete() {
+                                    let message = state
+                                        .ctx
+                                        .response_error_message()
+                                        .unwrap_or_else(|| e.to_string());
+                                    if retry_buffered_stream_after_upstream_failure(
+                                        &mut state,
+                                        &message,
+                                        "read_error",
+                                    )
+                                    .await
+                                    {
+                                        let bytes: Vec<Result<Bytes, Infallible>> = Vec::new();
+                                        return Some((stream::iter(bytes), state));
+                                    }
+                                }
+                                state.hook.record(state.credential_id, i, o, cc, cr, credits, "error");
                                 // 缓冲模式 chunk 读取失败：上游中途断流
-                                tracer.finalize(
+                                state.tracer.finalize(
                                     "interrupted",
                                     Some(outcome::STREAM_INTERRUPTED),
                                     Some(&e.to_string()),
-                                    Some(sent_bytes),
+                                    Some(state.sent_bytes),
                                     TraceUsage {
                                         input_tokens: i.max(0) as u64,
                                         output_tokens: o.max(0) as u64,
@@ -1877,14 +2198,15 @@ fn create_buffered_sse_stream(
                                     .into_iter()
                                     .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                     .collect();
-                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id, tracer, sent_bytes, traffic_guard)));
+                                state.finished = true;
+                                return Some((stream::iter(bytes), state));
                             }
                             None => {
                                 // 流结束，完成处理并返回所有事件（已更正 input_tokens）。
                                 // finish_and_get_all_events 内部会 finish() 累积器；若有半截 /
                                 // 非法工具调用 JSON，error 事件已随缓冲发出，这里据此记 error。
-                                let all_events = ctx.finish_and_get_all_events();
-                                let (i, o, cc, cr, credits) = ctx.final_usage();
+                                let all_events = state.ctx.finish_and_get_all_events();
+                                let (i, o, cc, cr, credits) = state.ctx.final_usage();
                                 let trace_usage = TraceUsage {
                                     input_tokens: i.max(0) as u64,
                                     output_tokens: o.max(0) as u64,
@@ -1892,9 +2214,20 @@ fn create_buffered_sse_stream(
                                     cache_read_tokens: cr.max(0) as u64,
                                     credits: if credits.is_finite() && credits > 0.0 { credits } else { 0.0 },
                                 };
-                                if let Some(message) = ctx.tool_json_error_message() {
-                                    hook.record(credential_id, i, o, cc, cr, credits, "error");
-                                    tracer.finalize(
+                                if let Some(message) = state.ctx.response_error_message() {
+                                    if state.ctx.response_error_is_retryable()
+                                        && retry_buffered_stream_after_upstream_failure(
+                                            &mut state,
+                                            &message,
+                                            "eof",
+                                        )
+                                        .await
+                                    {
+                                        let bytes: Vec<Result<Bytes, Infallible>> = Vec::new();
+                                        return Some((stream::iter(bytes), state));
+                                    }
+                                    state.hook.record(state.credential_id, i, o, cc, cr, credits, "error");
+                                    state.tracer.finalize(
                                         "error",
                                         Some(outcome::BAD_REQUEST),
                                         Some(&message),
@@ -1902,14 +2235,15 @@ fn create_buffered_sse_stream(
                                         trace_usage,
                                     );
                                 } else {
-                                    hook.record(credential_id, i, o, cc, cr, credits, "success");
-                                    tracer.finalize("success", None, None, None, trace_usage);
+                                    state.hook.record(state.credential_id, i, o, cc, cr, credits, "success");
+                                    state.tracer.finalize("success", None, None, None, trace_usage);
                                 }
                                 let bytes: Vec<Result<Bytes, Infallible>> = all_events
                                     .into_iter()
                                     .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                     .collect();
-                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id, tracer, sent_bytes, traffic_guard)));
+                                state.finished = true;
+                                return Some((stream::iter(bytes), state));
                             }
                         }
                     }

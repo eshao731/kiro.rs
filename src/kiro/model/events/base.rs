@@ -18,6 +18,10 @@ pub enum EventType {
     ContextUsage,
     /// 推理内容事件
     ReasoningContent,
+    /// 代码/文本内容事件
+    Code,
+    /// 上游状态错误事件
+    InvalidState,
     /// 未知事件类型
     Unknown,
 }
@@ -31,6 +35,8 @@ impl EventType {
             "meteringEvent" => Self::Metering,
             "contextUsageEvent" => Self::ContextUsage,
             "reasoningContentEvent" => Self::ReasoningContent,
+            "codeEvent" => Self::Code,
+            "invalidStateEvent" => Self::InvalidState,
             _ => Self::Unknown,
         }
     }
@@ -43,6 +49,8 @@ impl EventType {
             Self::Metering => "meteringEvent",
             Self::ContextUsage => "contextUsageEvent",
             Self::ReasoningContent => "reasoningContentEvent",
+            Self::Code => "codeEvent",
+            Self::InvalidState => "invalidStateEvent",
             Self::Unknown => "unknown",
         }
     }
@@ -77,8 +85,17 @@ pub enum Event {
     ContextUsage(super::ContextUsageEvent),
     /// 推理内容
     ReasoningContent(super::ReasoningContentEvent),
+    /// 代码/文本内容
+    Code(super::CodeEvent),
+    /// 上游状态错误
+    InvalidState(super::InvalidStateEvent),
     /// 未知事件 (保留原始帧数据)
-    Unknown {},
+    Unknown {
+        /// 原始事件类型
+        event_type: String,
+        /// 原始 payload；仅供诊断，不应原样写日志
+        payload: Vec<u8>,
+    },
     /// 服务端错误
     Error {
         /// 错误代码
@@ -134,7 +151,18 @@ impl Event {
                 let payload = super::ReasoningContentEvent::from_frame(&frame)?;
                 Ok(Self::ReasoningContent(payload))
             }
-            EventType::Unknown => Ok(Self::Unknown {}),
+            EventType::Code => {
+                let payload = super::CodeEvent::from_frame(&frame)?;
+                Ok(Self::Code(payload))
+            }
+            EventType::InvalidState => {
+                let payload = super::InvalidStateEvent::from_frame(&frame)?;
+                Ok(Self::InvalidState(payload))
+            }
+            EventType::Unknown => Ok(Self::Unknown {
+                event_type: event_type_str.to_string(),
+                payload: frame.payload,
+            }),
         }
     }
 
@@ -188,6 +216,11 @@ mod tests {
         assert_eq!(
             EventType::from_str("reasoningContentEvent"),
             EventType::ReasoningContent
+        );
+        assert_eq!(EventType::from_str("codeEvent"), EventType::Code);
+        assert_eq!(
+            EventType::from_str("invalidStateEvent"),
+            EventType::InvalidState
         );
         assert_eq!(EventType::from_str("unknown_type"), EventType::Unknown);
     }

@@ -178,10 +178,15 @@ async fn decode_round(
             };
             let event = match Event::from_frame(frame) {
                 Ok(ev) => ev,
-                Err(_) => continue,
+                Err(e) => {
+                    tracing::warn!("failed to parse Kiro event: {}", e);
+                    stream_error = true;
+                    continue;
+                }
             };
             match event {
                 Event::AssistantResponse(resp) => text.push_str(&resp.content),
+                Event::Code(code) => text.push_str(&code.content),
                 Event::ReasoningContent(r) => {
                     if let Some(t) = &r.text {
                         thinking.push_str(t);
@@ -210,7 +215,9 @@ async fn decode_round(
                     if exception_type == "ContentLengthExceededException" {
                         stop_reason_override = Some("max_tokens".to_string());
                     }
+                    stream_error = true;
                 }
+                Event::Error { .. } | Event::InvalidState(_) => stream_error = true,
                 _ => {}
             }
         }
@@ -271,6 +278,10 @@ async fn run_round(
                 ConversionError::EmptyMessages => {
                     ("invalid_request_error", "message list is empty".to_string())
                 }
+                ConversionError::EmptyCurrentMessage => (
+                    "invalid_request_error",
+                    "last user message has no text, image, or tool result".to_string(),
+                ),
                 ConversionError::UnsupportedToolMapping(reason) => (
                     "invalid_request_error",
                     format!("unsupported tool mapping: {}", reason),

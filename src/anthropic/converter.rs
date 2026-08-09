@@ -491,7 +491,8 @@ pub struct ConversionResult {
 pub enum ConversionError {
     UnsupportedModel(String),
     EmptyMessages,
-    /// Claude Code 工具无法映射到 Kiro 内置工具（如 Read.pages 无对应、内置缺 schema）。
+    EmptyCurrentMessage,
+    /// Claude Code 工具无法映射到 Kiro 内置工具（如内置工具缺少 schema）。
     UnsupportedToolMapping(String),
     InvalidImage(String),
 }
@@ -501,6 +502,7 @@ impl std::fmt::Display for ConversionError {
         match self {
             ConversionError::UnsupportedModel(model) => write!(f, "模型不支持: {}", model),
             ConversionError::EmptyMessages => write!(f, "消息列表为空"),
+            ConversionError::EmptyCurrentMessage => write!(f, "最后一条用户消息没有任何内容"),
             ConversionError::UnsupportedToolMapping(reason) => {
                 write!(f, "工具映射不支持: {}", reason)
             }
@@ -676,6 +678,16 @@ pub fn convert_request_with_mode(
     normalize_tool_result_user_content(&mut history);
     fold_user_text_into_tool_results(&mut text_content, &mut validated_tool_results);
     append_tool_results_as_user_text(&mut text_content, &duplicate_tool_results);
+
+    // Claude Code 会在上一轮收到空 assistant 后自动补发一个隐藏的 `content: []`
+    // user 请求。它既没有文本、图片，也没有工具结果，不能作为有效 currentMessage
+    // 发给 Kiro，否则会继续得到空流并形成重试链。
+    if text_content.trim().is_empty()
+        && images.is_empty()
+        && validated_tool_results.is_empty()
+    {
+        return Err(ConversionError::EmptyCurrentMessage);
+    }
 
     // 10. 收集历史中使用的工具名称，为缺失的工具生成占位符定义
     // Kiro API 要求：历史消息中引用的工具必须在 tools 列表中有定义
@@ -1354,11 +1366,19 @@ fn map_tool_input_to_kiro(
             maybe_insert(&mut out, "timeout", take_first(&obj, &["timeout"]));
         }
         ("Read", "read_file") => {
-            if obj.contains_key("pages") && !obj.get("pages").is_some_and(|v| v.is_null()) {
-                return Err(ConversionError::UnsupportedToolMapping(
-                    "Claude Code Read.pages has no Kiro read_file equivalent".to_string(),
-                ));
-            }
+            // Claude Code 2.1.30 起允许 Read.pages 选择 PDF 页码。Kiro read_file 没有
+            // 对应字段，且 PDF 页码不能误映射成文本行号。这里处理的是已执行完成的历史
+            // tool_use；保留 path，并把页码写入 explanation，既维持历史语义，也避免整段
+            // 会话在后续每次请求时都因同一个历史调用返回 400。
+            let pages = obj
+                .get("pages")
+                .filter(|value| !value.is_null())
+                .map(|value| {
+                    value
+                        .as_str()
+                        .map(ToString::to_string)
+                        .unwrap_or_else(|| value.to_string())
+                });
             maybe_insert(&mut out, "path", take_first(&obj, &["file_path", "path"]));
             let offset = obj.get("offset").and_then(optional_number);
             let limit = obj.get("limit").and_then(optional_number);
@@ -1370,6 +1390,23 @@ fn map_tool_input_to_kiro(
                 out.insert("end_line".to_string(), serde_json::json!(end));
             }
             maybe_insert(&mut out, "explanation", take_first(&obj, &["explanation"]));
+            if let Some(pages) = pages {
+                let page_note = format!("Original Claude Code PDF page selection: {pages}.");
+                match out.get_mut("explanation") {
+                    Some(serde_json::Value::String(explanation))
+                        if !explanation.trim().is_empty() =>
+                    {
+                        explanation.push(' ');
+                        explanation.push_str(&page_note);
+                    }
+                    _ => {
+                        out.insert(
+                            "explanation".to_string(),
+                            serde_json::Value::String(page_note),
+                        );
+                    }
+                }
+            }
             out.entry("explanation".to_string())
                 .or_insert_with(|| default_explanation(client_name));
         }
@@ -1864,6 +1901,13 @@ fn merge_user_messages(
     }
 
     let content = content_parts.join("\n");
+    // Kiro 的历史 userInputMessage.content 必须非空。保留消息位置和工具/图片
+    // 上下文，但用不可见占位符替代 Claude Code 历史中的空消息。
+    let content = if content.trim().is_empty() {
+        " ".to_string()
+    } else {
+        content
+    };
     // 保留文本内容，即使有工具结果也不丢弃用户文本
     let mut user_msg = UserMessage::new(&content, model_id);
 
@@ -1940,7 +1984,7 @@ fn convert_assistant_message(
         } else {
             format!("<thinking>{}</thinking>", thinking_content)
         }
-    } else if text_content.is_empty() && !tool_uses.is_empty() {
+    } else if text_content.trim().is_empty() {
         " ".to_string()
     } else {
         text_content
@@ -2789,14 +2833,96 @@ mod tests {
     }
 
     #[test]
-    fn cc_outbound_read_pages_errors() {
-        let err = map_tool_input_to_kiro(
+    fn cc_outbound_read_pages_preserves_selection_in_explanation() {
+        let read = map_tool_input_to_kiro(
             "Read",
-            serde_json::json!({"file_path": "/a", "pages": "1-3"}),
+            serde_json::json!({
+                "file_path": "/a.pdf",
+                "pages": "1-3",
+                "explanation": "Inspect the report."
+            }),
             ToolCompatibilityMode::ClaudeCode,
         )
-        .unwrap_err();
-        assert!(matches!(err, ConversionError::UnsupportedToolMapping(_)));
+        .unwrap();
+
+        assert_eq!(read["path"], serde_json::json!("/a.pdf"));
+        assert!(read.get("pages").is_none(), "Kiro schema 不支持 pages");
+        assert!(
+            read.get("start_line").is_none() && read.get("end_line").is_none(),
+            "PDF 页码不得误映射成文本行号"
+        );
+        let explanation = read["explanation"].as_str().unwrap();
+        assert!(explanation.contains("Inspect the report."));
+        assert!(explanation.contains("1-3"), "原始 PDF 页码选择应保留");
+    }
+
+    #[test]
+    fn cc_request_with_historical_read_pages_continues() {
+        use super::super::types::Message as AnthropicMessage;
+
+        let req = MessagesRequest {
+            model: "claude-sonnet-4.5".to_string(),
+            max_tokens: 1024,
+            messages: vec![
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("Read pages 1-3 of the report"),
+                },
+                AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!([{
+                        "type": "tool_use",
+                        "id": "tool-pdf-1",
+                        "name": "Read",
+                        "input": {"file_path": "/a.pdf", "pages": "1-3"}
+                    }]),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!([{
+                        "type": "tool_result",
+                        "tool_use_id": "tool-pdf-1",
+                        "content": "Contents extracted from PDF pages 1-3"
+                    }]),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("Summarize those pages"),
+                },
+            ],
+            stream: false,
+            system: None,
+            tools: Some(vec![cc_tool("Read")]),
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let result = convert_request(&req).expect("含 Read.pages 的历史会话应能继续");
+        let historical_read = result
+            .conversation_state
+            .history
+            .iter()
+            .filter_map(|message| match message {
+                Message::Assistant(assistant) => {
+                    assistant.assistant_response_message.tool_uses.as_ref()
+                }
+                Message::User(_) => None,
+            })
+            .flatten()
+            .find(|tool_use| tool_use.tool_use_id == "tool-pdf-1")
+            .expect("历史 Read tool_use 应保留");
+
+        assert_eq!(historical_read.name, "read_file");
+        assert_eq!(historical_read.input["path"], serde_json::json!("/a.pdf"));
+        assert!(historical_read.input.get("pages").is_none());
+        assert!(
+            historical_read.input["explanation"]
+                .as_str()
+                .is_some_and(|text| text.contains("1-3")),
+            "映射后的历史应保留原始 PDF 页码选择"
+        );
     }
 
     #[test]
@@ -3169,6 +3295,60 @@ mod tests {
                 .count(),
             4
         );
+    }
+
+    #[test]
+    fn test_convert_request_rejects_empty_current_user_message() {
+        use super::super::types::Message as AnthropicMessage;
+
+        let req = MessagesRequest {
+            model: "claude-sonnet-4.5".to_string(),
+            max_tokens: 1024,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!([]),
+            }],
+            stream: true,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let err = convert_request(&req).unwrap_err();
+        assert!(matches!(err, ConversionError::EmptyCurrentMessage));
+    }
+
+    #[test]
+    fn test_empty_history_messages_use_nonempty_kiro_placeholders() {
+        use super::super::types::Message as AnthropicMessage;
+
+        let user = AnthropicMessage {
+            role: "user".to_string(),
+            content: serde_json::json!([]),
+        };
+        let mut dedup = std::collections::HashSet::new();
+        let merged = merge_user_messages(
+            &[&user],
+            "claude-sonnet-4.5",
+            &mut dedup,
+        )
+        .unwrap();
+        assert_eq!(merged.user_input_message.content, " ");
+
+        let assistant = AnthropicMessage {
+            role: "assistant".to_string(),
+            content: serde_json::json!([]),
+        };
+        let converted = convert_assistant_message(
+            &assistant,
+            &mut HashMap::new(),
+            ToolCompatibilityMode::Raw,
+        )
+        .unwrap();
+        assert_eq!(converted.assistant_response_message.content, " ");
     }
 
     #[test]

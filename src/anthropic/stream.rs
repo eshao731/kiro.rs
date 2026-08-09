@@ -914,10 +914,20 @@ pub enum ToolJsonAccumulatorError {
     },
 }
 
+#[derive(Debug, Clone)]
+struct UpstreamResponseError {
+    error_type: &'static str,
+    message: String,
+}
+
 impl ToolJsonAccumulatorError {
     /// Anthropic error 事件里统一的 error.type。
     pub fn error_type(&self) -> &'static str {
         "upstream_tool_json_error"
+    }
+
+    pub fn is_incomplete_json(&self) -> bool {
+        matches!(self, Self::IncompleteJson { .. })
     }
 
     pub fn message(&self) -> String {
@@ -1393,6 +1403,8 @@ pub struct StreamContext {
     /// 工具调用 JSON 错误（非法 / 半截）。一旦置位，收尾时补发 `error` 事件，
     /// 上层据此把本次请求记为 error 而非 success。
     tool_json_error: Option<ToolJsonAccumulatorError>,
+    /// Kiro 在 HTTP 200 的事件流中返回的语义错误，或本地事件解析错误。
+    upstream_error: Option<UpstreamResponseError>,
     /// 跨 chunk 过滤混入 assistant 文本的字面 `<tool_use>` XML 泄漏。
     tool_use_xml_filter: ToolUseXmlLeakFilter,
 }
@@ -1411,6 +1423,51 @@ impl StreamContext {
     /// 或在非流式路径返回 502。无错误时返回 `None`。
     pub fn tool_json_error_message(&self) -> Option<String> {
         self.tool_json_error.as_ref().map(|err| err.message())
+    }
+
+    pub fn tool_json_error_is_incomplete(&self) -> bool {
+        self.tool_json_error
+            .as_ref()
+            .map(|err| err.is_incomplete_json())
+            .unwrap_or(false)
+    }
+
+    /// 最终响应错误。必须在 `generate_final_events` 之后读取，因为空响应只在 EOF
+    /// 收尾完成后才能可靠判定。
+    pub fn response_error_message(&self) -> Option<String> {
+        self.tool_json_error
+            .as_ref()
+            .map(|err| err.message())
+            .or_else(|| self.upstream_error.as_ref().map(|err| err.message.clone()))
+    }
+
+    pub fn response_error_type(&self) -> Option<&'static str> {
+        self.tool_json_error
+            .as_ref()
+            .map(|err| err.error_type())
+            .or_else(|| self.upstream_error.as_ref().map(|err| err.error_type))
+    }
+
+    pub fn response_error_is_retryable(&self) -> bool {
+        self.tool_json_error_is_incomplete()
+            || self
+                .upstream_error
+                .as_ref()
+                .is_some_and(|err| err.error_type == "upstream_empty_response")
+    }
+
+    pub fn record_upstream_error(
+        &mut self,
+        error_type: &'static str,
+        message: impl Into<String>,
+    ) {
+        if self.upstream_error.is_none() {
+            self.upstream_error = Some(UpstreamResponseError {
+                error_type,
+                message: message.into(),
+            });
+        }
+        self.state_manager.set_stop_reason("error");
     }
 
     /// 创建 StreamContext
@@ -1449,6 +1506,7 @@ impl StreamContext {
             repeat_guard_tripped: false,
             tool_json_accumulator: ToolJsonAccumulator::new(),
             tool_json_error: None,
+            upstream_error: None,
             tool_use_xml_filter: ToolUseXmlLeakFilter::default(),
         }
     }
@@ -1520,6 +1578,7 @@ impl StreamContext {
     pub fn process_kiro_event(&mut self, event: &Event) -> Vec<SseEvent> {
         match event {
             Event::AssistantResponse(resp) => self.process_assistant_response(&resp.content),
+            Event::Code(code) => self.process_assistant_response(&code.content),
             Event::ToolUse(tool_use) => self.process_tool_use(tool_use),
             Event::ReasoningContent(reasoning) => self.process_reasoning_content(reasoning),
             Event::ContextUsage(context_usage) => {
@@ -1551,6 +1610,10 @@ impl StreamContext {
                 error_message,
             } => {
                 tracing::error!("收到错误事件: {} - {}", error_code, error_message);
+                self.record_upstream_error(
+                    "upstream_error",
+                    format!("Kiro upstream error {error_code}: {error_message}"),
+                );
                 Vec::new()
             }
             Event::Exception {
@@ -1562,9 +1625,38 @@ impl StreamContext {
                     self.state_manager.set_stop_reason("max_tokens");
                 }
                 tracing::warn!("收到异常事件: {} - {}", exception_type, message);
+                self.record_upstream_error(
+                    "upstream_exception",
+                    format!("Kiro upstream exception {exception_type}: {message}"),
+                );
                 Vec::new()
             }
-            _ => Vec::new(),
+            Event::InvalidState(invalid) => {
+                tracing::warn!(
+                    reason = %invalid.reason,
+                    message = %invalid.message,
+                    "收到 invalidStateEvent"
+                );
+                self.record_upstream_error(
+                    "upstream_invalid_state",
+                    format!(
+                        "Kiro upstream rejected the conversation state ({}): {}",
+                        invalid.reason, invalid.message
+                    ),
+                );
+                Vec::new()
+            }
+            Event::Unknown {
+                event_type,
+                payload,
+            } => {
+                tracing::warn!(
+                    event_type = %event_type,
+                    payload_bytes = payload.len(),
+                    "忽略尚未支持的 Kiro 事件"
+                );
+                Vec::new()
+            }
         }
     }
 
@@ -2452,6 +2544,18 @@ impl StreamContext {
             self.state_manager.set_stop_reason("error");
         }
 
+        // Kiro 有时以 HTTP 200 + context/metering + EOF 结束，却没有任何文本、thinking
+        // 或工具调用。过去这里仍发 message_stop，导致 new-api 将语义失败记成空成功。
+        if self.tool_json_error.is_none()
+            && self.upstream_error.is_none()
+            && self.output_tokens == 0
+        {
+            self.record_upstream_error(
+                "upstream_empty_response",
+                "Kiro upstream ended the stream without assistant content, reasoning, or a tool call",
+            );
+        }
+
         // 互斥口径：total 真值（contextUsage 优先）− 缓存覆盖 = 未缓存的 input。
         let (final_input_tokens, cache_creation, cache_read) = self.resolved_usage();
 
@@ -2463,19 +2567,27 @@ impl StreamContext {
             cache_read,
         ));
 
-        // 工具调用 JSON 错误：在最终事件之后补一个 Anthropic `error` 事件，明确告知
-        // 客户端本次工具调用因上游半截 / 非法 JSON 未被转发（实时流已返回 200，无法再改状态码）。
-        if let Some(err) = &self.tool_json_error {
-            events.push(SseEvent::new(
+        // 实时流已返回 200，无法再改状态码。把 Anthropic `error` 放在
+        // `message_stop` 之前，避免下游在看到成功终止事件后停止消费，从而再次把
+        // 上游语义失败误判成空成功。
+        if let (Some(error_type), Some(message)) =
+            (self.response_error_type(), self.response_error_message())
+        {
+            let error_event = SseEvent::new(
                 "error",
                 json!({
                     "type": "error",
                     "error": {
-                        "type": err.error_type(),
-                        "message": err.message()
+                        "type": error_type,
+                        "message": message
                     }
                 }),
-            ));
+            );
+            let insert_at = events
+                .iter()
+                .position(|event| event.event == "message_stop")
+                .unwrap_or(events.len());
+            events.insert(insert_at, error_event);
         }
 
         events
@@ -2600,6 +2712,30 @@ impl BufferedStreamContext {
     pub fn tool_json_error_message(&self) -> Option<String> {
         self.inner.tool_json_error_message()
     }
+
+    pub fn tool_json_error_is_incomplete(&self) -> bool {
+        self.inner.tool_json_error_is_incomplete()
+    }
+
+    pub fn response_error_message(&self) -> Option<String> {
+        self.inner.response_error_message()
+    }
+
+    pub fn response_error_type(&self) -> Option<&'static str> {
+        self.inner.response_error_type()
+    }
+
+    pub fn response_error_is_retryable(&self) -> bool {
+        self.inner.response_error_is_retryable()
+    }
+
+    pub fn record_upstream_error(
+        &mut self,
+        error_type: &'static str,
+        message: impl Into<String>,
+    ) {
+        self.inner.record_upstream_error(error_type, message);
+    }
 }
 
 /// 简单的 token 估算（中英文字符混合）
@@ -2628,6 +2764,79 @@ pub fn estimate_tokens(text: &str) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn empty_test_context() -> StreamContext {
+        StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            false,
+            HashMap::new(),
+            std::collections::HashSet::new(),
+        )
+    }
+
+    #[test]
+    fn code_event_is_forwarded_as_assistant_text() {
+        let mut ctx = empty_test_context();
+        let mut events = ctx.generate_initial_events();
+        events.extend(ctx.process_kiro_event(&Event::Code(
+            crate::kiro::model::events::CodeEvent {
+                content: "let answer = 42;".to_string(),
+            },
+        )));
+        events.extend(ctx.generate_final_events());
+
+        assert_eq!(ctx.response_error_message(), None);
+        assert!(events.iter().any(|event| {
+            event.data["delta"]["text"] == serde_json::json!("let answer = 42;")
+        }));
+    }
+
+    #[test]
+    fn invalid_state_event_is_not_reported_as_success() {
+        let mut ctx = empty_test_context();
+        ctx.generate_initial_events();
+        ctx.process_kiro_event(&Event::InvalidState(
+            crate::kiro::model::events::InvalidStateEvent {
+                reason: "TOOL_USE_RESULT_MISMATCH".to_string(),
+                message: "Expected toolResult blocks but found none".to_string(),
+            },
+        ));
+        let events = ctx.generate_final_events();
+
+        assert_eq!(ctx.response_error_type(), Some("upstream_invalid_state"));
+        assert!(events.iter().any(|event| event.event == "error"));
+    }
+
+    #[test]
+    fn contentless_upstream_eof_is_an_explicit_retryable_error() {
+        let mut ctx = empty_test_context();
+        ctx.generate_initial_events();
+        let events = ctx.generate_final_events();
+
+        assert_eq!(ctx.response_error_type(), Some("upstream_empty_response"));
+        assert!(ctx.response_error_is_retryable());
+        assert!(events.iter().any(|event| {
+            event.event == "error"
+                && event.data["error"]["type"]
+                    == serde_json::json!("upstream_empty_response")
+        }));
+    }
+
+    #[test]
+    fn filtered_tool_xml_cannot_become_an_empty_success() {
+        let mut ctx = empty_test_context();
+        ctx.generate_initial_events();
+        let response: crate::kiro::model::events::AssistantResponseEvent =
+            serde_json::from_value(serde_json::json!({
+                "content": "<tool_use id=\"toolu_1\" name=\"Read\">{\"path\":\"/tmp/a\"}</tool_use>"
+            }))
+            .unwrap();
+        ctx.process_kiro_event(&Event::AssistantResponse(response));
+        ctx.generate_final_events();
+
+        assert_eq!(ctx.response_error_type(), Some("upstream_empty_response"));
+    }
 
     // ---- ToolJsonAccumulator: 流式半截 / 非法工具调用 JSON ----
 
@@ -2687,6 +2896,7 @@ mod tests {
             .push(&tool_evt("t1", "read_file", "{not json", true), &HashMap::new())
             .unwrap_err();
         assert_eq!(err.error_type(), "upstream_tool_json_error");
+        assert!(!err.is_incomplete_json());
         assert!(matches!(err, ToolJsonAccumulatorError::InvalidJson { .. }));
     }
 
@@ -2703,6 +2913,7 @@ mod tests {
             .is_none()
         );
         let err = acc.finish().unwrap_err();
+        assert!(err.is_incomplete_json());
         assert!(matches!(err, ToolJsonAccumulatorError::IncompleteJson { .. }));
         // 已取出残留后再 finish() 应成功。
         assert!(acc.finish().is_ok());

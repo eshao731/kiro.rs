@@ -145,6 +145,7 @@ jobs:
         with:
           shared-key: "rust-cache-${{ matrix.target }}"
           cache-on-failure: true
+          save-if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
 
       - name: Install musl tools
         if: contains(matrix.target, 'musl')
@@ -173,6 +174,7 @@ jobs:
           name: kiro-rs-${{ steps.version.outputs.version }}-${{ matrix.name }}
           if-no-files-found: error
           compression-level: 6
+          retention-days: 1
           path: |
             target/${{ matrix.target }}/release/kiro-rs
             target/${{ matrix.target }}/release/kiro-rs.exe
