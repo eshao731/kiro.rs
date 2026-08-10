@@ -1113,6 +1113,8 @@ pub struct MultiTokenManager {
     load_balancing_mode: Mutex<String>,
     /// 账号级 429 风控故障转移开关（运行时可修改）
     account_throttle_failover: AtomicBool,
+    /// 模型不支持时是否记录避让并切换其它凭据（运行时可修改）
+    model_fallback: AtomicBool,
     /// 账号级风控冷却时长（秒，运行时可修改）
     account_throttle_cooldown_secs: AtomicU64,
     /// 是否完全关闭本地冷却（运行时可修改）
@@ -1376,6 +1378,7 @@ impl MultiTokenManager {
 
         let load_balancing_mode = config.load_balancing_mode.clone();
         let throttle_failover = config.account_throttle_failover;
+        let model_fallback = config.model_fallback;
         let throttle_cooldown_secs = config.account_throttle_cooldown_secs;
         let never_cooldown = config.never_cooldown;
         let unlimited_concurrency = config.unlimited_concurrency;
@@ -1392,6 +1395,7 @@ impl MultiTokenManager {
             is_multiple_format: AtomicBool::new(is_multiple_format),
             load_balancing_mode: Mutex::new(load_balancing_mode),
             account_throttle_failover: AtomicBool::new(throttle_failover),
+            model_fallback: AtomicBool::new(model_fallback),
             account_throttle_cooldown_secs: AtomicU64::new(throttle_cooldown_secs),
             never_cooldown: AtomicBool::new(never_cooldown),
             unlimited_concurrency: AtomicBool::new(unlimited_concurrency),
@@ -2791,12 +2795,17 @@ impl MultiTokenManager {
     /// 记录当前凭据不支持指定模型，并返回同一请求范围内仍可调度的凭据数。
     ///
     /// 这是模型级避让，不是账号级冷却：该凭据仍可继续服务其它模型。
+    /// 模型退让关闭时返回 `None`，且不记录任何避让状态。
     pub fn report_model_unsupported(
         &self,
         id: u64,
         model: &str,
         group: Option<&str>,
-    ) -> usize {
+    ) -> Option<usize> {
+        if !self.get_model_fallback() {
+            return None;
+        }
+
         let normalized_model = normalize_model_for_support(model);
         let now = Instant::now();
         {
@@ -2814,10 +2823,12 @@ impl MultiTokenManager {
                 }
             }
 
-            entries
-                .iter()
-                .filter(|e| schedulable(e, now, Some(&normalized_model), group))
-                .count()
+            Some(
+                entries
+                    .iter()
+                    .filter(|e| schedulable(e, now, Some(&normalized_model), group))
+                    .count(),
+            )
         }
     }
 
@@ -3947,6 +3958,11 @@ impl MultiTokenManager {
         self.account_throttle_failover.load(Ordering::Relaxed)
     }
 
+    /// 获取模型退让开关（Admin API / 请求失败处理）
+    pub fn get_model_fallback(&self) -> bool {
+        self.model_fallback.load(Ordering::Relaxed)
+    }
+
     /// 获取账号级风控冷却时长秒数（Admin API）
     pub fn get_account_throttle_cooldown_secs(&self) -> u64 {
         self.account_throttle_cooldown_secs.load(Ordering::Relaxed)
@@ -3977,6 +3993,7 @@ impl MultiTokenManager {
         never_cooldown: Option<bool>,
         unlimited_concurrency: Option<bool>,
         disable_failure_auto_recovery: Option<bool>,
+        model_fallback: Option<bool>,
     ) -> anyhow::Result<()> {
         if let Some(secs) = cooldown_secs {
             // 限定一个合理范围：1 秒到 24 小时
@@ -3990,6 +4007,7 @@ impl MultiTokenManager {
         let prev_never_cooldown = self.get_never_cooldown();
         let prev_unlimited_concurrency = self.get_unlimited_concurrency();
         let prev_disable_failure_auto_recovery = self.get_disable_failure_auto_recovery();
+        let prev_model_fallback = self.get_model_fallback();
         let new_failover = failover.unwrap_or(prev_failover);
         let new_cooldown = cooldown_secs.unwrap_or(prev_cooldown);
         let new_never_cooldown = never_cooldown.unwrap_or(prev_never_cooldown);
@@ -3997,12 +4015,14 @@ impl MultiTokenManager {
             unlimited_concurrency.unwrap_or(prev_unlimited_concurrency);
         let new_disable_failure_auto_recovery = disable_failure_auto_recovery
             .unwrap_or(prev_disable_failure_auto_recovery);
+        let new_model_fallback = model_fallback.unwrap_or(prev_model_fallback);
 
         if new_failover == prev_failover
             && new_cooldown == prev_cooldown
             && new_never_cooldown == prev_never_cooldown
             && new_unlimited_concurrency == prev_unlimited_concurrency
             && new_disable_failure_auto_recovery == prev_disable_failure_auto_recovery
+            && new_model_fallback == prev_model_fallback
         {
             return Ok(());
         }
@@ -4017,6 +4037,8 @@ impl MultiTokenManager {
             .store(new_unlimited_concurrency, Ordering::Relaxed);
         self.disable_failure_auto_recovery
             .store(new_disable_failure_auto_recovery, Ordering::Relaxed);
+        self.model_fallback
+            .store(new_model_fallback, Ordering::Relaxed);
 
         if let Err(err) = self.persist_account_throttle_config(
             new_failover,
@@ -4024,6 +4046,7 @@ impl MultiTokenManager {
             new_never_cooldown,
             new_unlimited_concurrency,
             new_disable_failure_auto_recovery,
+            new_model_fallback,
         ) {
             // 回滚内存值
             self.account_throttle_failover
@@ -4036,6 +4059,8 @@ impl MultiTokenManager {
                 .store(prev_unlimited_concurrency, Ordering::Relaxed);
             self.disable_failure_auto_recovery
                 .store(prev_disable_failure_auto_recovery, Ordering::Relaxed);
+            self.model_fallback
+                .store(prev_model_fallback, Ordering::Relaxed);
             return Err(err);
         }
 
@@ -4052,13 +4077,21 @@ impl MultiTokenManager {
             }
         }
 
+        if !new_model_fallback {
+            let mut entries = self.entries.lock();
+            for entry in entries.iter_mut() {
+                entry.unsupported_models.clear();
+            }
+        }
+
         tracing::info!(
-            "账号级风控配置已更新: failover={}, cooldown_secs={}, never_cooldown={}, unlimited_concurrency={}, disable_failure_auto_recovery={}",
+            "故障转移配置已更新: failover={}, cooldown_secs={}, never_cooldown={}, unlimited_concurrency={}, disable_failure_auto_recovery={}, model_fallback={}",
             new_failover,
             new_cooldown,
             new_never_cooldown,
             new_unlimited_concurrency,
-            new_disable_failure_auto_recovery
+            new_disable_failure_auto_recovery,
+            new_model_fallback
         );
         Ok(())
     }
@@ -4070,6 +4103,7 @@ impl MultiTokenManager {
         never_cooldown: bool,
         unlimited_concurrency: bool,
         disable_failure_auto_recovery: bool,
+        model_fallback: bool,
     ) -> anyhow::Result<()> {
         use anyhow::Context;
 
@@ -4088,6 +4122,7 @@ impl MultiTokenManager {
         config.never_cooldown = never_cooldown;
         config.unlimited_concurrency = unlimited_concurrency;
         config.disable_failure_auto_recovery = disable_failure_auto_recovery;
+        config.model_fallback = model_fallback;
         config
             .save()
             .with_context(|| format!("持久化账号级风控配置失败: {}", config_path.display()))?;
@@ -4570,16 +4605,25 @@ mod tests {
                 .unwrap();
 
         manager
-            .set_account_throttle_config(None, None, Some(true), Some(true), Some(true))
+            .set_account_throttle_config(
+                None,
+                None,
+                Some(true),
+                Some(true),
+                Some(true),
+                Some(false),
+            )
             .unwrap();
 
         let persisted = Config::load(&config_path).unwrap();
         assert!(persisted.never_cooldown);
         assert!(persisted.unlimited_concurrency);
         assert!(persisted.disable_failure_auto_recovery);
+        assert!(!persisted.model_fallback);
         assert!(manager.get_never_cooldown());
         assert!(manager.get_unlimited_concurrency());
         assert!(manager.get_disable_failure_auto_recovery());
+        assert!(!manager.get_model_fallback());
 
         std::fs::remove_file(&config_path).unwrap();
     }
@@ -4663,7 +4707,7 @@ mod tests {
             .is_some());
 
         manager
-            .set_account_throttle_config(None, None, None, Some(true), None)
+            .set_account_throttle_config(None, None, None, Some(true), None, None)
             .unwrap();
         assert_eq!(manager.entries.lock()[0].rate_limit_count, 0);
         assert!(manager.entries.lock()[0].rate_limit_until.is_none());
@@ -4698,7 +4742,7 @@ mod tests {
         assert!(manager.entries.lock()[0].throttled_until.is_some());
 
         manager
-            .set_account_throttle_config(None, None, Some(true), None, None)
+            .set_account_throttle_config(None, None, Some(true), None, None, None)
             .unwrap();
         assert!(manager.entries.lock()[0].throttled_until.is_none());
 
@@ -5490,7 +5534,9 @@ mod tests {
             Some(1)
         );
 
-        let remaining = manager.report_model_unsupported(1, "Claude-Sonnet-5", None);
+        let remaining = manager
+            .report_model_unsupported(1, "Claude-Sonnet-5", None)
+            .unwrap();
         assert_eq!(remaining, 1);
 
         assert_eq!(
@@ -5517,6 +5563,51 @@ mod tests {
         assert_eq!(
             first_snapshot.unsupported_models,
             vec!["claude-sonnet-5".to_string()]
+        );
+    }
+
+    #[test]
+    fn disabling_model_fallback_clears_existing_model_avoidance() {
+        let mut first = grouped_cred("first", &[]);
+        first.priority = 0;
+        let mut second = grouped_cred("second", &[]);
+        second.priority = 1;
+
+        let manager =
+            MultiTokenManager::new(Config::default(), vec![first, second], None, None, false)
+                .unwrap();
+
+        let _ = manager.report_model_unsupported(1, "claude-sonnet-5", None);
+        assert_eq!(
+            manager
+                .select_next_credential(Some("claude-sonnet-5"), None)
+                .map(|(id, _)| id),
+            Some(2)
+        );
+
+        manager
+            .set_account_throttle_config(None, None, None, None, None, Some(false))
+            .unwrap();
+
+        assert!(!manager.get_model_fallback());
+        assert_eq!(
+            manager.report_model_unsupported(1, "claude-sonnet-5", None),
+            None,
+            "关闭后不应再记录新的模型避让"
+        );
+        assert_eq!(
+            manager
+                .select_next_credential(Some("claude-sonnet-5"), None)
+                .map(|(id, _)| id),
+            Some(1),
+            "关闭模型退让后，应清除已有避让并重新允许原凭据参与调度"
+        );
+        assert!(
+            manager
+                .snapshot()
+                .entries
+                .iter()
+                .all(|entry| entry.unsupported_models.is_empty())
         );
     }
 

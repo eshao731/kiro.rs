@@ -1896,6 +1896,7 @@ impl AdminService {
             disable_failure_auto_recovery: self
                 .token_manager
                 .get_disable_failure_auto_recovery(),
+            model_fallback: self.token_manager.get_model_fallback(),
         }
     }
 
@@ -1909,9 +1910,10 @@ impl AdminService {
             && req.never_cooldown.is_none()
             && req.unlimited_concurrency.is_none()
             && req.disable_failure_auto_recovery.is_none()
+            && req.model_fallback.is_none()
         {
             return Err(AdminServiceError::InvalidCredential(
-                "至少提供一个账号级风控配置字段".to_string(),
+                "至少提供一个故障转移配置字段".to_string(),
             ));
         }
 
@@ -1922,6 +1924,7 @@ impl AdminService {
                 req.never_cooldown,
                 req.unlimited_concurrency,
                 req.disable_failure_auto_recovery,
+                req.model_fallback,
             )
             .map_err(|e| AdminServiceError::InvalidCredential(e.to_string()))?;
 

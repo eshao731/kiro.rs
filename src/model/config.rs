@@ -153,6 +153,13 @@ pub struct Config {
     #[serde(default = "default_account_throttle_failover")]
     pub account_throttle_failover: bool,
 
+    /// 当前凭据不支持请求模型时，是否记录模型级避让并切换其它凭据（默认 true）。
+    ///
+    /// 关闭后：上游返回模型不支持时直接把原始 400 返回给客户端，不记录避让状态，
+    /// 也不切换其它凭据重试。
+    #[serde(default = "default_model_fallback")]
+    pub model_fallback: bool,
+
     /// 账号级风控及单端点 429 冷却时长（秒，默认 300 = 5 分钟）。
     #[serde(default = "default_account_throttle_cooldown_secs")]
     pub account_throttle_cooldown_secs: u64,
@@ -271,6 +278,10 @@ fn default_account_throttle_failover() -> bool {
     true
 }
 
+fn default_model_fallback() -> bool {
+    true
+}
+
 fn default_account_throttle_cooldown_secs() -> u64 {
     5 * 60
 }
@@ -345,6 +356,7 @@ impl Default for Config {
             update_auto_apply_time: default_update_auto_apply_time(),
             load_balancing_mode: default_load_balancing_mode(),
             account_throttle_failover: default_account_throttle_failover(),
+            model_fallback: default_model_fallback(),
             account_throttle_cooldown_secs: default_account_throttle_cooldown_secs(),
             never_cooldown: false,
             unlimited_concurrency: false,

@@ -790,6 +790,28 @@ impl KiroProvider {
                         );
                         anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
                     };
+                    let Some(remaining) = self
+                        .token_manager
+                        .report_model_unsupported(ctx.id, model_id, group)
+                    else {
+                        tracing::warn!(
+                            "API 请求失败（凭据 #{} 不支持模型 {}，模型退让已关闭）: {}",
+                            ctx.id,
+                            model_id,
+                            body
+                        );
+                        Self::emit_attempt(
+                            sink,
+                            attempt,
+                            ctx.id,
+                            endpoint_name,
+                            Some(400),
+                            outcome::MODEL_UNSUPPORTED,
+                            Some(&body),
+                            attempt_start,
+                        );
+                        anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
+                    };
                     tracing::warn!(
                         "API 请求失败（凭据 #{} 不支持模型 {}，本模型后续避让该凭据并切换，尝试 {}/{}）: {}",
                         ctx.id,
@@ -808,9 +830,6 @@ impl KiroProvider {
                         Some(&body),
                         attempt_start,
                     );
-                    let remaining =
-                        self.token_manager
-                            .report_model_unsupported(ctx.id, model_id, group);
                     last_error = Some(anyhow::anyhow!(
                         "{} API 请求失败（凭据 #{} 不支持当前模型，已记录模型级避让）: {} {}",
                         api_type,

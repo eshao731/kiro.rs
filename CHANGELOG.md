@@ -6,6 +6,10 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### ✨ 新功能 — 模型退让开关
+
+- **Admin UI 可控制模型退让**：顶栏故障转移面板新增「模型退让」开关。开启时沿用原行为，在凭据返回模型不支持后记录模型级避让并切换其它凭据；关闭后清空已有避让记录，后续直接返回上游原始 400，不再跨凭据退让。设置运行时立即生效并持久化为 `config.json` 的 `modelFallback`（默认开启）。
+
 ### ✨ 新功能 — Claude Opus 5 实验预览
 
 - **新增 `claude-opus-5` 支持**：Anthropic 兼容模型映射、`GET /v1/models` 静态列表及 `-thinking` 别名均已接入，按 Kiro 返回信息使用 1M 上下文窗口。

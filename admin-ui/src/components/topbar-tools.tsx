@@ -104,6 +104,13 @@ export function TopbarTools({ compact = false }: TopbarToolsProps) {
     })
   }
 
+  const updateModelFallback = (enabled: boolean) => {
+    setThrottleConfig({ modelFallback: enabled }, {
+      onSuccess: () => toast.success(enabled ? '已开启模型退让' : '已关闭模型退让'),
+      onError: (err) => toast.error(`切换失败: ${extractErrorMessage(err)}`),
+    })
+  }
+
   const openKeyDialog = () => {
     setNewKey('')
     setShowPlain(false)
@@ -145,6 +152,7 @@ export function TopbarTools({ compact = false }: TopbarToolsProps) {
     throttleConfig,
     updateCheck,
     updateDisableFailureAutoRecovery,
+    updateModelFallback,
     updateNeverCooldown,
     updateUnlimitedConcurrency,
     updateCooldown: (secs: number) =>
@@ -268,6 +276,7 @@ interface ToolControls {
   throttleConfig?: AccountThrottleConfig
   updateCheck?: { hasUpdate: boolean; latestVersion: string; currentVersion: string }
   updateDisableFailureAutoRecovery: (enabled: boolean) => void
+  updateModelFallback: (enabled: boolean) => void
   updateNeverCooldown: (enabled: boolean) => void
   updateUnlimitedConcurrency: (enabled: boolean) => void
   updateCooldown: (secs: number) => void
@@ -283,6 +292,7 @@ function FullTools({ controls }: { controls: ToolControls }) {
         saving={controls.isSettingThrottle}
         onToggleFailover={controls.handleToggleFailover}
         onChangeDisableFailureAutoRecovery={controls.updateDisableFailureAutoRecovery}
+        onChangeModelFallback={controls.updateModelFallback}
         onChangeNeverCooldown={controls.updateNeverCooldown}
         onChangeUnlimitedConcurrency={controls.updateUnlimitedConcurrency}
         onChangeCooldown={controls.updateCooldown}
@@ -301,6 +311,7 @@ function CompactTools({ controls }: { controls: ToolControls }) {
     saving: controls.isSettingThrottle,
     onToggleFailover: controls.handleToggleFailover,
     onChangeDisableFailureAutoRecovery: controls.updateDisableFailureAutoRecovery,
+    onChangeModelFallback: controls.updateModelFallback,
     onChangeNeverCooldown: controls.updateNeverCooldown,
     onChangeUnlimitedConcurrency: controls.updateUnlimitedConcurrency,
     onChangeCooldown: controls.updateCooldown,
@@ -420,6 +431,7 @@ interface ThrottleConfigButtonProps {
   saving: boolean
   onToggleFailover: () => void
   onChangeDisableFailureAutoRecovery: (enabled: boolean) => void
+  onChangeModelFallback: (enabled: boolean) => void
   onChangeNeverCooldown: (enabled: boolean) => void
   onChangeUnlimitedConcurrency: (enabled: boolean) => void
   onChangeCooldown: (secs: number) => void
@@ -430,6 +442,7 @@ interface ThrottleState {
   cooldownSecs: number
   disableFailureAutoRecovery: boolean
   failover: boolean
+  modelFallback: boolean
   neverCooldown: boolean
   unlimitedConcurrency: boolean
 }
@@ -471,7 +484,7 @@ const MAX_CUSTOM_COOLDOWN_MINUTES = 1440
 function ThrottleConfigButton({
   config, loading, saving, onToggleFailover, onChangeCooldown,
   onChangeDisableFailureAutoRecovery, onChangeNeverCooldown,
-  onChangeUnlimitedConcurrency,
+  onChangeModelFallback, onChangeUnlimitedConcurrency,
 }: ThrottleConfigButtonProps) {
   const [open, setOpen] = useState(false)
   const [customMin, setCustomMin] = useState('')
@@ -507,6 +520,7 @@ function ThrottleConfigButton({
           saving={saving}
           state={state}
           onChangeDisableFailureAutoRecovery={onChangeDisableFailureAutoRecovery}
+          onChangeModelFallback={onChangeModelFallback}
           onChangeNeverCooldown={onChangeNeverCooldown}
           onChangeUnlimitedConcurrency={onChangeUnlimitedConcurrency}
         />
@@ -528,12 +542,14 @@ function ThrottleBehaviorPanel({
   saving,
   state,
   onChangeDisableFailureAutoRecovery,
+  onChangeModelFallback,
   onChangeNeverCooldown,
   onChangeUnlimitedConcurrency,
 }: {
   saving: boolean
   state: ThrottleState
   onChangeDisableFailureAutoRecovery: (enabled: boolean) => void
+  onChangeModelFallback: (enabled: boolean) => void
   onChangeNeverCooldown: (enabled: boolean) => void
   onChangeUnlimitedConcurrency: (enabled: boolean) => void
 }) {
@@ -541,6 +557,21 @@ function ThrottleBehaviorPanel({
     <>
       <DropdownMenuLabel className="pt-1">保护策略</DropdownMenuLabel>
       <div className="space-y-1.5 px-2 pb-2">
+        <label className="flex cursor-pointer items-start justify-between gap-3 rounded-md bg-secondary/40 px-2.5 py-2">
+          <div className="text-xs">
+            <div className="font-medium text-foreground">模型退让</div>
+            <div className="leading-snug text-muted-foreground">
+              当前凭据不支持请求模型时，记入避让并切换其它凭据；关闭后直接返回原始错误
+            </div>
+          </div>
+          <Switch
+            aria-label="模型退让"
+            className="mt-0.5"
+            checked={state.modelFallback}
+            disabled={saving}
+            onCheckedChange={onChangeModelFallback}
+          />
+        </label>
         <label className="flex cursor-pointer items-start justify-between gap-3 rounded-md bg-secondary/40 px-2.5 py-2">
           <div className="text-xs">
             <div className="font-medium text-foreground">永远不冷却</div>
@@ -734,6 +765,7 @@ function ThrottleCompactItems(props: ThrottleConfigButtonProps) {
     onToggleFailover,
     onChangeCooldown,
     onChangeDisableFailureAutoRecovery,
+    onChangeModelFallback,
     onChangeNeverCooldown,
     onChangeUnlimitedConcurrency,
   } = props
@@ -766,6 +798,7 @@ function ThrottleCompactItems(props: ThrottleConfigButtonProps) {
         saving={busy}
         state={state}
         onChangeDisableFailureAutoRecovery={onChangeDisableFailureAutoRecovery}
+        onChangeModelFallback={onChangeModelFallback}
         onChangeNeverCooldown={onChangeNeverCooldown}
         onChangeUnlimitedConcurrency={onChangeUnlimitedConcurrency}
       />
@@ -846,6 +879,7 @@ function readThrottleState(
     cooldownSecs,
     disableFailureAutoRecovery: config?.disableFailureAutoRecovery ?? false,
     failover: config?.failover ?? true,
+    modelFallback: config?.modelFallback ?? true,
     neverCooldown: config?.neverCooldown ?? false,
     unlimitedConcurrency: config?.unlimitedConcurrency ?? false,
   }

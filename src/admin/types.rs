@@ -531,6 +531,8 @@ pub struct AccountThrottleConfigResponse {
     pub unlimited_concurrency: bool,
     /// 是否禁止失败过多后的自动自愈
     pub disable_failure_auto_recovery: bool,
+    /// 是否启用模型不支持时的凭据级退让
+    pub model_fallback: bool,
 }
 
 /// 更新账号级风控故障转移配置
@@ -552,6 +554,9 @@ pub struct SetAccountThrottleConfigRequest {
     /// 是否禁止失败过多后的自动自愈；缺省表示不修改
     #[serde(default)]
     pub disable_failure_auto_recovery: Option<bool>,
+    /// 是否启用模型不支持时的凭据级退让；缺省表示不修改
+    #[serde(default)]
+    pub model_fallback: Option<bool>,
 }
 
 /// 日志治理配置响应

@@ -318,6 +318,7 @@ curl -X POST http://127.0.0.1:8990/api/admin/credentials/kiro-api-key \
 | `proxyUsername` / `proxyPassword` | 无 | 全局代理认证 |
 | `loadBalancingMode` | `priority` | `priority`、`balanced` 或 `least_conn` |
 | `accountThrottleFailover` | `true` | 账号级 429 suspicious activity 时是否冷却并切换凭据 |
+| `modelFallback` | `true` | 当前凭据不支持请求模型时，是否记录模型级避让并切换其它凭据 |
 | `accountThrottleCooldownSecs` | `300` | 账号级风控冷却秒数 |
 | `cacheMaxSavingsRatio` | `0.9` | Prompt cache 最多计入的输入 token 比例，范围 0-1 |
 | `extractThinking` | `true` | 非流式响应是否把旧 `<thinking>` 文本提取成 thinking block |

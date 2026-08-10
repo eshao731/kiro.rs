@@ -448,6 +448,7 @@ export interface AccountThrottleConfig {
   neverCooldown: boolean
   unlimitedConcurrency: boolean
   disableFailureAutoRecovery: boolean
+  modelFallback: boolean
 }
 
 // 获取账号级风控故障转移配置
