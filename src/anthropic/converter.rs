@@ -301,7 +301,12 @@ pub fn map_model(model: &str) -> Option<String> {
 ///
 /// 复用 `map_model` 的映射逻辑，确保窗口大小判断与模型映射一致。
 /// Kiro 于 2026-03-24 将 Opus 4.6 和 Sonnet 4.6 升级至 1M 上下文。
-/// 4.7 / 4.8 / Opus 5 同 1M
+/// Sonnet 5 / Opus 4.7 / 4.8 / Opus 5 同 1M
+///
+/// 注意：本函数的返回值会在 `Event::ContextUsage` 处被用来把上游只回报的
+/// 百分比换算成 token 数（`pct × window / 100`）。漏配某个 1M 模型不会影响
+/// 发往上游的请求，但会让该模型的 usage 上报缩小 5 倍，进而使客户端的
+/// 上下文进度条与自动压缩阈值全部失准。新增 1M 模型时务必同步此处。
 pub fn get_context_window_size(model: &str) -> i32 {
     // 自定义模型若显式声明了上下文窗口，优先返回。
     if let Some(custom) = crate::model::custom_models::lookup(model) {
@@ -2286,6 +2291,52 @@ mod tests {
             map_model("claude-opus-5-beta"),
             Some("claude-opus-5-beta".to_string())
         );
+    }
+
+    /// Opus 5 的上下文窗口回归测试。
+    ///
+    /// 该模型曾被漏配在 1M 名单之外，导致 `Event::ContextUsage` 把上游回报的
+    /// 百分比乘以 200_000，usage 上报缩小 5 倍。
+    #[test]
+    fn test_context_window_opus_5() {
+        assert_eq!(get_context_window_size("claude-opus-5"), 1_000_000);
+        // 别名/后缀变体经 map_model 归一化后同样落在 1M
+        assert_eq!(get_context_window_size("claude-opus-5-latest"), 1_000_000);
+        assert_eq!(
+            get_context_window_size("claude-opus-5-20270101-thinking"),
+            1_000_000
+        );
+        assert_eq!(get_context_window_size("claude-opus.5"), 1_000_000);
+        // opus-4-5 不得被误匹配为 opus-5
+        assert_eq!(get_context_window_size("claude-opus-4-5"), 200_000);
+    }
+
+    /// 1M 名单的整体校验：新增 1M 模型时应同步此处，避免再次漏配。
+    #[test]
+    fn test_context_window_1m_family() {
+        for model in [
+            "claude-sonnet-4-6",
+            "claude-sonnet-4-8",
+            "claude-sonnet-5",
+            "claude-opus-4-6",
+            "claude-opus-4-7",
+            "claude-opus-4-8",
+            "claude-opus-5",
+        ] {
+            assert_eq!(
+                get_context_window_size(model),
+                1_000_000,
+                "{model} 应为 1M 上下文窗口"
+            );
+        }
+        // 未纳入 1M 的模型仍回退 200k
+        for model in ["claude-haiku-4-5", "claude-sonnet-4-5", "claude-opus-4-5"] {
+            assert_eq!(
+                get_context_window_size(model),
+                200_000,
+                "{model} 应回退 200k"
+            );
+        }
     }
 
     #[test]
