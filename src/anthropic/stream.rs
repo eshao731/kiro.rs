@@ -1028,12 +1028,18 @@ impl ToolJsonAccumulator {
         )))
     }
 
-    /// 流结束时收尾：若仍有从未收到 `stop=true` 的缓冲，说明上游在工具参数
-    /// 写到一半时截断，返回 `IncompleteJson`（取字节数最多的那个作代表）。
-    pub fn finish(&mut self) -> Result<(), ToolJsonAccumulatorError> {
+    /// 流结束时收尾。
+    ///
+    /// 非空但从未收到 `stop=true` 的缓冲仍视为真正的半截 JSON。空参数缓冲则
+    /// 按合法的 `{}` 工具调用补全；Kiro 对无参数工具可能不会发送额外的 stop 帧。
+    pub fn finish(
+        &mut self,
+        tool_name_map: &HashMap<String, String>,
+    ) -> Result<Vec<CompletedToolUse>, ToolJsonAccumulatorError> {
         if let Some((tool_use_id, (name, input))) = self
             .buffers
             .iter()
+            .filter(|(_, (_, input))| !input.trim().is_empty())
             .max_by_key(|(_, (_, input))| input.len())
             .map(|(id, (name, input))| (id.clone(), (name.clone(), input.clone())))
         {
@@ -1044,7 +1050,16 @@ impl ToolJsonAccumulator {
                 bytes: input.len(),
             });
         }
-        Ok(())
+
+        let mut completed: Vec<CompletedToolUse> = self
+            .buffers
+            .drain()
+            .map(|(id, (name, _))| {
+                CompletedToolUse::from_kiro(id, &name, serde_json::json!({}), tool_name_map)
+            })
+            .collect();
+        completed.sort_by(|a, b| a.id.cmp(&b.id));
+        Ok(completed)
     }
 }
 
@@ -2534,14 +2549,20 @@ impl StreamContext {
             events.extend(self.drain_invoke_sniff_buffer(true));
         }
 
-        // 收尾检查工具调用累积器：若仍有 tool_use 从未收到 stop=true（上游在参数
-        // 写到一半时截断），记为错误。process_tool_use 中已置位的错误保持不变。
-        if self.tool_json_error.is_none()
-            && let Err(e) = self.tool_json_accumulator.finish()
-        {
-            tracing::error!("{}", e);
-            self.tool_json_error = Some(e);
-            self.state_manager.set_stop_reason("error");
+        // 真正的半截 JSON 仍记为错误；0-byte 无参数调用则在 EOF 补成 `{}`。
+        if self.tool_json_error.is_none() {
+            match self.tool_json_accumulator.finish(&self.tool_name_map) {
+                Ok(completed) => {
+                    for tool_use in completed {
+                        events.extend(self.emit_completed_tool_use(tool_use));
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("{}", e);
+                    self.tool_json_error = Some(e);
+                    self.state_manager.set_stop_reason("error");
+                }
+            }
         }
 
         // Kiro 有时以 HTTP 200 + context/metering + EOF 结束，却没有任何文本、thinking
@@ -2912,11 +2933,32 @@ mod tests {
             .unwrap()
             .is_none()
         );
-        let err = acc.finish().unwrap_err();
+        let err = acc.finish(&HashMap::new()).unwrap_err();
         assert!(err.is_incomplete_json());
         assert!(matches!(err, ToolJsonAccumulatorError::IncompleteJson { .. }));
         // 已取出残留后再 finish() 应成功。
-        assert!(acc.finish().is_ok());
+        assert!(acc.finish(&HashMap::new()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn tool_json_accumulator_empty_buffer_without_stop_completes() {
+        let mut acc = ToolJsonAccumulator::new();
+        let mut map = HashMap::new();
+        map.insert(
+            "short_noop".to_string(),
+            "original_noop".to_string(),
+        );
+        assert!(
+            acc.push(&tool_evt("t1", "short_noop", "", false), &map)
+                .unwrap()
+                .is_none()
+        );
+
+        let completed = acc.finish(&map).unwrap();
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].id, "t1");
+        assert_eq!(completed[0].name, "original_noop");
+        assert_eq!(completed[0].input, serde_json::json!({}));
     }
 
     #[test]

@@ -163,6 +163,12 @@ jobs:
           RUSTFLAGS: -C link-arg=-fuse-ld=mold
         run: cargo test --locked --target ${{ matrix.target }} system_key_without_session_uses_configured_cache_ratio
 
+      - name: Run tool JSON accumulator regression tests
+        if: matrix.name == 'Linux-x64'
+        env:
+          RUSTFLAGS: -C link-arg=-fuse-ld=mold
+        run: cargo test --locked --target ${{ matrix.target }} tool_json_accumulator_
+
       - name: Build app
         env:
           RUSTFLAGS: ${{ contains(matrix.target, 'linux-gnu') && '-C link-arg=-fuse-ld=mold' || '' }}
