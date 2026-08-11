@@ -320,6 +320,7 @@ curl -X POST http://127.0.0.1:8990/api/admin/credentials/kiro-api-key \
 | `accountThrottleFailover` | `true` | 账号级 429 suspicious activity 时是否冷却并切换凭据 |
 | `modelFallback` | `true` | 当前凭据不支持请求模型时，是否记录模型级避让并切换其它凭据 |
 | `accountThrottleCooldownSecs` | `300` | 账号级风控冷却秒数 |
+| `ordinary429RetryCount` | `0` | 普通 429 的额外立即重试次数；大于 0 时取消外层等待并重试指定次数，`0` 或 `-1` 沿用原策略 |
 | `cacheMaxSavingsRatio` | `0.9` | Prompt cache 最多计入的输入 token 比例，范围 0-1 |
 | `extractThinking` | `true` | 非流式响应是否把旧 `<thinking>` 文本提取成 thinking block |
 | `traceEnabled` | `true` | 是否写入 `traces.db` |

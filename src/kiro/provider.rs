@@ -607,7 +607,7 @@ impl KiroProvider {
     /// 重试策略：
     /// - 每个凭据最多重试 MAX_RETRIES_PER_CREDENTIAL 次
     /// - 总重试次数 = min(凭据数量 × 每凭据重试次数, MAX_TOTAL_RETRIES)
-    /// - 硬上限 9 次，避免无限重试
+    /// - 普通 429 自定义重试开启后，从首次普通 429 起改用配置的立即重试预算
     async fn call_api_with_retry(
         &self,
         request_body: &str,
@@ -618,6 +618,12 @@ impl KiroProvider {
         // 重试预算按当前请求所属分组的账号数计算，避免小分组按全局账号数获得过多无效重试
         let total_credentials = self.token_manager.total_count_in_group(group).max(1);
         let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
+        let mut ordinary_429_retries = Ordinary429RetryState::new(
+            self.token_manager.get_ordinary_429_retry_count(),
+        );
+        // 自定义预算只有在普通 429 真正出现后才会激活。这里仅提供足够的循环槽位；
+        // 未命中普通 429 的请求仍由 allows_attempt() 严格限制在旧预算内。
+        let max_attempt_slots = ordinary_429_retries.max_attempt_slots(max_retries);
         let mut last_error: Option<anyhow::Error> = None;
         let mut force_refreshed: HashSet<u64> = HashSet::new();
         let api_type = if is_stream { "流式" } else { "非流式" };
@@ -625,7 +631,11 @@ impl KiroProvider {
         // 尝试从请求体中提取模型信息
         let model = Self::extract_model_from_request(request_body);
 
-        for attempt in 0..max_retries {
+        for attempt in 0..max_attempt_slots {
+            let attempt_limit = ordinary_429_retries.current_attempt_limit(max_retries);
+            if !ordinary_429_retries.allows_attempt(attempt, max_retries) {
+                break;
+            }
             let attempt_start = Instant::now();
             // 获取调用上下文（绑定 index、credentials、token）
             let mut ctx = match self.token_manager.acquire_context(model.as_deref(), group).await {
@@ -703,7 +713,7 @@ impl KiroProvider {
                     tracing::warn!(
                         "API 请求发送失败（尝试 {}/{}）: {}",
                         attempt + 1,
-                        max_retries,
+                        attempt_limit,
                         e
                     );
                     Self::emit_attempt(
@@ -713,7 +723,7 @@ impl KiroProvider {
                     // 网络错误通常是上游/链路瞬态问题，不应导致"禁用凭据"或"切换凭据"
                     // （否则一段时间网络抖动会把所有凭据都误禁用，需要重启才能恢复）
                     last_error = Some(e);
-                    if attempt + 1 < max_retries {
+                    if ordinary_429_retries.has_next_attempt(attempt, max_retries) {
                         sleep(Self::retry_delay(attempt)).await;
                     }
                     continue;
@@ -739,13 +749,15 @@ impl KiroProvider {
 
             // 失败响应：读取 body 用于日志/错误信息
             let body = response.text().await.unwrap_or_default();
+            let ordinary_429 =
+                is_ordinary_429(status.as_u16(), endpoint.as_ref(), &body);
 
             // 402 Payment Required 且额度用尽：禁用凭据并故障转移
             if status.as_u16() == 402 && endpoint.is_monthly_request_limit(&body) {
                 tracing::warn!(
                     "API 请求失败（额度已用尽，禁用凭据并切换，尝试 {}/{}）: {} {}",
                     attempt + 1,
-                    max_retries,
+                    attempt_limit,
                     status,
                     body
                 );
@@ -817,7 +829,7 @@ impl KiroProvider {
                         ctx.id,
                         model_id,
                         attempt + 1,
-                        max_retries,
+                        attempt_limit,
                         body
                     );
                     Self::emit_attempt(
@@ -859,7 +871,7 @@ impl KiroProvider {
                 tracing::warn!(
                     "API 请求失败（可能为凭据错误，尝试 {}/{}）: {} {}",
                     attempt + 1,
-                    max_retries,
+                    attempt_limit,
                     status,
                     body
                 );
@@ -1054,7 +1066,7 @@ impl KiroProvider {
                     ctx.id,
                     cooldown_secs,
                     attempt + 1,
-                    max_retries,
+                    attempt_limit,
                     body
                 );
 
@@ -1129,7 +1141,7 @@ impl KiroProvider {
                 tracing::warn!(
                     "API 请求失败（上游瞬态错误，尝试 {}/{}）: {} {}",
                     attempt + 1,
-                    max_retries,
+                    attempt_limit,
                     status,
                     body
                 );
@@ -1175,7 +1187,12 @@ impl KiroProvider {
                         );
                     }
                     let propagated = match rate_limit_error {
-                        Some(rate_limit) if !rate_limit.should_retry_locally() => {
+                        Some(rate_limit)
+                            if should_propagate_ordinary_429_immediately(
+                                &rate_limit,
+                                ordinary_429 && ordinary_429_retries.enabled(),
+                            ) =>
+                        {
                             return Err(rate_limit.into());
                         }
                         Some(rate_limit) if rate_limit.retry_after().is_some() => rate_limit,
@@ -1184,9 +1201,25 @@ impl KiroProvider {
                         }
                         _ => UpstreamRateLimitError::new(None),
                     };
+
+                    if ordinary_429 && ordinary_429_retries.enabled() {
+                        if ordinary_429_retries.activate_or_retry(attempt) {
+                            tracing::warn!(
+                                "普通 429 自定义立即重试已触发：当前外层尝试 {}，最多额外立即重试 {} 次（忽略 Retry-After）",
+                                attempt + 1,
+                                ordinary_429_retries.configured_retries()
+                            );
+                            last_error = Some(propagated.into());
+                            continue;
+                        }
+
+                        // 自定义预算耗尽后直接传播最后一次普通 429；不再回落到旧预算，
+                        // 也不在最后一次失败后额外等待。
+                        return Err(propagated.into());
+                    }
                     last_error = Some(propagated.into());
                 }
-                if attempt + 1 < max_retries {
+                if ordinary_429_retries.has_next_attempt(attempt, max_retries) {
                     // 429 限流用更长退避给账号配额恢复时间；408/5xx 仍用通用快速退避
                     let delay = if status.as_u16() == 429 {
                         Self::retry_delay_throttle(attempt)
@@ -1211,7 +1244,7 @@ impl KiroProvider {
             tracing::warn!(
                 "API 请求失败（未知错误，尝试 {}/{}）: {} {}",
                 attempt + 1,
-                max_retries,
+                attempt_limit,
                 status,
                 body
             );
@@ -1225,7 +1258,7 @@ impl KiroProvider {
                 status,
                 body
             ));
-            if attempt + 1 < max_retries {
+            if ordinary_429_retries.has_next_attempt(attempt, max_retries) {
                 sleep(Self::retry_delay(attempt)).await;
             }
         }
@@ -1235,7 +1268,7 @@ impl KiroProvider {
             anyhow::anyhow!(
                 "{} API 请求失败：已达到最大重试次数（{}次）",
                 api_type,
-                max_retries
+                ordinary_429_retries.current_attempt_limit(max_retries)
             )
         }))
     }
@@ -1330,6 +1363,75 @@ fn take_rate_limit_error(last_error: &mut Option<anyhow::Error>) -> Option<anyho
     } else {
         None
     }
+}
+
+/// 普通 429 的可选外层立即重试预算。
+///
+/// 配置未开启时，循环边界完全沿用旧的凭据数预算。配置开启后也不会预先扩大普通
+/// 请求的重试次数；只有第一次普通 429 才会激活一个从当前尝试开始计算的边界，确保
+/// 最多再执行配置数量的外层尝试。
+#[derive(Debug)]
+struct Ordinary429RetryState {
+    configured_retries: usize,
+    attempt_limit: Option<usize>,
+}
+
+impl Ordinary429RetryState {
+    fn new(configured_retries: i32) -> Self {
+        Self {
+            configured_retries: configured_retries.max(0) as usize,
+            attempt_limit: None,
+        }
+    }
+
+    fn enabled(&self) -> bool {
+        self.configured_retries > 0
+    }
+
+    fn configured_retries(&self) -> usize {
+        self.configured_retries
+    }
+
+    fn max_attempt_slots(&self, legacy_attempt_limit: usize) -> usize {
+        legacy_attempt_limit.saturating_add(self.configured_retries)
+    }
+
+    fn current_attempt_limit(&self, legacy_attempt_limit: usize) -> usize {
+        self.attempt_limit.unwrap_or(legacy_attempt_limit)
+    }
+
+    fn allows_attempt(&self, attempt: usize, legacy_attempt_limit: usize) -> bool {
+        attempt < self.current_attempt_limit(legacy_attempt_limit)
+    }
+
+    fn has_next_attempt(&self, attempt: usize, legacy_attempt_limit: usize) -> bool {
+        attempt.saturating_add(1) < self.current_attempt_limit(legacy_attempt_limit)
+    }
+
+    /// 激活首次普通 429 的预算，并返回当前失败后是否还允许一次外层尝试。
+    fn activate_or_retry(&mut self, attempt: usize) -> bool {
+        debug_assert!(self.enabled());
+        let configured_retries = self.configured_retries;
+        let attempt_limit = *self.attempt_limit.get_or_insert_with(|| {
+            attempt
+                .saturating_add(1)
+                .saturating_add(configured_retries)
+        });
+        attempt.saturating_add(1) < attempt_limit
+    }
+}
+
+fn should_propagate_ordinary_429_immediately(
+    rate_limit: &UpstreamRateLimitError,
+    custom_retry_enabled: bool,
+) -> bool {
+    !custom_retry_enabled && !rate_limit.should_retry_locally()
+}
+
+/// “普通 429”只包括全局过载/请求过多，不包括带 suspicious activity 特征的
+/// 账号级临时风控。后者即使在永远不冷却模式下落入瞬态错误分支，也不能激活本预算。
+fn is_ordinary_429(status: u16, endpoint: &dyn KiroEndpoint, body: &str) -> bool {
+    status == 429 && !endpoint.is_account_throttled(body)
 }
 
 /// 为账号风控 429 补齐本地冷却时间，并区分上游是否明确要求等待。
@@ -1494,5 +1596,79 @@ mod rate_limit_tests {
     fn current_acquire_rate_limit_is_detected_before_outer_retry() {
         let error = anyhow::Error::new(UpstreamRateLimitError::new(Some("30".to_string())));
         assert!(is_rate_limit_error(&error));
+    }
+
+    #[test]
+    fn disabled_ordinary_429_retry_values_preserve_legacy_attempt_limit() {
+        for configured in [0, -1] {
+            let state = Ordinary429RetryState::new(configured);
+            assert!(!state.enabled());
+            assert_eq!(state.max_attempt_slots(3), 3);
+            assert!(state.allows_attempt(2, 3));
+            assert!(!state.allows_attempt(3, 3));
+        }
+    }
+
+    #[test]
+    fn custom_ordinary_429_budget_activates_only_after_an_ordinary_429() {
+        let mut state = Ordinary429RetryState::new(5);
+
+        // 预留的循环槽位不能让从未命中过普通 429 的请求突破旧预算。
+        assert_eq!(state.max_attempt_slots(3), 8);
+        assert!(!state.allows_attempt(3, 3));
+
+        assert!(state.activate_or_retry(0));
+        assert_eq!(state.current_attempt_limit(3), 6);
+        assert!(state.allows_attempt(5, 3));
+        assert!(!state.allows_attempt(6, 3));
+    }
+
+    #[test]
+    fn custom_ordinary_429_budget_allows_exactly_n_additional_attempts() {
+        let mut state = Ordinary429RetryState::new(2);
+
+        assert!(state.activate_or_retry(0), "首次 429 后应允许第 1 次重试");
+        assert!(state.activate_or_retry(1), "应允许第 2 次重试");
+        assert!(
+            !state.activate_or_retry(2),
+            "第 3 次外层尝试仍为 429 时预算应耗尽"
+        );
+        assert_eq!(state.current_attempt_limit(4), 3);
+    }
+
+    #[test]
+    fn custom_ordinary_429_budget_starts_at_the_first_matching_attempt() {
+        let mut state = Ordinary429RetryState::new(2);
+
+        assert!(state.activate_or_retry(2));
+        assert_eq!(state.current_attempt_limit(3), 5);
+        assert!(state.has_next_attempt(3, 3));
+        assert!(!state.has_next_attempt(4, 3));
+    }
+
+    #[test]
+    fn custom_ordinary_429_retry_overrides_retry_after_until_budget_exhaustion() {
+        let rate_limit = UpstreamRateLimitError::new(Some("60".to_string()));
+
+        assert!(should_propagate_ordinary_429_immediately(
+            &rate_limit,
+            false
+        ));
+        assert!(!should_propagate_ordinary_429_immediately(
+            &rate_limit,
+            true
+        ));
+    }
+
+    #[test]
+    fn ordinary_429_excludes_suspicious_activity_account_throttles() {
+        let endpoint = IdeEndpoint::new();
+        let ordinary =
+            r#"{"message":"Too many requests, please wait before trying again.","reason":null}"#;
+        let suspicious = r#"{"message":"Due to suspicious activity, we are imposing temporary limits on how frequently your account (d-example) can send a request to Kiro while we investigate.","reason":null}"#;
+
+        assert!(is_ordinary_429(429, &endpoint, ordinary));
+        assert!(!is_ordinary_429(429, &endpoint, suspicious));
+        assert!(!is_ordinary_429(503, &endpoint, ordinary));
     }
 }

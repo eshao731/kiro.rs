@@ -88,6 +88,17 @@ export function TopbarTools({ compact = false }: TopbarToolsProps) {
     })
   }
 
+  const updateOrdinary429RetryCount = (count: number) => {
+    setThrottleConfig({ ordinary429RetryCount: count }, {
+      onSuccess: () => toast.success(
+        count > 0
+          ? `普通 429 将额外立即重试 ${count} 次`
+          : '已恢复普通 429 原重试策略',
+      ),
+      onError: (err) => toast.error(`保存失败: ${extractErrorMessage(err)}`),
+    })
+  }
+
   const updateNeverCooldown = (enabled: boolean) => {
     setThrottleConfig({ neverCooldown: enabled }, {
       onSuccess: () => toast.success(enabled ? '已开启永远不冷却' : '已恢复本地冷却保护'),
@@ -154,6 +165,7 @@ export function TopbarTools({ compact = false }: TopbarToolsProps) {
     updateDisableFailureAutoRecovery,
     updateModelFallback,
     updateNeverCooldown,
+    updateOrdinary429RetryCount,
     updateUnlimitedConcurrency,
     updateCooldown: (secs: number) =>
       setThrottleConfig({ cooldownSecs: secs }, {
@@ -278,6 +290,7 @@ interface ToolControls {
   updateDisableFailureAutoRecovery: (enabled: boolean) => void
   updateModelFallback: (enabled: boolean) => void
   updateNeverCooldown: (enabled: boolean) => void
+  updateOrdinary429RetryCount: (count: number) => void
   updateUnlimitedConcurrency: (enabled: boolean) => void
   updateCooldown: (secs: number) => void
 }
@@ -294,6 +307,7 @@ function FullTools({ controls }: { controls: ToolControls }) {
         onChangeDisableFailureAutoRecovery={controls.updateDisableFailureAutoRecovery}
         onChangeModelFallback={controls.updateModelFallback}
         onChangeNeverCooldown={controls.updateNeverCooldown}
+        onChangeOrdinary429RetryCount={controls.updateOrdinary429RetryCount}
         onChangeUnlimitedConcurrency={controls.updateUnlimitedConcurrency}
         onChangeCooldown={controls.updateCooldown}
       />
@@ -313,6 +327,7 @@ function CompactTools({ controls }: { controls: ToolControls }) {
     onChangeDisableFailureAutoRecovery: controls.updateDisableFailureAutoRecovery,
     onChangeModelFallback: controls.updateModelFallback,
     onChangeNeverCooldown: controls.updateNeverCooldown,
+    onChangeOrdinary429RetryCount: controls.updateOrdinary429RetryCount,
     onChangeUnlimitedConcurrency: controls.updateUnlimitedConcurrency,
     onChangeCooldown: controls.updateCooldown,
   }
@@ -433,6 +448,7 @@ interface ThrottleConfigButtonProps {
   onChangeDisableFailureAutoRecovery: (enabled: boolean) => void
   onChangeModelFallback: (enabled: boolean) => void
   onChangeNeverCooldown: (enabled: boolean) => void
+  onChangeOrdinary429RetryCount: (count: number) => void
   onChangeUnlimitedConcurrency: (enabled: boolean) => void
   onChangeCooldown: (secs: number) => void
 }
@@ -444,6 +460,7 @@ interface ThrottleState {
   failover: boolean
   modelFallback: boolean
   neverCooldown: boolean
+  ordinary429RetryCount: number
   unlimitedConcurrency: boolean
 }
 
@@ -484,7 +501,8 @@ const MAX_CUSTOM_COOLDOWN_MINUTES = 1440
 function ThrottleConfigButton({
   config, loading, saving, onToggleFailover, onChangeCooldown,
   onChangeDisableFailureAutoRecovery, onChangeNeverCooldown,
-  onChangeModelFallback, onChangeUnlimitedConcurrency,
+  onChangeModelFallback, onChangeOrdinary429RetryCount,
+  onChangeUnlimitedConcurrency,
 }: ThrottleConfigButtonProps) {
   const [open, setOpen] = useState(false)
   const [customMin, setCustomMin] = useState('')
@@ -522,6 +540,7 @@ function ThrottleConfigButton({
           onChangeDisableFailureAutoRecovery={onChangeDisableFailureAutoRecovery}
           onChangeModelFallback={onChangeModelFallback}
           onChangeNeverCooldown={onChangeNeverCooldown}
+          onChangeOrdinary429RetryCount={onChangeOrdinary429RetryCount}
           onChangeUnlimitedConcurrency={onChangeUnlimitedConcurrency}
         />
         <ThrottleCooldownPanel
@@ -544,6 +563,7 @@ function ThrottleBehaviorPanel({
   onChangeDisableFailureAutoRecovery,
   onChangeModelFallback,
   onChangeNeverCooldown,
+  onChangeOrdinary429RetryCount,
   onChangeUnlimitedConcurrency,
 }: {
   saving: boolean
@@ -551,8 +571,28 @@ function ThrottleBehaviorPanel({
   onChangeDisableFailureAutoRecovery: (enabled: boolean) => void
   onChangeModelFallback: (enabled: boolean) => void
   onChangeNeverCooldown: (enabled: boolean) => void
+  onChangeOrdinary429RetryCount: (count: number) => void
   onChangeUnlimitedConcurrency: (enabled: boolean) => void
 }) {
+  const [ordinary429RetryInput, setOrdinary429RetryInput] = useState(
+    String(state.ordinary429RetryCount),
+  )
+
+  useEffect(() => {
+    setOrdinary429RetryInput(String(state.ordinary429RetryCount))
+  }, [state.ordinary429RetryCount])
+
+  const submitOrdinary429RetryCount = (e: React.FormEvent) => {
+    e.preventDefault()
+    const raw = ordinary429RetryInput.trim()
+    const count = raw === '' ? Number.NaN : Number(raw)
+    if (!Number.isSafeInteger(count) || count < -1) {
+      toast.error('请输入 -1、0 或正整数')
+      return
+    }
+    onChangeOrdinary429RetryCount(count)
+  }
+
   return (
     <>
       <DropdownMenuLabel className="pt-1">保护策略</DropdownMenuLabel>
@@ -602,6 +642,38 @@ function ThrottleBehaviorPanel({
             onCheckedChange={(checked) => onChangeUnlimitedConcurrency(checked === true)}
           />
         </label>
+        <div className="rounded-md bg-secondary/40 px-2.5 py-2">
+          <div className="text-xs">
+            <div className="font-medium text-foreground">普通 429 立即重试次数</div>
+            <div className="leading-snug text-muted-foreground">
+              大于 0 时不等待，首次失败后额外立即重试 N 次；0 或 -1 沿用原策略
+            </div>
+          </div>
+          <form
+            className="mt-2 flex items-center gap-1.5"
+            onSubmit={submitOrdinary429RetryCount}
+          >
+            <Input
+              aria-label="普通 429 立即重试次数"
+              type="number"
+              min={-1}
+              step={1}
+              value={ordinary429RetryInput}
+              onChange={(e) => setOrdinary429RetryInput(e.target.value)}
+              disabled={saving}
+              className="h-7 min-w-0 flex-1 text-xs"
+            />
+            <Button
+              type="submit"
+              size="sm"
+              variant="outline"
+              className="h-7 text-xs"
+              disabled={saving || !ordinary429RetryInput.trim()}
+            >
+              保存
+            </Button>
+          </form>
+        </div>
         <label className="flex cursor-pointer items-start justify-between gap-3 rounded-md bg-secondary/40 px-2.5 py-2">
           <div className="text-xs">
             <div className="font-medium text-foreground">失败后不自动自愈</div>
@@ -767,6 +839,7 @@ function ThrottleCompactItems(props: ThrottleConfigButtonProps) {
     onChangeDisableFailureAutoRecovery,
     onChangeModelFallback,
     onChangeNeverCooldown,
+    onChangeOrdinary429RetryCount,
     onChangeUnlimitedConcurrency,
   } = props
   const [customMin, setCustomMin] = useState('')
@@ -800,6 +873,7 @@ function ThrottleCompactItems(props: ThrottleConfigButtonProps) {
         onChangeDisableFailureAutoRecovery={onChangeDisableFailureAutoRecovery}
         onChangeModelFallback={onChangeModelFallback}
         onChangeNeverCooldown={onChangeNeverCooldown}
+        onChangeOrdinary429RetryCount={onChangeOrdinary429RetryCount}
         onChangeUnlimitedConcurrency={onChangeUnlimitedConcurrency}
       />
       <ThrottleCooldownPanel
@@ -881,6 +955,7 @@ function readThrottleState(
     failover: config?.failover ?? true,
     modelFallback: config?.modelFallback ?? true,
     neverCooldown: config?.neverCooldown ?? false,
+    ordinary429RetryCount: config?.ordinary429RetryCount ?? 0,
     unlimitedConcurrency: config?.unlimitedConcurrency ?? false,
   }
 }

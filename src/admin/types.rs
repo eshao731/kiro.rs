@@ -533,6 +533,8 @@ pub struct AccountThrottleConfigResponse {
     pub disable_failure_auto_recovery: bool,
     /// 是否启用模型不支持时的凭据级退让
     pub model_fallback: bool,
+    /// 普通 429 专用重试次数；大于 0 启用，0 或负值禁用
+    pub ordinary_429_retry_count: i32,
 }
 
 /// 更新账号级风控故障转移配置
@@ -557,6 +559,9 @@ pub struct SetAccountThrottleConfigRequest {
     /// 是否启用模型不支持时的凭据级退让；缺省表示不修改
     #[serde(default)]
     pub model_fallback: Option<bool>,
+    /// 普通 429 专用重试次数；缺省表示不修改，大于 0 启用，0 或负值禁用
+    #[serde(default)]
+    pub ordinary_429_retry_count: Option<i32>,
 }
 
 /// 日志治理配置响应
@@ -1216,7 +1221,30 @@ pub struct DeleteGroupQuery {
 
 #[cfg(test)]
 mod tests {
-    use super::{AddCredentialRequest, ImportKiroApiKeyRequest};
+    use super::{
+        AccountThrottleConfigResponse, AddCredentialRequest, ImportKiroApiKeyRequest,
+        SetAccountThrottleConfigRequest,
+    };
+
+    #[test]
+    fn account_throttle_config_uses_camel_case_retry_count() {
+        let request: SetAccountThrottleConfigRequest =
+            serde_json::from_value(serde_json::json!({"ordinary429RetryCount": -1}))
+                .expect("请求应可反序列化");
+        assert_eq!(request.ordinary_429_retry_count, Some(-1));
+
+        let response = AccountThrottleConfigResponse {
+            failover: true,
+            cooldown_secs: 300,
+            never_cooldown: false,
+            unlimited_concurrency: false,
+            disable_failure_auto_recovery: false,
+            model_fallback: true,
+            ordinary_429_retry_count: 4,
+        };
+        let value = serde_json::to_value(response).expect("响应应可序列化");
+        assert_eq!(value["ordinary429RetryCount"], 4);
+    }
 
     #[test]
     fn import_kiro_api_key_request_maps_to_standard_add_flow() {

@@ -1897,6 +1897,7 @@ impl AdminService {
                 .token_manager
                 .get_disable_failure_auto_recovery(),
             model_fallback: self.token_manager.get_model_fallback(),
+            ordinary_429_retry_count: self.token_manager.get_ordinary_429_retry_count(),
         }
     }
 
@@ -1911,6 +1912,7 @@ impl AdminService {
             && req.unlimited_concurrency.is_none()
             && req.disable_failure_auto_recovery.is_none()
             && req.model_fallback.is_none()
+            && req.ordinary_429_retry_count.is_none()
         {
             return Err(AdminServiceError::InvalidCredential(
                 "至少提供一个故障转移配置字段".to_string(),
@@ -1925,6 +1927,7 @@ impl AdminService {
                 req.unlimited_concurrency,
                 req.disable_failure_auto_recovery,
                 req.model_fallback,
+                req.ordinary_429_retry_count,
             )
             .map_err(|e| AdminServiceError::InvalidCredential(e.to_string()))?;
 

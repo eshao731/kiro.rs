@@ -177,6 +177,12 @@ pub struct Config {
     #[serde(default)]
     pub unlimited_concurrency: bool,
 
+    /// 普通 429 专用重试次数（默认 0，禁用）。
+    ///
+    /// 大于 0 时启用专用重试逻辑；0 或负值沿用原有重试逻辑。
+    #[serde(default)]
+    pub ordinary_429_retry_count: i32,
+
     /// 是否关闭连续失败导致全部凭据禁用时的自动自愈（默认 false）。
     ///
     /// 开启后，`TooManyFailures` 凭据保持禁用，必须由管理员手动恢复。
@@ -360,6 +366,7 @@ impl Default for Config {
             account_throttle_cooldown_secs: default_account_throttle_cooldown_secs(),
             never_cooldown: false,
             unlimited_concurrency: false,
+            ordinary_429_retry_count: 0,
             disable_failure_auto_recovery: false,
             cache_max_savings_ratio: default_cache_max_savings_ratio(),
             input_cache_short_ttl_secs: default_input_cache_short_ttl_secs(),

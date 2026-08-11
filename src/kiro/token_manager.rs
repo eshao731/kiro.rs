@@ -13,7 +13,7 @@ use tokio::sync::Mutex as TokioMutex;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::time::{Duration as StdDuration, Instant};
 
 use crate::http_client::{ProxyConfig, build_client};
@@ -1121,6 +1121,8 @@ pub struct MultiTokenManager {
     never_cooldown: AtomicBool,
     /// 是否禁止普通 429 动态收缩并发（运行时可修改）
     unlimited_concurrency: AtomicBool,
+    /// 普通 429 专用重试次数（运行时可修改）
+    ordinary_429_retry_count: AtomicI32,
     /// 是否禁止失败过多后的自动自愈（运行时可修改）
     disable_failure_auto_recovery: AtomicBool,
     /// 最近一次统计持久化时间（用于 debounce）
@@ -1382,6 +1384,7 @@ impl MultiTokenManager {
         let throttle_cooldown_secs = config.account_throttle_cooldown_secs;
         let never_cooldown = config.never_cooldown;
         let unlimited_concurrency = config.unlimited_concurrency;
+        let ordinary_429_retry_count = config.ordinary_429_retry_count;
         let disable_failure_auto_recovery = config.disable_failure_auto_recovery;
         let manager = Self {
             config,
@@ -1399,6 +1402,7 @@ impl MultiTokenManager {
             account_throttle_cooldown_secs: AtomicU64::new(throttle_cooldown_secs),
             never_cooldown: AtomicBool::new(never_cooldown),
             unlimited_concurrency: AtomicBool::new(unlimited_concurrency),
+            ordinary_429_retry_count: AtomicI32::new(ordinary_429_retry_count),
             disable_failure_auto_recovery: AtomicBool::new(disable_failure_auto_recovery),
             last_stats_save_at: Mutex::new(None),
             stats_dirty: AtomicBool::new(false),
@@ -3978,6 +3982,11 @@ impl MultiTokenManager {
         self.unlimited_concurrency.load(Ordering::Relaxed)
     }
 
+    /// 获取普通 429 专用重试次数（Admin API / 请求失败处理）
+    pub fn get_ordinary_429_retry_count(&self) -> i32 {
+        self.ordinary_429_retry_count.load(Ordering::Relaxed)
+    }
+
     /// 获取是否禁止失败过多后的自动自愈（Admin API）
     pub fn get_disable_failure_auto_recovery(&self) -> bool {
         self.disable_failure_auto_recovery.load(Ordering::Relaxed)
@@ -3994,6 +4003,7 @@ impl MultiTokenManager {
         unlimited_concurrency: Option<bool>,
         disable_failure_auto_recovery: Option<bool>,
         model_fallback: Option<bool>,
+        ordinary_429_retry_count: Option<i32>,
     ) -> anyhow::Result<()> {
         if let Some(secs) = cooldown_secs {
             // 限定一个合理范围：1 秒到 24 小时
@@ -4006,6 +4016,7 @@ impl MultiTokenManager {
         let prev_cooldown = self.get_account_throttle_cooldown_secs();
         let prev_never_cooldown = self.get_never_cooldown();
         let prev_unlimited_concurrency = self.get_unlimited_concurrency();
+        let prev_ordinary_429_retry_count = self.get_ordinary_429_retry_count();
         let prev_disable_failure_auto_recovery = self.get_disable_failure_auto_recovery();
         let prev_model_fallback = self.get_model_fallback();
         let new_failover = failover.unwrap_or(prev_failover);
@@ -4013,6 +4024,8 @@ impl MultiTokenManager {
         let new_never_cooldown = never_cooldown.unwrap_or(prev_never_cooldown);
         let new_unlimited_concurrency =
             unlimited_concurrency.unwrap_or(prev_unlimited_concurrency);
+        let new_ordinary_429_retry_count =
+            ordinary_429_retry_count.unwrap_or(prev_ordinary_429_retry_count);
         let new_disable_failure_auto_recovery = disable_failure_auto_recovery
             .unwrap_or(prev_disable_failure_auto_recovery);
         let new_model_fallback = model_fallback.unwrap_or(prev_model_fallback);
@@ -4021,6 +4034,7 @@ impl MultiTokenManager {
             && new_cooldown == prev_cooldown
             && new_never_cooldown == prev_never_cooldown
             && new_unlimited_concurrency == prev_unlimited_concurrency
+            && new_ordinary_429_retry_count == prev_ordinary_429_retry_count
             && new_disable_failure_auto_recovery == prev_disable_failure_auto_recovery
             && new_model_fallback == prev_model_fallback
         {
@@ -4035,6 +4049,8 @@ impl MultiTokenManager {
             .store(new_never_cooldown, Ordering::Relaxed);
         self.unlimited_concurrency
             .store(new_unlimited_concurrency, Ordering::Relaxed);
+        self.ordinary_429_retry_count
+            .store(new_ordinary_429_retry_count, Ordering::Relaxed);
         self.disable_failure_auto_recovery
             .store(new_disable_failure_auto_recovery, Ordering::Relaxed);
         self.model_fallback
@@ -4047,6 +4063,7 @@ impl MultiTokenManager {
             new_unlimited_concurrency,
             new_disable_failure_auto_recovery,
             new_model_fallback,
+            new_ordinary_429_retry_count,
         ) {
             // 回滚内存值
             self.account_throttle_failover
@@ -4057,6 +4074,8 @@ impl MultiTokenManager {
                 .store(prev_never_cooldown, Ordering::Relaxed);
             self.unlimited_concurrency
                 .store(prev_unlimited_concurrency, Ordering::Relaxed);
+            self.ordinary_429_retry_count
+                .store(prev_ordinary_429_retry_count, Ordering::Relaxed);
             self.disable_failure_auto_recovery
                 .store(prev_disable_failure_auto_recovery, Ordering::Relaxed);
             self.model_fallback
@@ -4085,13 +4104,14 @@ impl MultiTokenManager {
         }
 
         tracing::info!(
-            "故障转移配置已更新: failover={}, cooldown_secs={}, never_cooldown={}, unlimited_concurrency={}, disable_failure_auto_recovery={}, model_fallback={}",
+            "故障转移配置已更新: failover={}, cooldown_secs={}, never_cooldown={}, unlimited_concurrency={}, disable_failure_auto_recovery={}, model_fallback={}, ordinary_429_retry_count={}",
             new_failover,
             new_cooldown,
             new_never_cooldown,
             new_unlimited_concurrency,
             new_disable_failure_auto_recovery,
-            new_model_fallback
+            new_model_fallback,
+            new_ordinary_429_retry_count
         );
         Ok(())
     }
@@ -4104,6 +4124,7 @@ impl MultiTokenManager {
         unlimited_concurrency: bool,
         disable_failure_auto_recovery: bool,
         model_fallback: bool,
+        ordinary_429_retry_count: i32,
     ) -> anyhow::Result<()> {
         use anyhow::Context;
 
@@ -4123,6 +4144,7 @@ impl MultiTokenManager {
         config.unlimited_concurrency = unlimited_concurrency;
         config.disable_failure_auto_recovery = disable_failure_auto_recovery;
         config.model_fallback = model_fallback;
+        config.ordinary_429_retry_count = ordinary_429_retry_count;
         config
             .save()
             .with_context(|| format!("持久化账号级风控配置失败: {}", config_path.display()))?;
@@ -4604,6 +4626,8 @@ mod tests {
             MultiTokenManager::new(config, vec![KiroCredentials::default()], None, None, false)
                 .unwrap();
 
+        assert_eq!(manager.get_ordinary_429_retry_count(), 0);
+
         manager
             .set_account_throttle_config(
                 None,
@@ -4612,6 +4636,7 @@ mod tests {
                 Some(true),
                 Some(true),
                 Some(false),
+                Some(6),
             )
             .unwrap();
 
@@ -4620,10 +4645,12 @@ mod tests {
         assert!(persisted.unlimited_concurrency);
         assert!(persisted.disable_failure_auto_recovery);
         assert!(!persisted.model_fallback);
+        assert_eq!(persisted.ordinary_429_retry_count, 6);
         assert!(manager.get_never_cooldown());
         assert!(manager.get_unlimited_concurrency());
         assert!(manager.get_disable_failure_auto_recovery());
         assert!(!manager.get_model_fallback());
+        assert_eq!(manager.get_ordinary_429_retry_count(), 6);
 
         std::fs::remove_file(&config_path).unwrap();
     }
@@ -4707,7 +4734,7 @@ mod tests {
             .is_some());
 
         manager
-            .set_account_throttle_config(None, None, None, Some(true), None, None)
+            .set_account_throttle_config(None, None, None, Some(true), None, None, None)
             .unwrap();
         assert_eq!(manager.entries.lock()[0].rate_limit_count, 0);
         assert!(manager.entries.lock()[0].rate_limit_until.is_none());
@@ -4742,7 +4769,7 @@ mod tests {
         assert!(manager.entries.lock()[0].throttled_until.is_some());
 
         manager
-            .set_account_throttle_config(None, None, Some(true), None, None, None)
+            .set_account_throttle_config(None, None, Some(true), None, None, None, None)
             .unwrap();
         assert!(manager.entries.lock()[0].throttled_until.is_none());
 
@@ -5586,7 +5613,7 @@ mod tests {
         );
 
         manager
-            .set_account_throttle_config(None, None, None, None, None, Some(false))
+            .set_account_throttle_config(None, None, None, None, None, Some(false), None)
             .unwrap();
 
         assert!(!manager.get_model_fallback());

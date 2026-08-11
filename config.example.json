@@ -9,6 +9,7 @@
   "defaultEndpoint": "ide",
   "modelFallback": true,
   "accountThrottleCooldownSecs": 300,
+  "ordinary429RetryCount": 0,
   "cacheMaxSavingsRatio": 0.9,
   "inputCacheShortTtlSecs": 300,
   "inputCacheLongTtlSecs": 3600,

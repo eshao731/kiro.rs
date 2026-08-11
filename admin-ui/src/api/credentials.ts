@@ -447,6 +447,7 @@ export interface AccountThrottleConfig {
   cooldownSecs: number
   neverCooldown: boolean
   unlimitedConcurrency: boolean
+  ordinary429RetryCount: number
   disableFailureAutoRecovery: boolean
   modelFallback: boolean
 }
