@@ -10,7 +10,7 @@ use crate::admin::trace_db::{
 };
 use crate::admin::usage_stats::{SharedAggregator, SharedRecorder, UsageRecord};
 use crate::kiro::model::available_models::{TokenLimits, UpstreamModel};
-use crate::kiro::model::events::Event;
+use crate::kiro::model::events::{Event, TokenUsage};
 use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::kiro::token_manager::ModelDiscoveryError;
@@ -451,12 +451,35 @@ pub(super) fn map_provider_error(err: Error) -> Response {
         .into_response()
 }
 
-/// 计算 Anthropic usage 口径的 input_tokens
-fn resolve_usage_input_tokens(
+/// 解析普通非流式响应的最终 Anthropic usage。
+///
+/// 返回 `(uncached_input, output, cache_write, cache_read)`。精确 provider 快照优先；
+/// 缺失时才使用 contextUsage/输入估算和本地 CacheMeter 分摊。
+fn resolve_non_stream_usage(
     fallback_total_input_tokens: i32,
     context_total_input_tokens: Option<i32>,
-) -> i32 {
-    context_total_input_tokens.unwrap_or(fallback_total_input_tokens)
+    fallback_output_tokens: i32,
+    cache_usage: super::cache_metering::CacheUsage,
+    provider_usage: Option<TokenUsage>,
+) -> (i32, i32, i32, i32) {
+    if let Some(usage) = provider_usage {
+        let usage = usage.sanitized();
+        return (
+            usage.uncached_input_tokens,
+            usage.output_tokens,
+            usage.cache_write_input_tokens,
+            usage.cache_read_input_tokens,
+        );
+    }
+
+    let total_input = context_total_input_tokens.unwrap_or(fallback_total_input_tokens);
+    let (input, cache_write, cache_read) = cache_usage.split_against_total(total_input);
+    (
+        input,
+        fallback_output_tokens.max(0),
+        cache_write,
+        cache_read,
+    )
 }
 
 #[cfg(test)]
@@ -1366,7 +1389,7 @@ fn record_stream_usage(
     hook.record(
         credential_id,
         input,
-        ctx.output_tokens,
+        ctx.resolved_output_tokens(),
         cache_creation,
         cache_read,
         ctx.credits,
@@ -1379,7 +1402,7 @@ fn stream_trace_usage(ctx: &StreamContext) -> TraceUsage {
     let (input, cache_creation, cache_read) = ctx.resolved_usage();
     TraceUsage {
         input_tokens: input.max(0) as u64,
-        output_tokens: ctx.output_tokens.max(0) as u64,
+        output_tokens: ctx.resolved_output_tokens() as u64,
         cache_creation_tokens: cache_creation.max(0) as u64,
         cache_read_tokens: cache_read.max(0) as u64,
         credits: if ctx.credits.is_finite() && ctx.credits > 0.0 {
@@ -1470,6 +1493,8 @@ async fn handle_non_stream_request(
     let mut stop_reason = "end_turn".to_string();
     // 从 contextUsageEvent 计算的实际输入 tokens
     let mut context_input_tokens: Option<i32> = None;
+    // metadataEvent.tokenUsage 是本次 provider 调用的精确最终快照。
+    let mut provider_token_usage: Option<TokenUsage> = None;
     // meteringEvent 上报的 credit 计费量（上游真实下发）；
     // input/cache_* 的互斥分摊在拿到 total 真值后由 cache_usage 完成。
     let mut credits: f64 = 0.0;
@@ -1523,6 +1548,20 @@ async fn handle_non_stream_request(
                                     tracing::error!("{}", e);
                                     tool_json_error = Some(e);
                                 }
+                            }
+                        }
+                        Event::Metadata(metadata) => {
+                            if let Some(usage) = metadata.token_usage {
+                                let usage = usage.sanitized();
+                                tracing::debug!(
+                                    uncached_input_tokens = usage.uncached_input_tokens,
+                                    cache_write_input_tokens = usage.cache_write_input_tokens,
+                                    cache_read_input_tokens = usage.cache_read_input_tokens,
+                                    output_tokens = usage.output_tokens,
+                                    "收到 metadataEvent.tokenUsage 精确用量"
+                                );
+                                // 单条 provider 流内是最终快照，重复事件取最后一份。
+                                provider_token_usage = Some(usage);
                             }
                         }
                         Event::ContextUsage(context_usage) => {
@@ -1657,14 +1696,46 @@ async fn handle_non_stream_request(
             );
             continue;
         }
-        hook.record(credential_id, input_tokens, 0, 0, 0, 0.0, "error");
-        tracer.finalize(
-            "error",
-            Some(outcome::BAD_REQUEST),
-            Some(&message),
-            None,
-            TraceUsage::zero(),
-        );
+        if let Some(usage) = provider_token_usage {
+            let usage = usage.sanitized();
+            let trace_usage = TraceUsage {
+                input_tokens: usage.uncached_input_tokens as u64,
+                output_tokens: usage.output_tokens as u64,
+                cache_creation_tokens: usage.cache_write_input_tokens as u64,
+                cache_read_tokens: usage.cache_read_input_tokens as u64,
+                credits: if credits.is_finite() && credits > 0.0 {
+                    credits
+                } else {
+                    0.0
+                },
+            };
+            hook.record(
+                credential_id,
+                usage.uncached_input_tokens,
+                usage.output_tokens,
+                usage.cache_write_input_tokens,
+                usage.cache_read_input_tokens,
+                credits,
+                "error",
+            );
+            tracer.finalize(
+                "error",
+                Some(outcome::BAD_REQUEST),
+                Some(&message),
+                None,
+                trace_usage,
+            );
+        } else {
+            // metadata 缺失时保留原有错误口径，不把不完整工具输出估算成已消费量。
+            hook.record(credential_id, input_tokens, 0, 0, 0, 0.0, "error");
+            tracer.finalize(
+                "error",
+                Some(outcome::BAD_REQUEST),
+                Some(&message),
+                None,
+                TraceUsage::zero(),
+            );
+        }
         return (
             StatusCode::BAD_GATEWAY,
             Json(ErrorResponse::new("upstream_tool_json_error", message)),
@@ -1734,14 +1805,16 @@ async fn handle_non_stream_request(
             .into_response();
     }
 
-    // 估算输出 tokens（上游不下发 token，全部走估算）
-    let output_tokens = token::estimate_output_tokens(&content);
-
-    // 输入 tokens：contextUsage 真实值优先，否则用客户端估算
-    let total_input_tokens = resolve_usage_input_tokens(input_tokens, context_input_tokens);
-    // 互斥分摊：input + cache_creation + cache_read == total
-    let (final_input_tokens, cache_creation_tokens, cache_read_tokens) =
-        cache_usage.split_against_total(total_input_tokens);
+    // provider 未下发 metadataEvent 时才使用本地输出估算。
+    let fallback_output_tokens = token::estimate_output_tokens(&content);
+    let (final_input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens) =
+        resolve_non_stream_usage(
+            input_tokens,
+            context_input_tokens,
+            fallback_output_tokens,
+            cache_usage,
+            provider_token_usage,
+        );
 
     // 构建 Anthropic 响应
     let mut usage_json = json!({
@@ -2826,6 +2899,44 @@ mod tests {
         assert_eq!(models[0].display_name, "Configured GPT");
         assert_eq!(models[0].owned_by, "configured-owner");
         assert_eq!(models[0].max_tokens, 12_345);
+    }
+
+    #[test]
+    fn non_stream_usage_prefers_sanitized_provider_snapshot() {
+        let fallback_cache = super::super::cache_metering::CacheUsage {
+            cache_read: 25,
+            cache_covered_est: 50,
+            prompt_total_est: 100,
+        };
+        let provider = TokenUsage {
+            uncached_input_tokens: 3,
+            output_tokens: 11,
+            cache_read_input_tokens: 7,
+            cache_write_input_tokens: 4,
+        };
+
+        assert_eq!(
+            resolve_non_stream_usage(100, Some(80), 9, fallback_cache, Some(provider)),
+            (3, 11, 4, 7)
+        );
+    }
+
+    #[test]
+    fn non_stream_usage_falls_back_to_context_and_cache_split() {
+        let cache_usage = super::super::cache_metering::CacheUsage {
+            cache_read: 25,
+            cache_covered_est: 50,
+            prompt_total_est: 100,
+        };
+
+        assert_eq!(
+            resolve_non_stream_usage(100, Some(80), 9, cache_usage, None),
+            (40, 9, 20, 20)
+        );
+        assert_eq!(
+            resolve_non_stream_usage(100, None, -9, Default::default(), None),
+            (100, 0, 0, 0)
+        );
     }
 
     #[test]

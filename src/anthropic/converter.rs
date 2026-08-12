@@ -11,7 +11,9 @@ use crate::kiro::model::requests::conversation::{
     AssistantMessage, ConversationState, CurrentMessage, HistoryAssistantMessage,
     HistoryUserMessage, KiroImage, Message, UserInputMessage, UserInputMessageContext, UserMessage,
 };
-use crate::kiro::model::requests::kiro::{AdditionalModelRequestFields, KiroOutputConfig};
+use crate::kiro::model::requests::kiro::{
+    AdditionalModelRequestFields, KiroOutputConfig, KiroReasoningConfig,
+};
 use crate::kiro::model::requests::tool::{
     InputSchema, Tool, ToolResult, ToolSpecification, ToolUseEntry,
 };
@@ -333,14 +335,18 @@ pub fn get_context_window_size(model: &str) -> i32 {
     }
 }
 
-/// 是否为已确认接受 `additionalModelRequestFields.output_config` 的模型。
-///
-/// Kiro `ListAvailableModels`（2026-06）确认：Opus 4.6/4.7/4.8、Sonnet 4.6 接受
-/// `output_config`。Claude 5 系（fable-5 / mythos-5 / sonnet-5 / opus-5 / claude-5）
-/// 与 xhigh 能力一致，一并视为支持。其余（4.5 系、haiku、sonnet-4.8 等）保守视为
-/// 不支持——向它们下发会触发上游 400（`additionalModelRequestFields is not supported`）。
-/// 若后续实测某模型 400，从这里去除即可。
+fn model_uses_gpt_reasoning_effort(model_id: &str) -> bool {
+    matches!(
+        model_id.to_ascii_lowercase().as_str(),
+        "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna"
+    )
+}
+
+/// 是否为已确认接受原生 reasoning effort 字段的模型。
 fn model_supports_native_reasoning(model_id: &str) -> bool {
+    if model_uses_gpt_reasoning_effort(model_id) {
+        return true;
+    }
     // 自定义模型可按 backend_id 声明支持 reasoning。
     if crate::model::custom_models::backend_supports_reasoning(model_id) {
         return true;
@@ -409,6 +415,7 @@ fn select_native_reasoning_effort(req: &MessagesRequest, model_id: &str) -> Stri
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EffortTier {
+    None,
     Low,
     Medium,
     High,
@@ -419,6 +426,7 @@ enum EffortTier {
 impl EffortTier {
     fn parse(raw: &str) -> Option<Self> {
         match raw.trim().to_ascii_lowercase().as_str() {
+            "none" => Some(Self::None),
             "low" => Some(Self::Low),
             "medium" => Some(Self::Medium),
             "high" => Some(Self::High),
@@ -430,6 +438,7 @@ impl EffortTier {
 
     fn as_str(self) -> &'static str {
         match self {
+            Self::None => "none",
             Self::Low => "low",
             Self::Medium => "medium",
             Self::High => "high",
@@ -462,7 +471,11 @@ fn normalize_effort_for_model(model_id: &str, raw_effort: &str) -> Option<String
     // it with `Invalid additionalModelRequestFields`, so map to the nearest
     // lower tier instead of failing the request. Unknown/future models keep
     // recognized values intact to avoid maintaining a brittle full allow-list.
-    let normalized = if requested == EffortTier::XHigh && !model_supports_xhigh_effort(model_id) {
+    let normalized = if requested == EffortTier::None
+        && !model_uses_gpt_reasoning_effort(model_id)
+    {
+        EffortTier::High
+    } else if requested == EffortTier::XHigh && !model_supports_xhigh_effort(model_id) {
         EffortTier::High
     } else {
         requested
@@ -517,14 +530,14 @@ fn build_additional_model_request_fields(
         return None;
     }
 
-    // 仅对确认接受 output_config 的模型下发，避免上游 400。
+    // 仅对确认支持 effort 的模型下发，避免上游 schema 校验 400。
     if !model_supports_native_reasoning(model_id) {
         if let Some(oc) = &req.output_config
             && !oc.effort.trim().is_empty()
         {
             tracing::debug!(
                 model_id = %model_id,
-                "skipping unsupported additionalModelRequestFields.output_config for model"
+                "skipping unsupported reasoning effort for model"
             );
         }
         return None;
@@ -536,9 +549,17 @@ fn build_additional_model_request_fields(
     }
 
     let effort = select_native_reasoning_effort(req, model_id);
-    Some(AdditionalModelRequestFields {
-        output_config: Some(KiroOutputConfig { effort }),
-    })
+    if model_uses_gpt_reasoning_effort(model_id) {
+        Some(AdditionalModelRequestFields {
+            output_config: None,
+            reasoning: Some(KiroReasoningConfig { effort }),
+        })
+    } else {
+        Some(AdditionalModelRequestFields {
+            output_config: Some(KiroOutputConfig { effort }),
+            reasoning: None,
+        })
+    }
 }
 
 /// 转换结果
@@ -2635,6 +2656,9 @@ mod tests {
     #[test]
     fn model_supports_native_reasoning_allows_confirmed_and_5_family() {
         for m in [
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.6-luna",
             "claude-opus-4.6",
             "claude-opus-4.7",
             "claude-opus-4.8",
@@ -2655,6 +2679,29 @@ mod tests {
                 "{m} 未确认支持，不应下发 output_config"
             );
         }
+    }
+
+    #[test]
+    fn gpt_5_6_effort_uses_reasoning_wire_field() {
+        for model in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
+            for effort in ["none", "low", "medium", "high", "xhigh", "max"] {
+                let req = minimal_request_with_effort(model, effort);
+                let fields = convert_request(&req)
+                    .unwrap()
+                    .additional_model_request_fields
+                    .expect("GPT-5.6 effort should be forwarded");
+                assert!(fields.output_config.is_none());
+                assert_eq!(fields.reasoning.unwrap().effort, effort);
+            }
+        }
+    }
+
+    #[test]
+    fn none_effort_falls_back_for_claude() {
+        assert_eq!(
+            normalize_effort_for_model("claude-opus-4.7", "none").as_deref(),
+            Some("high")
+        );
     }
 
     #[test]

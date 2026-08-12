@@ -18,7 +18,7 @@ use axum::{
     Json,
     body::{Body, to_bytes},
     extract::{Extension, State},
-    http::{StatusCode, header},
+    http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
 };
 use serde::Deserialize;
@@ -27,7 +27,7 @@ use uuid::Uuid;
 
 use super::handlers::post_messages;
 use super::middleware::{AppState, KeyContext};
-use super::types::{Message, MessagesRequest, OutputConfig, SystemMessage, Tool};
+use super::types::{Message, MessagesRequest, Metadata, OutputConfig, SystemMessage, Tool};
 
 /// 读取内部响应体时的上限（64MB，与请求体上限对齐）
 const MAX_INNER_BODY: usize = 64 * 1024 * 1024;
@@ -54,6 +54,35 @@ pub struct ChatCompletionRequest {
     pub tool_choice: Option<Value>,
     #[serde(default)]
     pub reasoning_effort: Option<String>,
+    #[serde(default)]
+    pub prompt_cache_key: Option<String>,
+}
+
+/// 从 OpenAI 请求体或会话亲和请求头中提取并规范化 Kiro 会话 UUID。
+pub(super) fn resolve_session_metadata(
+    prompt_cache_key: Option<&str>,
+    headers: &HeaderMap,
+) -> Option<Metadata> {
+    let candidates = [
+        prompt_cache_key,
+        headers
+            .get("x-session-affinity")
+            .and_then(|value| value.to_str().ok()),
+        headers
+            .get("x-client-request-id")
+            .and_then(|value| value.to_str().ok()),
+        headers
+            .get("session_id")
+            .and_then(|value| value.to_str().ok()),
+    ];
+
+    candidates.into_iter().flatten().find_map(|candidate| {
+        let raw_uuid = candidate.strip_prefix("session_").unwrap_or(candidate);
+        let uuid = Uuid::parse_str(raw_uuid).ok()?;
+        Some(Metadata {
+            user_id: Some(format!("session_{uuid}")),
+        })
+    })
 }
 
 // ============================ Handler ============================
@@ -62,10 +91,12 @@ pub struct ChatCompletionRequest {
 pub async fn post_chat_completions(
     State(state): State<AppState>,
     Extension(key_ctx): Extension<KeyContext>,
+    headers: HeaderMap,
     Json(req): Json<ChatCompletionRequest>,
 ) -> Response {
     let want_stream = req.stream;
     let model = req.model.clone();
+    let metadata = resolve_session_metadata(req.prompt_cache_key.as_deref(), &headers);
 
     tracing::info!(
         model = %model,
@@ -75,7 +106,7 @@ pub async fn post_chat_completions(
     );
 
     // 1. OpenAI -> Anthropic 请求翻译
-    let anthropic_req = match openai_to_anthropic(req) {
+    let anthropic_req = match openai_to_anthropic(req, metadata) {
         Ok(r) => r,
         Err(msg) => {
             return openai_error(StatusCode::BAD_REQUEST, "invalid_request_error", &msg);
@@ -136,7 +167,10 @@ pub async fn post_chat_completions(
 
 // ============================ 请求翻译 ============================
 
-fn openai_to_anthropic(req: ChatCompletionRequest) -> Result<MessagesRequest, String> {
+fn openai_to_anthropic(
+    req: ChatCompletionRequest,
+    metadata: Option<Metadata>,
+) -> Result<MessagesRequest, String> {
     let max_tokens = req
         .max_tokens
         .or(req.max_completion_tokens)
@@ -238,12 +272,16 @@ fn openai_to_anthropic(req: ChatCompletionRequest) -> Result<MessagesRequest, St
         max_tokens,
         messages,
         stream: false, // 内部始终非流式
-        system: if system.is_empty() { None } else { Some(system) },
+        system: if system.is_empty() {
+            None
+        } else {
+            Some(system)
+        },
         tools,
         tool_choice,
         thinking: None,
         output_config,
-        metadata: None,
+        metadata,
     })
 }
 
@@ -494,23 +532,29 @@ pub(super) fn parse_anthropic_message(anthropic: &Value, model: &str) -> ParsedR
     let finish_reason = map_finish_reason(stop_reason, !tool_calls.is_empty()).to_string();
 
     let usage = anthropic.get("usage");
-    let input_tokens = usage
+    let uncached_input_tokens = usage
         .and_then(|u| u.get("input_tokens"))
         .and_then(|v| v.as_i64())
-        .unwrap_or(0);
+        .unwrap_or(0)
+        .max(0);
     let cache_creation_tokens = usage
         .and_then(|u| u.get("cache_creation_input_tokens"))
         .and_then(|v| v.as_i64())
-        .unwrap_or(0);
+        .unwrap_or(0)
+        .max(0);
     let cached_tokens = usage
         .and_then(|u| u.get("cache_read_input_tokens"))
         .and_then(|v| v.as_i64())
-        .unwrap_or(0);
-    let prompt_tokens = input_tokens + cache_creation_tokens + cached_tokens;
+        .unwrap_or(0)
+        .max(0);
+    let prompt_tokens = uncached_input_tokens
+        .saturating_add(cache_creation_tokens)
+        .saturating_add(cached_tokens);
     let completion_tokens = usage
         .and_then(|u| u.get("output_tokens"))
         .and_then(|v| v.as_i64())
-        .unwrap_or(0);
+        .unwrap_or(0)
+        .max(0);
 
     let credit_usage = usage
         .and_then(|u| u.get("credit_usage"))
@@ -717,6 +761,123 @@ mod tests {
         assert!(sse.contains("\"cached_tokens\":850"));
     }
 
+    const UUID_A: &str = "550e8400-e29b-41d4-a716-446655440000";
+    const UUID_B: &str = "67e55044-10b1-426f-9247-bb680e5fe0c8";
+    const UUID_C: &str = "123e4567-e89b-12d3-a456-426614174000";
+    const UUID_D: &str = "123e4567-e89b-12d3-a456-426614174001";
+
+    fn metadata_user_id(metadata: Option<Metadata>) -> Option<String> {
+        metadata.and_then(|value| value.user_id)
+    }
+
+    fn chat_request(prompt_cache_key: Option<&str>) -> ChatCompletionRequest {
+        let mut value = json!({
+            "model": "gpt-5.6-sol",
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning_effort": "low",
+            "max_completion_tokens": 12
+        });
+        if let Some(key) = prompt_cache_key {
+            value["prompt_cache_key"] = json!(key);
+        }
+        serde_json::from_value(value).unwrap()
+    }
+
+    #[test]
+    fn session_metadata_accepts_and_normalizes_uuid_forms() {
+        let headers = HeaderMap::new();
+        assert_eq!(
+            metadata_user_id(resolve_session_metadata(
+                Some("550E8400-E29B-41D4-A716-446655440000"),
+                &headers,
+            ))
+            .as_deref(),
+            Some("session_550e8400-e29b-41d4-a716-446655440000")
+        );
+        assert_eq!(
+            metadata_user_id(resolve_session_metadata(
+                Some("session_67e55044-10b1-426f-9247-bb680e5fe0c8"),
+                &headers,
+            ))
+            .as_deref(),
+            Some("session_67e55044-10b1-426f-9247-bb680e5fe0c8")
+        );
+    }
+
+    #[test]
+    fn session_metadata_uses_body_then_header_priority_with_invalid_fallback() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-session-affinity",
+            format!("session_{UUID_B}").parse().unwrap(),
+        );
+        headers.insert("x-client-request-id", UUID_C.parse().unwrap());
+        headers.insert("session_id", UUID_D.parse().unwrap());
+
+        assert_eq!(
+            metadata_user_id(resolve_session_metadata(Some(UUID_A), &headers)).as_deref(),
+            Some("session_550e8400-e29b-41d4-a716-446655440000")
+        );
+        assert_eq!(
+            metadata_user_id(resolve_session_metadata(Some("invalid"), &headers)).as_deref(),
+            Some("session_67e55044-10b1-426f-9247-bb680e5fe0c8")
+        );
+
+        headers.insert("x-session-affinity", "invalid".parse().unwrap());
+        assert_eq!(
+            metadata_user_id(resolve_session_metadata(None, &headers)).as_deref(),
+            Some("session_123e4567-e89b-12d3-a456-426614174000")
+        );
+
+        headers.insert("x-client-request-id", "invalid".parse().unwrap());
+        assert_eq!(
+            metadata_user_id(resolve_session_metadata(None, &headers)).as_deref(),
+            Some("session_123e4567-e89b-12d3-a456-426614174001")
+        );
+    }
+
+    #[test]
+    fn session_metadata_skips_non_utf8_and_invalid_candidates() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-session-affinity",
+            axum::http::HeaderValue::from_bytes(&[0xff]).unwrap(),
+        );
+        headers.insert("x-client-request-id", "not-a-uuid".parse().unwrap());
+        headers.insert("session_id", "session_not-a-uuid".parse().unwrap());
+
+        assert!(resolve_session_metadata(Some("invalid"), &headers).is_none());
+        assert!(resolve_session_metadata(None, &HeaderMap::new()).is_none());
+    }
+
+    #[test]
+    fn chat_conversion_forwards_resolved_metadata_without_other_regressions() {
+        let req = chat_request(Some(UUID_A));
+        let metadata = resolve_session_metadata(req.prompt_cache_key.as_deref(), &HeaderMap::new());
+        let anthropic = openai_to_anthropic(req, metadata).unwrap();
+
+        assert_eq!(
+            anthropic
+                .metadata
+                .and_then(|value| value.user_id)
+                .as_deref(),
+            Some("session_550e8400-e29b-41d4-a716-446655440000")
+        );
+        assert_eq!(anthropic.model, "gpt-5.6-sol");
+        assert_eq!(anthropic.max_tokens, 12);
+        assert_eq!(anthropic.messages.len(), 1);
+        assert_eq!(
+            anthropic
+                .output_config
+                .as_ref()
+                .map(|config| config.effort.as_str()),
+            Some("low")
+        );
+
+        let anthropic = openai_to_anthropic(chat_request(None), None).unwrap();
+        assert!(anthropic.metadata.is_none());
+    }
+
     fn base_parsed() -> ParsedResponse {
         ParsedResponse {
             model: "gpt-5.6-sol".to_string(),
@@ -810,6 +971,40 @@ mod tests {
         assert_eq!(p.credit_usage, Some(0.6));
         assert_eq!(p.credit_unit.as_deref(), Some("credit"));
         assert_eq!(p.credit_unit_plural.as_deref(), Some("credits"));
+    }
+
+    #[test]
+    fn parse_anthropic_message_combines_all_input_categories() {
+        let anthropic = json!({
+            "content": [],
+            "stop_reason": "end_turn",
+            "usage": {
+                "input_tokens": 3,
+                "cache_creation_input_tokens": 4,
+                "cache_read_input_tokens": 7,
+                "output_tokens": 5
+            }
+        });
+        let p = parse_anthropic_message(&anthropic, "gpt-5.6-sol");
+        assert_eq!(p.prompt_tokens, 14);
+        assert_eq!(p.cached_tokens, 7);
+        assert_eq!(p.completion_tokens, 5);
+    }
+
+    #[test]
+    fn parse_anthropic_message_sanitizes_negative_and_missing_usage() {
+        let anthropic = json!({
+            "content": [],
+            "usage": {
+                "input_tokens": -3,
+                "cache_read_input_tokens": -7,
+                "output_tokens": -5
+            }
+        });
+        let p = parse_anthropic_message(&anthropic, "gpt-5.6-sol");
+        assert_eq!(p.prompt_tokens, 0);
+        assert_eq!(p.cached_tokens, 0);
+        assert_eq!(p.completion_tokens, 0);
     }
 
     #[test]
