@@ -1155,9 +1155,6 @@ pub struct CredentialEntrySnapshot {
     /// 账号来源渠道（纯备注）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_channel: Option<String>,
-    /// 凭据添加（创建）时间（RFC3339 格式）；旧凭据缺失时为 None
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub created_at: Option<String>,
 }
 
 /// 凭据管理器状态快照
@@ -3563,7 +3560,6 @@ impl MultiTokenManager {
                     endpoint: e.credentials.endpoint.clone(),
                     groups: e.credentials.groups.clone(),
                     source_channel: e.credentials.source_channel.clone(),
-                    created_at: e.credentials.created_at.clone(),
                 })
                 .collect(),
             current_id,
@@ -3751,7 +3747,6 @@ impl MultiTokenManager {
                 .filter(|e| {
                     !e.disabled
                         && !e.throttled_until.map(|t| t > throttled_now).unwrap_or(false)
-                        && credential_matches_request(e, model, group)
                 })
                 .count()
         }

@@ -1066,7 +1066,8 @@ impl KiroProvider {
                                     None,
                                     fb_start,
                                 );
-                                self.token_manager.report_success(ctx.id);
+                                self.token_manager
+                                    .report_success_for_request(ctx.id, model.as_deref());
                                 tracing::info!(
                                     "凭据 #{} 在备用端点 [{}] 成功（主端点 [{}] 此前 429）",
                                     ctx.id,

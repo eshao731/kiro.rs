@@ -14,9 +14,7 @@ use crate::kiro::auth::idc::{self, BUILDER_ID_START_URL};
 use crate::kiro::auth::social;
 use crate::kiro::error::UpstreamRateLimitError;
 use crate::kiro::model::available_models::ListAvailableModelsResponse;
-use crate::kiro::model::credentials::{
-    KiroCredentials, normalize_import_auth_method, validate_external_idp_endpoint,
-};
+use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::model::events::{Event, strip_tool_use_xml_leaks};
 use crate::kiro::model::requests::conversation::{
     ConversationState, CurrentMessage, UserInputMessage,
