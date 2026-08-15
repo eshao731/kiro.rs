@@ -696,7 +696,6 @@ impl AdminService {
                     source_channel: entry.source_channel,
                     balance,
                     balance_updated_at,
-                    created_at: entry.created_at,
                 }
             })
             .collect();

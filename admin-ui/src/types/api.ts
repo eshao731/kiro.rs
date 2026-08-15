@@ -57,8 +57,6 @@ export interface CredentialStatusItem {
   balance?: BalanceResponse
   /** 余额缓存的更新时间（Unix 秒） */
   balanceUpdatedAt?: number
-  /** 凭据添加（创建）时间（RFC3339 格式）；旧凭据缺失时为 undefined */
-  createdAt?: string
 }
 
 export interface CredentialApiKeyResponse {
