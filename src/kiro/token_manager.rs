@@ -5612,10 +5612,7 @@ mod tests {
 
         let snapshot = manager.snapshot();
         let entry = snapshot.entries.first().expect("凭据应已入库");
-        let created_at = entry
-            .created_at
-            .as_deref()
-            .expect("新凭据应写入 created_at");
+        let created_at = &entry.created_at;
         assert!(
             DateTime::parse_from_rfc3339(created_at).is_ok(),
             "created_at 应为合法 RFC3339: {created_at}"

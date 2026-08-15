@@ -1462,20 +1462,22 @@ mod tests {
     }
 
     #[test]
-    fn test_is_external_idp_and_token_type_header() {
+    fn test_external_idp_and_api_key_detection() {
         let mut cred = KiroCredentials {
             auth_method: Some("azuread".to_string()), // 别名也应识别
             ..Default::default()
         };
-        assert!(cred.is_external_idp_credential());
-        assert_eq!(cred.token_type_header(), Some("EXTERNAL_IDP"));
+        cred.canonicalize_auth_method();
+        assert!(cred.is_external_idp());
+        assert!(!cred.is_api_key_credential());
 
         cred.auth_method = Some("social".to_string());
-        assert!(!cred.is_external_idp_credential());
-        assert_eq!(cred.token_type_header(), None);
+        assert!(!cred.is_external_idp());
+        assert!(!cred.is_api_key_credential());
 
         cred.auth_method = Some("api_key".to_string());
-        assert_eq!(cred.token_type_header(), Some("API_KEY"));
+        assert!(!cred.is_external_idp());
+        assert!(cred.is_api_key_credential());
     }
 
     #[test]

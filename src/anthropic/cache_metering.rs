@@ -734,6 +734,7 @@ fn collect_tool_result_segments<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::anthropic::stream::estimate_tokens;
 
     #[test]
     fn lookup_miss_then_record_then_hit() {

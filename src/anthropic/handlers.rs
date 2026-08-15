@@ -2907,6 +2907,7 @@ mod tests {
             cache_read: 25,
             cache_covered_est: 50,
             prompt_total_est: 100,
+            ..Default::default()
         };
         let provider = TokenUsage {
             uncached_input_tokens: 3,
@@ -2927,6 +2928,7 @@ mod tests {
             cache_read: 25,
             cache_covered_est: 50,
             prompt_total_est: 100,
+            ..Default::default()
         };
 
         assert_eq!(
