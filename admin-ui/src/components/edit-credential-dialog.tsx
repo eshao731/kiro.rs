@@ -146,7 +146,7 @@ export function EditCredentialDialog({
           </DialogTitle>
         </DialogHeader>
 
-        <form onSubmit={handleSubmit}>
+        <form onSubmit={handleSubmit} autoComplete="off">
           <div className="space-y-4 py-4">
             {credential.authMethod === 'api_key' && (
               <div className="space-y-2 rounded-xl border border-border/60 bg-secondary/30 p-3">
@@ -204,6 +204,7 @@ export function EditCredentialDialog({
               <Input
                 id="email"
                 type="email"
+                autoComplete="off"
                 placeholder="例: user@example.com"
                 value={email}
                 onChange={(e) => setEmail(e.target.value)}
@@ -298,6 +299,11 @@ export function EditCredentialDialog({
               <div className="grid grid-cols-2 gap-2">
                 <Input
                   id="proxyUsername"
+                  name="kiro-proxy-auth-user"
+                  autoComplete="off"
+                  data-1p-ignore
+                  data-bwignore
+                  data-lpignore="true"
                   placeholder="代理用户名（留空不修改）"
                   value={proxyUsername}
                   onChange={(e) => setProxyUsername(e.target.value)}
@@ -305,7 +311,12 @@ export function EditCredentialDialog({
                 />
                 <Input
                   id="proxyPassword"
+                  name="kiro-proxy-auth-secret"
                   type="password"
+                  autoComplete="new-password"
+                  data-1p-ignore
+                  data-bwignore
+                  data-lpignore="true"
                   placeholder="代理密码（留空不修改）"
                   value={proxyPassword}
                   onChange={(e) => setProxyPassword(e.target.value)}
