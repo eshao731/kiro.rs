@@ -1,0 +1,51 @@
+name: Relay Build Artifact
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_run_id:
+        description: GitHub Actions run ID containing the artifact
+        required: true
+        type: string
+      source_sha:
+        description: Commit SHA that produced the artifact
+        required: true
+        type: string
+      source_artifact:
+        description: Artifact name to relay
+        required: true
+        type: string
+      release_tag:
+        description: Temporary release tag
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: write
+
+jobs:
+  relay:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download source artifact
+        uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.source_run_id }}
+          name: ${{ inputs.source_artifact }}
+          path: relay
+
+      - name: Publish temporary release asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test -f relay/kiro-rs
+          gh release create "${{ inputs.release_tag }}" relay/kiro-rs \
+            --repo "${{ github.repository }}" \
+            --target "${{ inputs.source_sha }}" \
+            --title "Temporary deployment artifact ${{ inputs.source_sha }}" \
+            --notes "Temporary deployment relay; safe to delete after deployment." \
+            --prerelease
