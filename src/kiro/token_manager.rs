@@ -25,8 +25,8 @@ use crate::kiro::model::available_models::{ListAvailableModelsResponse, Upstream
 use crate::kiro::model::available_profiles::ListAvailableProfilesResponse;
 use crate::kiro::model::credentials::{KiroCredentials, profile_arn_region};
 use crate::kiro::model::token_refresh::{
-    ExternalIdpRefreshResponse, IdcRefreshRequest, IdcRefreshResponse, RefreshRequest,
-    RefreshResponse,
+    ExternalIdpRefreshResponse, IdcRefreshRequest, IdcRefreshResponse, OidcErrorResponse,
+    RefreshRequest, RefreshResponse,
 };
 use crate::kiro::model::usage_limits::UsageLimitsResponse;
 use crate::model::config::Config;
@@ -114,6 +114,46 @@ impl fmt::Display for RefreshTokenInvalidError {
 }
 
 impl std::error::Error for RefreshTokenInvalidError {}
+
+/// AWS SSO OIDC 拒绝 refresh grant，但未声明 refreshToken 无效。
+///
+/// `access_denied` 与明确的 `invalid_grant` 不同：现有 accessToken 仍可能可用，
+/// 因此调用方应优先回退到 accessToken，而不是累计刷新失败并禁用凭据。
+#[derive(Debug)]
+pub(crate) struct IdcRefreshAccessDeniedError {
+    pub message: String,
+}
+
+impl fmt::Display for IdcRefreshAccessDeniedError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl std::error::Error for IdcRefreshAccessDeniedError {}
+
+fn has_existing_access_token(credentials: &KiroCredentials) -> bool {
+    credentials
+        .access_token
+        .as_deref()
+        .is_some_and(|token| !token.trim().is_empty())
+}
+
+fn can_fallback_after_idc_access_denied(
+    credentials: &KiroCredentials,
+    error: &anyhow::Error,
+) -> bool {
+    has_existing_access_token(credentials)
+        && error
+            .downcast_ref::<IdcRefreshAccessDeniedError>()
+            .is_some()
+}
+
+fn is_idc_access_denied_response(status: u16, body: &str) -> bool {
+    status == 400
+        && serde_json::from_str::<OidcErrorResponse>(body)
+            .is_ok_and(|response| response.error == "access_denied")
+}
 
 /// 普通 429 软限流错误。
 ///
@@ -330,6 +370,13 @@ async fn refresh_idc_token(
         {
             return Err(RefreshTokenInvalidError {
                 message: format!("IdC refreshToken 已失效 (invalid_grant): {}", body_text),
+            }
+            .into());
+        }
+
+        if is_idc_access_denied_response(status.as_u16(), &body_text) {
+            return Err(IdcRefreshAccessDeniedError {
+                message: format!("IdC refresh grant 被拒绝 (access_denied): {}", body_text),
             }
             .into());
         }
@@ -929,6 +976,10 @@ struct CredentialEntry {
     total_failure_count: u64,
     /// Token 刷新连续失败次数
     refresh_failure_count: u32,
+    /// IdC refresh grant 返回 access_denied 后的刷新重试冷却。
+    /// 冷却期间继续使用已有 accessToken，由真实 API 响应判断 Token 是否可用。
+    /// 不持久化，进程重启后清空。
+    refresh_access_denied_until: Option<Instant>,
     /// 是否已禁用
     disabled: bool,
     /// 禁用原因（用于区分手动禁用 vs 自动禁用，便于自愈）
@@ -983,6 +1034,7 @@ impl CredentialEntry {
         self.failure_count = 0;
         self.total_failure_count = 0;
         self.refresh_failure_count = 0;
+        self.refresh_access_denied_until = None;
         self.disabled = false;
         self.disabled_reason = None;
         self.disabled_at = None;
@@ -1266,6 +1318,8 @@ pub struct MultiTokenManager {
 
 /// 每个凭据最大 API 调用失败次数
 const MAX_FAILURES_PER_CREDENTIAL: u32 = 3;
+/// IdC refresh grant 被拒绝时，避免每个请求都重复刷新。
+const IDC_ACCESS_DENIED_REFRESH_COOLDOWN_SECS: u64 = 300;
 /// 普通 429 软冷却：首次 5s，之后指数增长。
 const RATE_LIMIT_SOFT_COOLDOWN_BASE_SECS: u64 = 5;
 /// 普通 429 软冷却封顶，避免一次普通限流把账号长时间踢出调度。
@@ -1496,6 +1550,7 @@ impl MultiTokenManager {
                     failure_count: 0,
                     total_failure_count: 0,
                     refresh_failure_count: 0,
+                    refresh_access_denied_until: None,
                     disabled: cred.disabled, // 从配置文件读取 disabled 状态
                     disabled_reason,
                     success_count: 0,
@@ -2400,31 +2455,74 @@ impl MultiTokenManager {
             });
         }
 
-        // 第一次检查（无锁）：快速判断是否需要刷新
-        let needs_refresh = is_token_expired(credentials) || is_token_expiring_soon(credentials);
+        // 第一次快速判断是否需要刷新。IdC access_denied 冷却期间
+        // 继续使用已有 accessToken，让真实 API 响应决定它是否失效。
+        let refresh_deferred = {
+            let entries = self.entries.lock();
+            entries
+                .iter()
+                .find(|entry| entry.id == id)
+                .and_then(|entry| entry.refresh_access_denied_until)
+                .is_some_and(|until| until > Instant::now())
+                && has_existing_access_token(credentials)
+        };
+        let needs_refresh = (is_token_expired(credentials) || is_token_expiring_soon(credentials))
+            && !refresh_deferred;
 
         let creds = if needs_refresh {
             // 获取刷新锁，确保同一时间只有一个刷新操作
             let _guard = self.refresh_lock.lock().await;
 
             // 第二次检查：获取锁后重新读取凭据，因为其他请求可能已经完成刷新
-            let current_creds = {
+            let (current_creds, refresh_deferred) = {
                 let entries = self.entries.lock();
-                entries
+                let entry = entries
                     .iter()
                     .find(|e| e.id == id)
-                    .map(|e| e.credentials.clone())
-                    .ok_or_else(|| anyhow::anyhow!("凭据 #{} 不存在", id))?
+                    .ok_or_else(|| anyhow::anyhow!("凭据 #{} 不存在", id))?;
+                let deferred = entry
+                    .refresh_access_denied_until
+                    .is_some_and(|until| until > Instant::now())
+                    && has_existing_access_token(&entry.credentials);
+                (entry.credentials.clone(), deferred)
             };
 
-            if is_token_expired(&current_creds) || is_token_expiring_soon(&current_creds) {
+            if (is_token_expired(&current_creds) || is_token_expiring_soon(&current_creds))
+                && !refresh_deferred
+            {
                 // 确实需要刷新
                 let global_proxy = self.proxy.lock().clone();
                 let effective_proxy = current_creds.effective_proxy(global_proxy.as_ref());
-                let new_creds =
-                    refresh_token(&current_creds, &self.config, effective_proxy.as_ref()).await?;
+                let (new_creds, used_access_token_fallback) = match refresh_token(
+                    &current_creds,
+                    &self.config,
+                    effective_proxy.as_ref(),
+                )
+                .await
+                {
+                    Ok(new_creds) => (new_creds, false),
+                    Err(error) if can_fallback_after_idc_access_denied(&current_creds, &error) => {
+                        let mut entries = self.entries.lock();
+                        if let Some(entry) = entries.iter_mut().find(|entry| entry.id == id) {
+                            entry.refresh_access_denied_until = Some(
+                                Instant::now()
+                                    + StdDuration::from_secs(
+                                        IDC_ACCESS_DENIED_REFRESH_COOLDOWN_SECS,
+                                    ),
+                            );
+                            entry.refresh_failure_count = 0;
+                        }
+                        tracing::warn!(
+                            "凭据 #{} IdC refresh grant 被拒绝，继续使用现有 accessToken，{} 秒后再尝试刷新",
+                            id,
+                            IDC_ACCESS_DENIED_REFRESH_COOLDOWN_SECS
+                        );
+                        (current_creds.clone(), true)
+                    }
+                    Err(error) => return Err(error),
+                };
 
-                if is_token_expired(&new_creds) {
+                if !used_access_token_fallback && is_token_expired(&new_creds) {
                     anyhow::bail!("刷新后的 Token 仍然无效或已过期");
                 }
 
@@ -2433,12 +2531,17 @@ impl MultiTokenManager {
                     let mut entries = self.entries.lock();
                     if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
                         entry.credentials = new_creds.clone();
+                        if !used_access_token_fallback {
+                            entry.refresh_access_denied_until = None;
+                        }
                     }
                 }
 
                 // 回写凭据到文件（仅多凭据格式），失败只记录警告
-                if let Err(e) = self.persist_credentials() {
-                    tracing::warn!("Token 刷新后持久化失败（不影响本次请求）: {}", e);
+                if !used_access_token_fallback {
+                    if let Err(e) = self.persist_credentials() {
+                        tracing::warn!("Token 刷新后持久化失败（不影响本次请求）: {}", e);
+                    }
                 }
 
                 new_creds
@@ -3581,6 +3684,7 @@ impl MultiTokenManager {
                 // 启用时重置失败计数
                 entry.failure_count = 0;
                 entry.refresh_failure_count = 0;
+                entry.refresh_access_denied_until = None;
                 entry.disabled_reason = None;
                 entry.disabled_at = None;
                 entry.throttled_until = None;
@@ -4346,12 +4450,21 @@ impl MultiTokenManager {
         }
 
         // 3. 验证凭据有效性（API Key 无需网络刷新）
-        let mut validated_cred = if new_cred.is_api_key_credential() {
-            new_cred.clone()
+        let (mut validated_cred, refresh_access_denied) = if new_cred.is_api_key_credential() {
+            (new_cred.clone(), false)
         } else {
             let global_proxy = self.proxy.lock().clone();
             let effective_proxy = new_cred.effective_proxy(global_proxy.as_ref());
-            refresh_token(&new_cred, &self.config, effective_proxy.as_ref()).await?
+            match refresh_token(&new_cred, &self.config, effective_proxy.as_ref()).await {
+                Ok(credentials) => (credentials, false),
+                Err(error) if can_fallback_after_idc_access_denied(&new_cred, &error) => {
+                    tracing::warn!(
+                        "IdC refresh grant 被拒绝，凭据仍携带 accessToken，保留原 Token 完成导入"
+                    );
+                    (new_cred.clone(), true)
+                }
+                Err(error) => return Err(error),
+            }
         };
 
         // 捕获原始输入的去重指纹。刷新可能轮换 refreshToken，且下方 step 5 会把
@@ -4455,6 +4568,10 @@ impl MultiTokenManager {
                 failure_count: 0,
                 total_failure_count: 0,
                 refresh_failure_count: 0,
+                refresh_access_denied_until: refresh_access_denied.then(|| {
+                    Instant::now()
+                        + StdDuration::from_secs(IDC_ACCESS_DENIED_REFRESH_COOLDOWN_SECS)
+                }),
                 disabled: false,
                 disabled_reason: None,
                 success_count: 0,
@@ -4737,6 +4854,7 @@ impl MultiTokenManager {
             entry.credentials.access_token = new_access_token;
             entry.credentials.expires_at = new_expires_at;
             entry.refresh_failure_count = 0;
+            entry.refresh_access_denied_until = None;
         }
         self.invalidate_model_cache(id);
         self.persist_credentials()?;
@@ -4832,6 +4950,7 @@ impl MultiTokenManager {
             if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
                 entry.credentials = new_creds;
                 entry.refresh_failure_count = 0;
+                entry.refresh_access_denied_until = None;
             }
         }
         self.invalidate_model_cache(id);
@@ -5265,6 +5384,51 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
+    #[test]
+    fn idc_access_denied_response_is_distinct_from_invalid_grant() {
+        assert!(is_idc_access_denied_response(
+            400,
+            r#"{"error":"access_denied","error_description":"Access denied"}"#,
+        ));
+        assert!(!is_idc_access_denied_response(
+            400,
+            r#"{"error":"invalid_grant","error_description":"Invalid refresh token provided"}"#,
+        ));
+        assert!(!is_idc_access_denied_response(
+            401,
+            r#"{"error":"access_denied"}"#,
+        ));
+    }
+
+    #[test]
+    fn idc_access_denied_fallback_requires_existing_access_token() {
+        let error = anyhow::Error::new(IdcRefreshAccessDeniedError {
+            message: "access denied".to_string(),
+        });
+        let mut credentials = KiroCredentials {
+            access_token: Some("still-usable-access-token".to_string()),
+            ..Default::default()
+        };
+
+        assert!(can_fallback_after_idc_access_denied(
+            &credentials,
+            &error
+        ));
+
+        credentials.access_token = None;
+        assert!(!can_fallback_after_idc_access_denied(
+            &credentials,
+            &error
+        ));
+        assert!(!can_fallback_after_idc_access_denied(
+            &KiroCredentials {
+                access_token: Some("still-usable-access-token".to_string()),
+                ..Default::default()
+            },
+            &anyhow::anyhow!("generic refresh failure"),
+        ));
+    }
+
     /// 构造一个仅含单凭据、可配置 RPM 限流的测试用 manager。
     fn rpm_test_manager(enabled: bool, limit: u32) -> MultiTokenManager {
         let mut config = Config::default();
@@ -5277,6 +5441,27 @@ mod tests {
             ..KiroCredentials::default()
         };
         MultiTokenManager::new(config, vec![cred], None, None, true).unwrap()
+    }
+
+    #[tokio::test]
+    async fn idc_access_denied_cooldown_uses_expired_access_token_without_disabling() {
+        let manager = rpm_test_manager(false, 1);
+        let credentials = {
+            let mut entries = manager.entries.lock();
+            let entry = &mut entries[0];
+            entry.credentials.auth_method = Some("idc".to_string());
+            entry.credentials.expires_at = Some("2020-01-01T00:00:00Z".to_string());
+            entry.refresh_access_denied_until =
+                Some(Instant::now() + StdDuration::from_secs(60));
+            entry.credentials.clone()
+        };
+
+        let context = manager.try_ensure_token(1, &credentials).await.unwrap();
+
+        assert_eq!(context.token, "access-token");
+        let entries = manager.entries.lock();
+        assert!(!entries[0].disabled);
+        assert_eq!(entries[0].refresh_failure_count, 0);
     }
 
     #[test]
