@@ -1199,6 +1199,7 @@ async fn handle_stream_request(
 
     // 创建 SSE 流
     let stream = create_sse_stream(
+        provider.clone(),
         response,
         ctx,
         initial_events,
@@ -1243,6 +1244,7 @@ fn format_error_chain(error: &(dyn std::error::Error + 'static)) -> String {
 
 /// 创建 SSE 事件流
 fn create_sse_stream(
+    provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     response: reqwest::Response,
     ctx: StreamContext,
     initial_events: Vec<SseEvent>,
@@ -1262,8 +1264,8 @@ fn create_sse_stream(
     let body_stream = response.bytes_stream();
 
     let processing_stream = stream::unfold(
-        (body_stream, ctx, EventStreamDecoder::new(), false, interval(Duration::from_secs(PING_INTERVAL_SECS)), hook, credential_id, tracer, 0u64, traffic_guard),
-        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, hook, credential_id, tracer, mut sent_bytes, traffic_guard)| async move {
+        (body_stream, ctx, EventStreamDecoder::new(), false, interval(Duration::from_secs(PING_INTERVAL_SECS)), hook, credential_id, tracer, 0u64, traffic_guard, provider),
+        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, hook, credential_id, tracer, mut sent_bytes, traffic_guard, provider)| async move {
             if finished {
                 return None;
             }
@@ -1319,11 +1321,12 @@ fn create_sse_stream(
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
 
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, hook, credential_id, tracer, sent_bytes, traffic_guard)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, hook, credential_id, tracer, sent_bytes, traffic_guard, provider)))
                         }
                         Some(Err(e)) => {
                             let error_detail = format_error_chain(&e);
                             tracing::error!(error = %error_detail, "读取响应流失败");
+                            provider.rotate_dynamic_proxy_session(credential_id, "stream_body_read_error");
                             ctx.record_upstream_error(
                                 "upstream_stream_error",
                                 format!("Kiro response stream failed: {e}"),
@@ -1342,7 +1345,7 @@ fn create_sse_stream(
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id, tracer, sent_bytes, traffic_guard)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id, tracer, sent_bytes, traffic_guard, provider)))
                         }
                         None => {
                             // 流结束，发送最终事件（generate_final_events 内部会 finish()
@@ -1361,6 +1364,7 @@ fn create_sse_stream(
                                 );
                             } else {
                                 record_stream_usage(&hook, &ctx, credential_id, "success");
+                                provider.report_stream_success(credential_id, Some(&ctx.model));
                                 tracer.finalize(
                                     "success",
                                     None,
@@ -1373,7 +1377,7 @@ fn create_sse_stream(
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id, tracer, sent_bytes, traffic_guard)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id, tracer, sent_bytes, traffic_guard, provider)))
                         }
                     }
                 }
@@ -1381,7 +1385,7 @@ fn create_sse_stream(
                 _ = ping_interval.tick() => {
                     tracing::trace!("发送 ping 保活事件");
                     let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
-                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, hook, credential_id, tracer, sent_bytes, traffic_guard)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, hook, credential_id, tracer, sent_bytes, traffic_guard, provider)))
                 }
             }
         },
@@ -2348,6 +2352,9 @@ async fn retry_buffered_stream_after_upstream_failure(
     reason: &str,
 ) -> bool {
     if state.upstream_response_retry >= TOOL_JSON_INCOMPLETE_MAX_RETRIES {
+        state
+            .provider
+            .rotate_dynamic_proxy_session(state.credential_id, reason);
         return false;
     }
 
@@ -2364,6 +2371,10 @@ async fn retry_buffered_stream_after_upstream_failure(
         error = %message,
         "retrying buffered stream after retryable upstream response failure"
     );
+
+    state
+        .provider
+        .rotate_dynamic_proxy_session(state.credential_id, reason);
 
     match provider
         .call_api_stream(&request_body, Some(tracer.as_ref()), group.as_deref())
@@ -2534,6 +2545,11 @@ fn create_buffered_sse_stream(
                                         let bytes: Vec<Result<Bytes, Infallible>> = Vec::new();
                                         return Some((stream::iter(bytes), state));
                                     }
+                                } else {
+                                    state.provider.rotate_dynamic_proxy_session(
+                                        state.credential_id,
+                                        "buffered_stream_body_read_error",
+                                    );
                                 }
                                 state.hook.record(state.credential_id, i, o, cc, cr, credits, "error");
                                 // 缓冲模式 chunk 读取失败：上游中途断流
@@ -2592,6 +2608,9 @@ fn create_buffered_sse_stream(
                                     );
                                 } else {
                                     state.hook.record(state.credential_id, i, o, cc, cr, credits, "success");
+                                    state
+                                        .provider
+                                        .report_stream_success(state.credential_id, Some(&state.model));
                                     state.tracer.finalize("success", None, None, None, trace_usage);
                                 }
                                 let bytes: Vec<Result<Bytes, Infallible>> = all_events

@@ -34,6 +34,40 @@ impl ProxyConfig {
         self.password = Some(password.into());
         self
     }
+
+    /// Rotate the session number used by 711proxy sticky residential proxies.
+    ///
+    /// This intentionally only handles the provider's documented URL shape. Other
+    /// proxies must keep their configured URL unchanged.
+    pub fn rotate_711proxy_session(&self) -> Option<Self> {
+        if !self.url.to_ascii_lowercase().contains("711proxy.com") {
+            return None;
+        }
+
+        let marker = "session-";
+        let marker_start = self.url.to_ascii_lowercase().find(marker)?;
+        let digits_start = marker_start + marker.len();
+        let digits_end = self.url[digits_start..]
+            .char_indices()
+            .find(|(_, ch)| !ch.is_ascii_digit())
+            .map(|(offset, _)| digits_start + offset)
+            .unwrap_or(self.url.len());
+        if digits_end == digits_start {
+            return None;
+        }
+
+        let old_session = &self.url[digits_start..digits_end];
+        let mut next_session = fastrand::u64(10_000_000..100_000_000).to_string();
+        if next_session == old_session {
+            next_session = (next_session.parse::<u64>().unwrap_or(10_000_000) + 1).to_string();
+        }
+
+        let mut rotated = self.clone();
+        rotated
+            .url
+            .replace_range(digits_start..digits_end, &next_session);
+        Some(rotated)
+    }
 }
 
 /// 构建 HTTP Client
@@ -145,5 +179,22 @@ mod tests {
     fn test_build_api_client_with_proxy() {
         let config = ProxyConfig::new("socks5h://127.0.0.1:1080");
         assert!(build_api_client(Some(&config), 30, TlsBackend::Rustls).is_ok());
+    }
+
+    #[test]
+    fn test_rotate_711proxy_session_only_changes_session_digits() {
+        let config = ProxyConfig::new(
+            "socks5h://USER-zone-custom-region-US-session-21330988-sessTime-180-sessAuto-1:pass@global.rotgb.711proxy.com:10000",
+        );
+        let rotated = config.rotate_711proxy_session().expect("711proxy session");
+        assert!(rotated.url.contains("sessTime-180-sessAuto-1"));
+        assert_ne!(rotated.url, config.url);
+        assert!(rotated.url.contains("global.rotgb.711proxy.com:10000"));
+    }
+
+    #[test]
+    fn test_rotate_711proxy_session_ignores_other_proxies() {
+        let config = ProxyConfig::new("socks5h://proxy.example/session-123");
+        assert!(config.rotate_711proxy_session().is_none());
     }
 }

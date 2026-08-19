@@ -123,6 +123,9 @@ pub struct KiroProvider {
     /// `ListAvailableProfiles`。命中真实 ARN 的账号会把 ARN 持久化进凭据，之后
     /// 通过 `streaming_profile_arn()` 直接命中，不再进入解析路径。
     profile_resolution_attempted: Mutex<HashSet<u64>>,
+    /// Per-credential dynamic proxy URL overrides after a transport failure.
+    /// Only 711proxy URLs are rotated; no proxy cooldown is applied.
+    dynamic_proxy_overrides: Mutex<HashMap<u64, ProxyConfig>>,
 }
 
 impl KiroProvider {
@@ -162,6 +165,7 @@ impl KiroProvider {
             endpoints,
             endpoint_cooldowns: Mutex::new(HashMap::new()),
             profile_resolution_attempted: Mutex::new(HashSet::new()),
+            dynamic_proxy_overrides: Mutex::new(HashMap::new()),
         }
     }
 
@@ -175,6 +179,63 @@ impl KiroProvider {
         let client = build_api_client(effective.as_ref(), 720, self.tls_backend)?;
         cache.insert(effective, client.clone());
         Ok(client)
+    }
+
+    fn apply_dynamic_proxy_override(&self, credential_id: u64, credentials: &mut KiroCredentials) {
+        let Some(proxy) = self
+            .dynamic_proxy_overrides
+            .lock()
+            .get(&credential_id)
+            .cloned()
+        else {
+            return;
+        };
+        tracing::debug!(
+            credential_id,
+            proxy_provider = "711proxy",
+            "using rotated dynamic proxy session"
+        );
+        credentials.proxy_url = Some(proxy.url);
+        credentials.proxy_username = proxy.username;
+        credentials.proxy_password = proxy.password;
+    }
+
+    /// Rotate a 711proxy session after a transport/body-stream failure.
+    /// Returns true when the credential had a supported dynamic proxy URL.
+    pub fn rotate_dynamic_proxy_session(&self, credential_id: u64, reason: &str) -> bool {
+        let Some(credentials) = self.token_manager.clone_credential(credential_id) else {
+            return false;
+        };
+        let configured = credentials.effective_proxy(self.global_proxy.as_ref());
+        let current = self
+            .dynamic_proxy_overrides
+            .lock()
+            .get(&credential_id)
+            .cloned()
+            .or(configured);
+        let Some(current) = current else {
+            return false;
+        };
+        let Some(rotated) = current.rotate_711proxy_session() else {
+            return false;
+        };
+        tracing::warn!(
+            credential_id,
+            reason,
+            proxy_provider = "711proxy",
+            dynamic_session_rotated = true,
+            "711proxy transport failure; rotating sticky session for the next request"
+        );
+        self.dynamic_proxy_overrides
+            .lock()
+            .insert(credential_id, rotated);
+        true
+    }
+
+    /// Record success only after a streaming response body has been fully consumed.
+    pub fn report_stream_success(&self, credential_id: u64, model: Option<&str>) {
+        self.token_manager
+            .report_success_for_request(credential_id, model);
     }
 
     /// 用指定 endpoint 构造并发送一次 API 请求，返回原始响应（不读取 body）。
@@ -694,6 +755,7 @@ impl KiroProvider {
 
             // 确保 Enterprise / IdC 账号的真实 profileArn 已解析（流式端点强制要求）
             self.ensure_profile_arn(&mut ctx).await?;
+            self.apply_dynamic_proxy_override(ctx.id, &mut ctx.credentials);
 
             let config = self.token_manager.config();
             let machine_id = machine_id::generate_from_credentials(&ctx.credentials, config);
@@ -758,6 +820,7 @@ impl KiroProvider {
                     );
                     // 网络错误通常是上游/链路瞬态问题，不应导致"禁用凭据"或"切换凭据"
                     // （否则一段时间网络抖动会把所有凭据都误禁用，需要重启才能恢复）
+                    self.rotate_dynamic_proxy_session(ctx.id, "request_send_error");
                     last_error = Some(e);
                     if ordinary_429_retries.has_next_attempt(attempt, max_retries) {
                         sleep(Self::retry_delay(attempt)).await;
@@ -776,8 +839,10 @@ impl KiroProvider {
                     sink, attempt, ctx.id, endpoint_name, Some(status.as_u16()),
                     outcome::SUCCESS, None, attempt_start,
                 );
-                self.token_manager
-                    .report_success_for_request(ctx.id, model.as_deref());
+                if !is_stream {
+                    self.token_manager
+                        .report_success_for_request(ctx.id, model.as_deref());
+                }
                 return Ok(KiroCallResult {
                     response,
                     credential_id: ctx.id,
@@ -1077,8 +1142,10 @@ impl KiroProvider {
                                 None,
                                 fb_start,
                             );
-                            self.token_manager
-                                .report_success_for_request(ctx.id, model.as_deref());
+                            if !is_stream {
+                                self.token_manager
+                                    .report_success_for_request(ctx.id, model.as_deref());
+                            }
                             tracing::info!(
                                 "凭据 #{} 在备用端点 [{}] 成功（主端点 [{}] 此前 429）",
                                 ctx.id,
