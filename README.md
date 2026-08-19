@@ -105,8 +105,7 @@ docker compose logs --tail=200 kiro-rs
   "apiKey": "sk-kiro-rs-...",
   "adminApiKey": "sk-admin-...",
   "region": "us-east-1",
-  "tlsBackend": "rustls",
-  "defaultEndpoint": "ide"
+  "tlsBackend": "rustls"
 }
 ```
 
@@ -295,8 +294,7 @@ curl -X POST http://127.0.0.1:8990/api/admin/credentials/kiro-api-key \
   "apiKey": "sk-kiro-rs-change-me",
   "adminApiKey": "sk-admin-change-me",
   "region": "us-east-1",
-  "tlsBackend": "rustls",
-  "defaultEndpoint": "ide"
+  "tlsBackend": "rustls"
 }
 ```
 
@@ -312,7 +310,7 @@ curl -X POST http://127.0.0.1:8990/api/admin/credentials/kiro-api-key \
 | `region` | `us-east-1` | 全局默认 Region |
 | `authRegion` | 无 | token 刷新用 Region，未配置时回退 `region` |
 | `apiRegion` | 无 | Kiro API 请求用 Region，未配置时回退 `region` |
-| `defaultEndpoint` | `ide` | 凭据未指定 endpoint 时使用的端点 |
+| 固定降级链 | `runtime` → `ide` → `codewhisperer` → `amazonq` | 凭据未显式指定 endpoint 时从 `runtime` 开始；不可通过全局配置改变 |
 | `tlsBackend` | `rustls` | `rustls` 或 `native-tls` |
 | `proxyUrl` | 无 | 全局代理，支持 `http://`、`https://`、`socks5://` |
 | `proxyUsername` / `proxyPassword` | 无 | 全局代理认证 |
@@ -455,7 +453,7 @@ KIRO_API_KEY=ksk_xxx ./kiro-rs
 | `proxyUsername` / `proxyPassword` | 凭据级代理认证 |
 | `disabled` | 是否禁用 |
 | `kiroApiKey` | `ksk_*` Kiro API Key |
-| `endpoint` | `ide` 或 `cli`，未填使用 `config.defaultEndpoint` |
+| `endpoint` | `runtime`、`ide`、`codewhisperer`、`amazonq` 或 `cli`，未填从 `runtime` 开始 |
 
 <a id="models"></a>
 ## 模型

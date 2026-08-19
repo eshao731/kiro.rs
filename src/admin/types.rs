@@ -215,7 +215,7 @@ pub struct AddCredentialRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kiro_api_key: Option<String>,
 
-    /// 端点名称（可选，未配置时使用 config.defaultEndpoint）
+    /// 端点名称（可选，未配置时固定从 Runtime 端点开始）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
 

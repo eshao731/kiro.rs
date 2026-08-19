@@ -6,7 +6,6 @@
   "region": "us-east-1",
   "adminApiKey": "sk-admin-your-secret-key",
   "credentialImportApiKey": "sk-credential-import-your-secret-key",
-  "defaultEndpoint": "ide",
   "modelFallback": true,
   "accountThrottleCooldownSecs": 300,
   "ordinary429RetryCount": 0,

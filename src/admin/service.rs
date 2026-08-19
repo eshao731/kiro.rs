@@ -629,7 +629,8 @@ impl AdminService {
         } else {
             snapshot.current_id
         };
-        let default_endpoint = self.token_manager.config().default_endpoint.clone();
+        let fixed_start_endpoint =
+            crate::kiro::endpoint::runtime::RUNTIME_ENDPOINT_NAME.to_string();
 
         // 一次性快照余额缓存，避免 N 次加锁
         let balance_snapshot: HashMap<u64, CachedBalance> = {
@@ -689,7 +690,7 @@ impl AdminService {
                     rate_limit_count: entry.rate_limit_count,
                     rate_limit_concurrency_limit: entry.rate_limit_concurrency_limit,
                     unsupported_models: entry.unsupported_models,
-                    endpoint: entry.endpoint.unwrap_or_else(|| default_endpoint.clone()),
+                    endpoint: entry.endpoint.unwrap_or_else(|| fixed_start_endpoint.clone()),
                     groups: entry.groups,
                     source_channel: entry.source_channel,
                     balance,

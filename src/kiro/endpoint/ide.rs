@@ -62,7 +62,7 @@ impl KiroEndpoint for IdeEndpoint {
     }
 
     fn fallback_endpoint(&self) -> Option<&'static str> {
-        Some(super::runtime::RUNTIME_ENDPOINT_NAME)
+        Some(super::codewhisperer::CODEWHISPERER_ENDPOINT_NAME)
     }
 
     fn api_url(&self, ctx: &RequestContext<'_>) -> String {

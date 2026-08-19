@@ -31,7 +31,7 @@ pub struct TraceAttempt {
     pub attempt: u32,
     /// 命中的上游凭据 id；0 表示未取到凭据
     pub credential_id: u64,
-    /// 端点名（ide / cli）
+    /// 端点名（runtime / ide / codewhisperer / amazonq / cli）
     pub endpoint: String,
     /// 上游 HTTP 状态码；None 表示网络层失败（请求未发出/无响应）
     pub http_status: Option<u16>,

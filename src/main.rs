@@ -12,7 +12,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use clap::Parser;
-use kiro::endpoint::{CliEndpoint, IdeEndpoint, KiroEndpoint, RuntimeEndpoint};
+use kiro::endpoint::{
+    AmazonQEndpoint, CliEndpoint, CodeWhispererEndpoint, IdeEndpoint, KiroEndpoint,
+    RuntimeEndpoint,
+};
 use kiro::model::credentials::{CredentialsConfig, KiroCredentials};
 use kiro::provider::KiroProvider;
 use kiro::token_manager::MultiTokenManager;
@@ -118,23 +121,24 @@ async fn main() {
     // 构建端点注册表
     let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
     {
-        let ide = IdeEndpoint::new();
-        endpoints.insert(ide.name().to_string(), Arc::new(ide));
-        let cli = CliEndpoint::new();
-        endpoints.insert(cli.name().to_string(), Arc::new(cli));
         let runtime = RuntimeEndpoint::new();
         endpoints.insert(runtime.name().to_string(), Arc::new(runtime));
-    }
-
-    // 校验默认端点存在
-    if !endpoints.contains_key(&config.default_endpoint) {
-        tracing::error!("默认端点 \"{}\" 未注册", config.default_endpoint);
-        std::process::exit(1);
+        let ide = IdeEndpoint::new();
+        endpoints.insert(ide.name().to_string(), Arc::new(ide));
+        let codewhisperer = CodeWhispererEndpoint::new();
+        endpoints.insert(codewhisperer.name().to_string(), Arc::new(codewhisperer));
+        let amazonq = AmazonQEndpoint::new();
+        endpoints.insert(amazonq.name().to_string(), Arc::new(amazonq));
+        let cli = CliEndpoint::new();
+        endpoints.insert(cli.name().to_string(), Arc::new(cli));
     }
 
     // 校验所有凭据声明的端点都已注册
     for cred in &credentials_list {
-        let name = cred.endpoint.as_deref().unwrap_or(&config.default_endpoint);
+        let name = cred
+            .endpoint
+            .as_deref()
+            .unwrap_or(kiro::endpoint::runtime::RUNTIME_ENDPOINT_NAME);
         if !endpoints.contains_key(name) {
             tracing::error!(
                 "凭据 id={:?} 指定了未知端点 \"{}\"（已注册: {:?}）",
@@ -166,7 +170,6 @@ async fn main() {
         token_manager.clone(),
         proxy_config.clone(),
         endpoints,
-        config.default_endpoint.clone(),
     ));
 
     // 初始化自定义模型注册表（启动时装载一次，运行期只读）
@@ -394,7 +397,6 @@ fn ensure_config_files(config_path: &str, credentials_path: &str) {
             "adminApiKey": admin_api_key,
             "region": "us-east-1",
             "tlsBackend": "rustls",
-            "defaultEndpoint": "ide"
         });
         match serde_json::to_string_pretty(&default)
             .map_err(anyhow::Error::from)

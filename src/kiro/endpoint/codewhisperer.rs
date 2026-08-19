@@ -1,7 +1,4 @@
-//! Kiro Runtime 端点
-//!
-//! 对应 `runtime.{region}.kiro.dev` 推理链路。请求头和请求体加工与 IDE 端点一致，
-//! 是默认首选端点；普通 429 时依次降级到 IDE、CodeWhisperer 和 Amazon Q。
+//! AWS CodeWhisperer streaming endpoint.
 
 use reqwest::RequestBuilder;
 use uuid::Uuid;
@@ -10,11 +7,11 @@ use super::ide::inject_profile_arn;
 use super::{KiroEndpoint, RequestContext};
 use crate::kiro::kiro_version;
 
-pub const RUNTIME_ENDPOINT_NAME: &str = "runtime";
+pub const CODEWHISPERER_ENDPOINT_NAME: &str = "codewhisperer";
 
-pub struct RuntimeEndpoint;
+pub struct CodeWhispererEndpoint;
 
-impl RuntimeEndpoint {
+impl CodeWhispererEndpoint {
     pub fn new() -> Self {
         Self
     }
@@ -24,15 +21,11 @@ impl RuntimeEndpoint {
     }
 
     fn host(&self, ctx: &RequestContext<'_>) -> String {
-        format!("runtime.{}.kiro.dev", self.api_region(ctx))
-    }
-
-    fn x_amz_user_agent(&self, ctx: &RequestContext<'_>) -> String {
-        format!(
-            "aws-sdk-js/1.0.34 KiroIDE-{}-{}",
-            kiro_version::effective(&ctx.config.kiro_version),
-            ctx.machine_id
-        )
+        if self.api_region(ctx) == "us-east-1" {
+            "codewhisperer.us-east-1.amazonaws.com".to_string()
+        } else {
+            format!("q.{}.amazonaws.com", self.api_region(ctx))
+        }
     }
 
     fn user_agent(&self, ctx: &RequestContext<'_>) -> String {
@@ -44,36 +37,45 @@ impl RuntimeEndpoint {
             ctx.machine_id
         )
     }
+
+    fn x_amz_user_agent(&self, ctx: &RequestContext<'_>) -> String {
+        format!(
+            "aws-sdk-js/1.0.34 KiroIDE-{}-{}",
+            kiro_version::effective(&ctx.config.kiro_version),
+            ctx.machine_id
+        )
+    }
 }
 
-impl Default for RuntimeEndpoint {
+impl Default for CodeWhispererEndpoint {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl KiroEndpoint for RuntimeEndpoint {
+impl KiroEndpoint for CodeWhispererEndpoint {
     fn name(&self) -> &'static str {
-        RUNTIME_ENDPOINT_NAME
+        CODEWHISPERER_ENDPOINT_NAME
     }
 
     fn fallback_endpoint(&self) -> Option<&'static str> {
-        Some(super::ide::IDE_ENDPOINT_NAME)
+        Some(super::amazonq::AMAZONQ_ENDPOINT_NAME)
     }
 
     fn api_url(&self, ctx: &RequestContext<'_>) -> String {
-        format!(
-            "https://runtime.{}.kiro.dev/generateAssistantResponse",
-            self.api_region(ctx)
-        )
+        format!("https://{}/generateAssistantResponse", self.host(ctx))
     }
 
     fn mcp_url(&self, ctx: &RequestContext<'_>) -> String {
-        format!("https://runtime.{}.kiro.dev/mcp", self.api_region(ctx))
+        format!("https://{}/mcp", self.host(ctx))
     }
 
     fn decorate_api(&self, req: RequestBuilder, ctx: &RequestContext<'_>) -> RequestBuilder {
         let mut req = req
+            .header(
+                "x-amz-target",
+                "AmazonCodeWhispererStreamingService.GenerateAssistantResponse",
+            )
             .header("x-amzn-codewhisperer-optout", "true")
             .header("x-amzn-kiro-agent-mode", "vibe")
             .header("x-amz-user-agent", self.x_amz_user_agent(ctx))

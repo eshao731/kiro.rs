@@ -300,10 +300,6 @@ pub struct Config {
     #[serde(default = "default_tool_compatibility_mode")]
     pub tool_compatibility_mode: ToolCompatibilityMode,
 
-    /// 默认端点名称（凭据未显式指定 endpoint 时使用，默认 "ide"）
-    #[serde(default = "default_endpoint")]
-    pub default_endpoint: String,
-
     /// 是否启用请求链路追踪（写 traces.db）。默认 true。
     ///
     /// 关闭后：不再写入 trace 记录、不走 TraceSink，但 `GET /api/admin/traces`
@@ -321,7 +317,7 @@ pub struct Config {
 
     /// 端点特定的配置
     ///
-    /// 键为端点名（如 "ide" / "cli"），值为该端点自由定义的参数对象。
+    /// 键为端点名（如 "runtime" / "ide" / "cli"），值为该端点自由定义的参数对象。
     /// 未在此表出现的端点沿用实现内置默认值。
     #[serde(default)]
     pub endpoints: HashMap<String, serde_json::Value>,
@@ -439,10 +435,6 @@ fn default_tool_compatibility_mode() -> ToolCompatibilityMode {
     ToolCompatibilityMode::ClaudeCode
 }
 
-fn default_endpoint() -> String {
-    crate::kiro::endpoint::ide::IDE_ENDPOINT_NAME.to_string()
-}
-
 fn default_trace_enabled() -> bool {
     true
 }
@@ -503,7 +495,6 @@ impl Default for Config {
             model_cache_ttl_secs: default_model_cache_ttl_secs(),
             extract_thinking: default_extract_thinking(),
             tool_compatibility_mode: default_tool_compatibility_mode(),
-            default_endpoint: default_endpoint(),
             trace_enabled: default_trace_enabled(),
             trace_retention_days: default_trace_retention_days(),
             usage_log_retention_days: default_usage_log_retention_days(),

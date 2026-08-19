@@ -365,13 +365,13 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
               </label>
               <Input
                 id="endpoint"
-                placeholder="留空使用默认端点（如 ide / cli）"
+                placeholder="留空使用默认端点（runtime）"
                 value={endpoint}
                 onChange={(e) => setEndpoint(e.target.value)}
                 disabled={isPending}
               />
               <p className="text-xs text-muted-foreground">
-                可选。决定该凭据走哪套 Kiro API。留空使用全局 defaultEndpoint
+                可选：runtime / ide / codewhisperer / amazonq / cli。留空从 runtime 开始
               </p>
             </div>
 

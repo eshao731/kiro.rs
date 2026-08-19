@@ -112,8 +112,6 @@ pub struct KiroProvider {
     tls_backend: TlsBackend,
     /// 端点实现注册表（key: endpoint 名称）
     endpoints: HashMap<String, Arc<dyn KiroEndpoint>>,
-    /// 默认端点名称（凭据未指定 endpoint 时使用）
-    default_endpoint: String,
     /// 凭据 × 端点的临时冷却。
     ///
     /// 端点 429 后即使备用端点成功，也必须保留主端点冷却；否则下一次请求会再次
@@ -138,18 +136,17 @@ impl KiroProvider {
     /// # Arguments
     /// * `token_manager` - 多凭据 Token 管理器
     /// * `proxy` - 全局代理配置
-    /// * `endpoints` - 端点名 → 实现的注册表（至少包含 `default_endpoint` 对应条目）
-    /// * `default_endpoint` - 凭据未显式指定 endpoint 时使用的名称
+    /// * `endpoints` - 端点名 → 实现的注册表（必须包含 Runtime 端点）
     pub fn with_proxy(
         token_manager: Arc<MultiTokenManager>,
         proxy: Option<ProxyConfig>,
         endpoints: HashMap<String, Arc<dyn KiroEndpoint>>,
-        default_endpoint: String,
     ) -> Self {
+        let fixed_start_endpoint = crate::kiro::endpoint::runtime::RUNTIME_ENDPOINT_NAME;
         assert!(
-            endpoints.contains_key(&default_endpoint),
-            "默认端点 {} 未在 endpoints 注册表中",
-            default_endpoint
+            endpoints.contains_key(fixed_start_endpoint),
+            "固定起始端点 {} 未在 endpoints 注册表中",
+            fixed_start_endpoint
         );
         let tls_backend = token_manager.config().tls_backend;
         // 预热：构建全局代理对应的 Client（作为受保护的常驻条目）
@@ -163,7 +160,6 @@ impl KiroProvider {
             client_cache: Mutex::new(client_cache),
             tls_backend,
             endpoints,
-            default_endpoint,
             endpoint_cooldowns: Mutex::new(HashMap::new()),
             profile_resolution_attempted: Mutex::new(HashSet::new()),
         }
@@ -230,50 +226,60 @@ impl KiroProvider {
         let name = credentials
             .endpoint
             .as_deref()
-            .unwrap_or(&self.default_endpoint);
+            .unwrap_or(crate::kiro::endpoint::runtime::RUNTIME_ENDPOINT_NAME);
         self.endpoints
             .get(name)
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("未知端点: {}", name))
     }
 
-    /// API 请求选择端点；配置的首选端点仍在冷却时直接使用未冷却的备用端点。
+    /// API 请求选择端点；配置的首选端点冷却时沿备用链选择第一个未冷却端点。
     fn endpoint_for_api_request(
         &self,
         credential_id: u64,
         credentials: &KiroCredentials,
     ) -> anyhow::Result<Arc<dyn KiroEndpoint>> {
-        let endpoint = self.endpoint_for(credentials)?;
-        let endpoint_name = endpoint.name();
-        let Some(primary_remaining) =
-            self.endpoint_cooldown_remaining(credential_id, endpoint_name)
-        else {
-            return Ok(endpoint);
-        };
-
-        let mut retry_after = primary_remaining;
-        if let Some(fallback_name) = endpoint.fallback_endpoint() {
-            match self.endpoint_cooldown_remaining(credential_id, fallback_name) {
+        let primary = self.endpoint_for(credentials)?;
+        let mut endpoint = primary.clone();
+        let mut retry_after = None;
+        let mut visited = HashSet::new();
+        loop {
+            let endpoint_name = endpoint.name();
+            if !visited.insert(endpoint_name) {
+                break;
+            }
+            match self.endpoint_cooldown_remaining(credential_id, endpoint_name) {
                 None => {
-                    if let Some(fallback) = self.endpoints.get(fallback_name).cloned() {
+                    if endpoint_name != primary.name() {
                         tracing::warn!(
-                            "凭据 #{} 端点 [{}] 仍在冷却（剩余 {}s），本次直接使用备用端点 [{}]",
+                            "凭据 #{} 首选端点 [{}] 冷却，本次使用备用端点 [{}]",
                             credential_id,
-                            endpoint_name,
-                            primary_remaining.as_secs().max(1),
-                            fallback_name
+                            primary.name(),
+                            endpoint_name
                         );
-                        return Ok(fallback);
                     }
+                    return Ok(endpoint);
                 }
-                Some(fallback_remaining) => {
-                    retry_after = retry_after.min(fallback_remaining);
+                Some(remaining) => {
+                    retry_after = Some(
+                        retry_after
+                            .map(|current: Duration| current.min(remaining))
+                            .unwrap_or(remaining),
+                    );
                 }
             }
+
+            let Some(fallback_name) = endpoint.fallback_endpoint() else {
+                break;
+            };
+            let Some(fallback) = self.endpoints.get(fallback_name).cloned() else {
+                break;
+            };
+            endpoint = fallback;
         }
 
         Err(AllEndpointsCoolingError {
-            retry_after_secs: retry_after.as_secs().max(1),
+            retry_after_secs: retry_after.unwrap_or_default().as_secs().max(1),
         }
         .into())
     }
@@ -989,8 +995,8 @@ impl KiroProvider {
                 continue;
             }
 
-            // 429 端点降级：先用同一凭据切到备用端点换桶重试。
-            // 备用端点也失败后，再按主端点响应分类为账号风控或瞬态退避。
+            // 429 端点降级：沿备用链用同一凭据换桶重试。
+            // 备用链耗尽或遇到非 429 失败后，再按主端点响应分类为账号风控或瞬态退避。
             if status.as_u16() == 429 {
                 let endpoint_cooldown_secs = self
                     .token_manager
@@ -1019,8 +1025,18 @@ impl KiroProvider {
                     attempt_start,
                 );
 
-                if let Some(fb_name) = endpoint.fallback_endpoint() {
-                    let fallback_available = if let Some(remaining) =
+                let mut fallback_name = endpoint.fallback_endpoint();
+                let mut visited = HashSet::from([endpoint_name]);
+                while let Some(fb_name) = fallback_name {
+                    if !visited.insert(fb_name) {
+                        break;
+                    }
+                    let Some(fb_endpoint) = self.endpoints.get(fb_name).cloned() else {
+                        break;
+                    };
+                    fallback_name = fb_endpoint.fallback_endpoint();
+
+                    if let Some(remaining) =
                         self.endpoint_cooldown_remaining(ctx.id, fb_name)
                     {
                         tracing::warn!(
@@ -1029,99 +1045,102 @@ impl KiroProvider {
                             ctx.id,
                             remaining.as_secs().max(1)
                         );
-                        false
-                    } else {
-                        true
-                    };
-                    if let Some(fb_endpoint) = fallback_available
-                        .then(|| self.endpoints.get(fb_name).cloned())
-                        .flatten()
+                        continue;
+                    }
+
+                    tracing::info!(
+                        "端点 [{}] 限流 429，凭据 #{} 降级到备用端点 [{}] 重试（换桶不换号）",
+                        endpoint_name,
+                        ctx.id,
+                        fb_name
+                    );
+                    let fb_start = Instant::now();
+                    match self
+                        .execute_api_request(
+                            &fb_endpoint,
+                            &ctx,
+                            &machine_id,
+                            config,
+                            request_body,
+                        )
+                        .await
                     {
-                        tracing::info!(
-                            "端点 [{}] 限流 429，凭据 #{} 降级到备用端点 [{}] 重试（换桶不换号）",
-                            endpoint_name,
-                            ctx.id,
-                            fb_name
-                        );
-                        let fb_start = Instant::now();
-                        match self
-                            .execute_api_request(
-                                &fb_endpoint,
-                                &ctx,
-                                &machine_id,
-                                config,
-                                request_body,
-                            )
-                            .await
-                        {
-                            Ok(fb_resp) if fb_resp.status().is_success() => {
-                                let fb_status = fb_resp.status();
-                                Self::emit_attempt(
-                                    sink,
-                                    attempt,
+                        Ok(fb_resp) if fb_resp.status().is_success() => {
+                            let fb_status = fb_resp.status();
+                            Self::emit_attempt(
+                                sink,
+                                attempt,
+                                ctx.id,
+                                fb_name,
+                                Some(fb_status.as_u16()),
+                                outcome::SUCCESS,
+                                None,
+                                fb_start,
+                            );
+                            self.token_manager
+                                .report_success_for_request(ctx.id, model.as_deref());
+                            tracing::info!(
+                                "凭据 #{} 在备用端点 [{}] 成功（主端点 [{}] 此前 429）",
+                                ctx.id,
+                                fb_name,
+                                endpoint_name
+                            );
+                            return Ok(KiroCallResult {
+                                response: fb_resp,
+                                credential_id: ctx.id,
+                            });
+                        }
+                        Ok(fb_resp) => {
+                            let fb_status = fb_resp.status();
+                            let fb_body = fb_resp.text().await.unwrap_or_default();
+                            if fb_status.as_u16() == 429 {
+                                self.mark_endpoint_rate_limited(
                                     ctx.id,
                                     fb_name,
-                                    Some(fb_status.as_u16()),
-                                    outcome::SUCCESS,
-                                    None,
-                                    fb_start,
+                                    Duration::from_secs(endpoint_cooldown_secs),
                                 );
-                                self.token_manager
-                                    .report_success_for_request(ctx.id, model.as_deref());
-                                tracing::info!(
-                                    "凭据 #{} 在备用端点 [{}] 成功（主端点 [{}] 此前 429）",
-                                    ctx.id,
-                                    fb_name,
-                                    endpoint_name
-                                );
-                                return Ok(KiroCallResult {
-                                    response: fb_resp,
-                                    credential_id: ctx.id,
-                                });
                             }
-                            Ok(fb_resp) => {
-                                let fb_status = fb_resp.status();
-                                let fb_body = fb_resp.text().await.unwrap_or_default();
-                                if fb_status.as_u16() == 429 {
-                                    self.mark_endpoint_rate_limited(
-                                        ctx.id,
-                                        fb_name,
-                                        Duration::from_secs(endpoint_cooldown_secs),
-                                    );
-                                }
-                                Self::emit_attempt(
-                                    sink,
-                                    attempt,
-                                    ctx.id,
-                                    fb_name,
-                                    Some(fb_status.as_u16()),
-                                    outcome::TRANSIENT,
-                                    Some(&fb_body),
-                                    fb_start,
-                                );
+                            Self::emit_attempt(
+                                sink,
+                                attempt,
+                                ctx.id,
+                                fb_name,
+                                Some(fb_status.as_u16()),
+                                outcome::TRANSIENT,
+                                Some(&fb_body),
+                                fb_start,
+                            );
+                            if fb_status.as_u16() == 429 {
                                 tracing::warn!(
-                                    "备用端点 [{}] 也失败（{}），落回主端点 429 分类处理",
-                                    fb_name,
-                                    fb_status
+                                    "备用端点 [{}] 也限流 429，继续尝试下一个端点",
+                                    fb_name
                                 );
+                                continue;
                             }
-                            Err(e) => {
-                                Self::emit_attempt(
-                                    sink,
-                                    attempt,
-                                    ctx.id,
-                                    fb_name,
-                                    None,
-                                    outcome::NETWORK_ERROR,
-                                    Some(&e.to_string()),
-                                    fb_start,
-                                );
-                                tracing::warn!(
-                                    "备用端点 [{}] 请求发送失败（{}），落回主端点 429 分类处理",
-                                    fb_name,
-                                    e
-                                );
-                            }
+                            tracing::warn!(
+                                "备用端点 [{}] 失败（{}），落回主端点 429 分类处理",
+                                fb_name,
+                                fb_status
+                            );
+                            break;
+                        }
+                        Err(e) => {
+                            Self::emit_attempt(
+                                sink,
+                                attempt,
+                                ctx.id,
+                                fb_name,
+                                None,
+                                outcome::NETWORK_ERROR,
+                                Some(&e.to_string()),
+                                fb_start,
+                            );
+                            tracing::warn!(
+                                "备用端点 [{}] 请求发送失败（{}），落回主端点 429 分类处理",
+                                fb_name,
+                                e
+                            );
+                            break;
                         }
                     }
                 }
@@ -1530,7 +1549,9 @@ fn account_rate_limit_with_fallback(
 #[cfg(test)]
 mod rate_limit_tests {
     use super::*;
-    use crate::kiro::endpoint::{IdeEndpoint, RuntimeEndpoint};
+    use crate::kiro::endpoint::{
+        AmazonQEndpoint, CodeWhispererEndpoint, IdeEndpoint, RuntimeEndpoint,
+    };
 
     fn endpoint_cooldown_test_provider_with_config(
         config: crate::model::config::Config,
@@ -1547,10 +1568,15 @@ mod rate_limit_tests {
             .unwrap(),
         );
         let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
-        endpoints.insert("ide".to_string(), Arc::new(IdeEndpoint::new()));
         endpoints.insert("runtime".to_string(), Arc::new(RuntimeEndpoint::new()));
+        endpoints.insert("ide".to_string(), Arc::new(IdeEndpoint::new()));
+        endpoints.insert(
+            "codewhisperer".to_string(),
+            Arc::new(CodeWhispererEndpoint::new()),
+        );
+        endpoints.insert("amazonq".to_string(), Arc::new(AmazonQEndpoint::new()));
         (
-            KiroProvider::with_proxy(token_manager, None, endpoints, "ide".to_string()),
+            KiroProvider::with_proxy(token_manager, None, endpoints),
             credentials,
         )
     }
@@ -1562,23 +1588,42 @@ mod rate_limit_tests {
     #[test]
     fn endpoint_429_cooldown_routes_next_request_directly_to_fallback() {
         let (provider, credentials) = endpoint_cooldown_test_provider();
-        provider.mark_endpoint_rate_limited(1, "ide", Duration::from_secs(300));
+        provider.mark_endpoint_rate_limited(1, "runtime", Duration::from_secs(300));
 
         let selected = provider
             .endpoint_for_api_request(1, &credentials)
             .expect("备用端点未冷却时应直接降级");
 
-        assert_eq!(selected.name(), "runtime");
+        assert_eq!(selected.name(), "ide");
     }
 
     #[test]
-    fn both_endpoint_cooldowns_exhaust_the_credential() {
+    fn endpoint_cooldowns_follow_the_full_fallback_chain() {
         let (provider, credentials) = endpoint_cooldown_test_provider();
-        provider.mark_endpoint_rate_limited(1, "ide", Duration::from_secs(300));
         provider.mark_endpoint_rate_limited(1, "runtime", Duration::from_secs(300));
+        provider.mark_endpoint_rate_limited(1, "ide", Duration::from_secs(300));
+
+        let selected = provider
+            .endpoint_for_api_request(1, &credentials)
+            .expect("前两个端点冷却时应继续降级");
+        assert_eq!(selected.name(), "codewhisperer");
+
+        provider.mark_endpoint_rate_limited(1, "codewhisperer", Duration::from_secs(300));
+        let selected = provider
+            .endpoint_for_api_request(1, &credentials)
+            .expect("前三个端点冷却时应降级到 Amazon Q");
+        assert_eq!(selected.name(), "amazonq");
+    }
+
+    #[test]
+    fn all_endpoint_cooldowns_exhaust_the_credential() {
+        let (provider, credentials) = endpoint_cooldown_test_provider();
+        for endpoint in ["runtime", "ide", "codewhisperer", "amazonq"] {
+            provider.mark_endpoint_rate_limited(1, endpoint, Duration::from_secs(300));
+        }
 
         let error = match provider.endpoint_for_api_request(1, &credentials) {
-            Ok(_) => panic!("两个端点都冷却时不应继续撞上游"),
+            Ok(_) => panic!("所有端点都冷却时不应继续撞上游"),
             Err(error) => error,
         };
 
@@ -1591,14 +1636,15 @@ mod rate_limit_tests {
         config.never_cooldown = true;
         let (provider, credentials) = endpoint_cooldown_test_provider_with_config(config);
 
-        provider.mark_endpoint_rate_limited(1, "ide", Duration::from_secs(300));
-        provider.mark_endpoint_rate_limited(1, "runtime", Duration::from_secs(300));
+        for endpoint in ["runtime", "ide", "codewhisperer", "amazonq"] {
+            provider.mark_endpoint_rate_limited(1, endpoint, Duration::from_secs(300));
+        }
 
         let selected = provider
             .endpoint_for_api_request(1, &credentials)
             .expect("永远不冷却模式应继续使用首选端点");
 
-        assert_eq!(selected.name(), "ide");
+        assert_eq!(selected.name(), "runtime");
         assert!(provider.endpoint_cooldowns.lock().is_empty());
     }
 

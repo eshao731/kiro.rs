@@ -1,6 +1,6 @@
 //! Kiro 端点抽象
 //!
-//! 不同 Kiro 端点（如 `ide` / `cli`）在 URL、请求头、请求体上存在差异，
+//! 不同 Kiro 端点（如 `runtime` / `ide` / `codewhisperer` / `amazonq` / `cli`）在 URL、请求头、请求体上存在差异，
 //! 但共享凭据池、Token 刷新、重试逻辑和 AWS event-stream 响应解码。
 //!
 //! [`KiroEndpoint`] 抽象了请求侧的差异点；`KiroProvider` 持有一个 endpoint 注册表，
@@ -11,11 +11,15 @@ use reqwest::RequestBuilder;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::model::config::Config;
 
+pub mod amazonq;
 pub mod cli;
+pub mod codewhisperer;
 pub mod ide;
 pub mod runtime;
 
+pub use amazonq::AmazonQEndpoint;
 pub use cli::CliEndpoint;
+pub use codewhisperer::CodeWhispererEndpoint;
 pub use ide::IdeEndpoint;
 pub use runtime::RuntimeEndpoint;
 
@@ -23,7 +27,7 @@ pub use runtime::RuntimeEndpoint;
 ///
 /// 同一个 `KiroProvider` 可持有多个 endpoint 实现，按凭据级字段切换。
 pub trait KiroEndpoint: Send + Sync {
-    /// 端点名称（对应 credentials.endpoint / config.defaultEndpoint 的取值）
+    /// 端点名称（对应 credentials.endpoint 的取值）
     fn name(&self) -> &'static str;
 
     /// 429 限流时可降级到的备用端点名。
