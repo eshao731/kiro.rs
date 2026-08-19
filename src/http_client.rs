@@ -49,7 +49,33 @@ pub fn build_client(
     timeout_secs: u64,
     tls_backend: TlsBackend,
 ) -> anyhow::Result<Client> {
+    build_client_inner(proxy, timeout_secs, tls_backend, false)
+}
+
+/// Build the client used for Kiro model API calls.
+///
+/// Proxied model streams use HTTP/1.1 so concurrent responses are isolated on
+/// separate proxy connections. With HTTP/2 multiplexing, one broken proxy
+/// tunnel can interrupt every active stream sharing that connection.
+pub fn build_api_client(
+    proxy: Option<&ProxyConfig>,
+    timeout_secs: u64,
+    tls_backend: TlsBackend,
+) -> anyhow::Result<Client> {
+    build_client_inner(proxy, timeout_secs, tls_backend, proxy.is_some())
+}
+
+fn build_client_inner(
+    proxy: Option<&ProxyConfig>,
+    timeout_secs: u64,
+    tls_backend: TlsBackend,
+    proxy_http1_only: bool,
+) -> anyhow::Result<Client> {
     let mut builder = Client::builder().timeout(Duration::from_secs(timeout_secs));
+
+    if proxy_http1_only {
+        builder = builder.http1_only();
+    }
 
     match tls_backend {
         TlsBackend::Rustls => {
@@ -113,5 +139,11 @@ mod tests {
         let config = ProxyConfig::new("http://127.0.0.1:7890");
         let client = build_client(Some(&config), 30, TlsBackend::Rustls);
         assert!(client.is_ok());
+    }
+
+    #[test]
+    fn test_build_api_client_with_proxy() {
+        let config = ProxyConfig::new("socks5h://127.0.0.1:1080");
+        assert!(build_api_client(Some(&config), 30, TlsBackend::Rustls).is_ok());
     }
 }

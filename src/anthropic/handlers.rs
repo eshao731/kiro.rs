@@ -1227,6 +1227,20 @@ fn create_ping_sse() -> Bytes {
     Bytes::from("event: ping\ndata: {\"type\": \"ping\"}\n\n")
 }
 
+fn format_error_chain(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut message = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        let cause_message = cause.to_string();
+        if !cause_message.is_empty() && !message.ends_with(&cause_message) {
+            message.push_str(": ");
+            message.push_str(&cause_message);
+        }
+        source = cause.source();
+    }
+    message
+}
+
 /// 创建 SSE 事件流
 fn create_sse_stream(
     response: reqwest::Response,
@@ -1308,8 +1322,8 @@ fn create_sse_stream(
                             Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, hook, credential_id, tracer, sent_bytes, traffic_guard)))
                         }
                         Some(Err(e)) => {
-                            tracing::error!("读取响应流失败: {}", e);
-                            // 发送最终事件并结束（记为 error）
+                            let error_detail = format_error_chain(&e);
+                            tracing::error!(error = %error_detail, "读取响应流失败");
                             ctx.record_upstream_error(
                                 "upstream_stream_error",
                                 format!("Kiro response stream failed: {e}"),
@@ -1320,7 +1334,7 @@ fn create_sse_stream(
                             tracer.finalize(
                                 "interrupted",
                                 Some(outcome::STREAM_INTERRUPTED),
-                                Some(&e.to_string()),
+                                Some(&error_detail),
                                 Some(sent_bytes),
                                 stream_trace_usage(&ctx),
                             );
@@ -2496,7 +2510,8 @@ fn create_buffered_sse_stream(
                                 // 继续读取下一个 chunk，不发送任何数据
                             }
                             Some(Err(e)) => {
-                                tracing::error!("读取响应流失败: {}", e);
+                                let error_detail = format_error_chain(&e);
+                                tracing::error!(error = %error_detail, "读取响应流失败");
                                 // 发生错误，完成处理并返回所有事件
                                 state.ctx.record_upstream_error(
                                     "upstream_stream_error",
@@ -2525,7 +2540,7 @@ fn create_buffered_sse_stream(
                                 state.tracer.finalize(
                                     "interrupted",
                                     Some(outcome::STREAM_INTERRUPTED),
-                                    Some(&e.to_string()),
+                                    Some(&error_detail),
                                     Some(state.sent_bytes),
                                     TraceUsage {
                                         input_tokens: i.max(0) as u64,
