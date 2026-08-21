@@ -264,8 +264,7 @@ impl KiroProvider {
             .client_for(&ctx.credentials)?
             .post(&url)
             .body(body)
-            .header("content-type", endpoint.content_type())
-            .header("Connection", "close");
+            .header("content-type", endpoint.content_type());
         let request = endpoint.decorate_api(base, &rctx);
 
         let request = request
@@ -561,8 +560,7 @@ impl KiroProvider {
                 .client_for(&ctx.credentials)?
                 .post(&url)
                 .body(body)
-                .header("content-type", endpoint.content_type())
-                .header("Connection", "close");
+                .header("content-type", endpoint.content_type());
             let request = endpoint.decorate_mcp(base, &rctx);
 
             let response = match request.send().await {

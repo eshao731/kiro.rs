@@ -87,16 +87,14 @@ pub fn build_client(
 }
 
 /// Build the client used for Kiro model API calls.
-///
-/// Proxied model streams use HTTP/1.1 so concurrent responses are isolated on
-/// separate proxy connections. With HTTP/2 multiplexing, one broken proxy
-/// tunnel can interrupt every active stream sharing that connection.
 pub fn build_api_client(
     proxy: Option<&ProxyConfig>,
     timeout_secs: u64,
     tls_backend: TlsBackend,
 ) -> anyhow::Result<Client> {
-    build_client_inner(proxy, timeout_secs, tls_backend, proxy.is_some())
+    // Keep reqwest's default HTTP negotiation. Forcing HTTP/1.1 through a
+    // SOCKS5 proxy caused a higher rate of truncated streaming response bodies.
+    build_client_inner(proxy, timeout_secs, tls_backend, false)
 }
 
 fn build_client_inner(
