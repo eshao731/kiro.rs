@@ -1242,6 +1242,48 @@ fn format_error_chain(error: &(dyn std::error::Error + 'static)) -> String {
     message
 }
 
+/// Returns true when the downstream request has already been canceled.
+///
+/// A canceled downstream stream must not rotate a sticky proxy session: it is
+/// a client lifecycle event, not evidence that the proxy or upstream endpoint
+/// is unhealthy.
+fn is_client_cancellation_error(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    [
+        "context canceled",
+        "operation canceled",
+        "request canceled",
+        "client disconnected",
+        "client gone",
+    ]
+    .iter()
+    .any(|marker| error.contains(marker))
+}
+
+/// Returns true for transport failures where a new sticky proxy session can
+/// make a bounded retry useful. This deliberately excludes downstream
+/// cancellation, which should never trigger proxy rotation or retry.
+fn is_retryable_transport_error(error: &str) -> bool {
+    if is_client_cancellation_error(error) {
+        return false;
+    }
+
+    let error = error.to_ascii_lowercase();
+    [
+        "error decoding response body",
+        "error reading a body from connection",
+        "response body closed",
+        "body closed",
+        "unexpected eof",
+        "connection reset",
+        "connection aborted",
+        "timed out",
+        "timeout",
+    ]
+    .iter()
+    .any(|marker| error.contains(marker))
+}
+
 /// 创建 SSE 事件流
 fn create_sse_stream(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
@@ -1326,7 +1368,20 @@ fn create_sse_stream(
                         Some(Err(e)) => {
                             let error_detail = format_error_chain(&e);
                             tracing::error!(error = %error_detail, "读取响应流失败");
-                            provider.rotate_dynamic_proxy_session(credential_id, "stream_body_read_error");
+                            if is_retryable_transport_error(&error_detail) {
+                                // 711proxy transport failures only rotate the
+                                // sticky session. They must not enter the
+                                // account cooldown path.
+                                provider.rotate_dynamic_proxy_session(
+                                    credential_id,
+                                    "stream_body_read_error",
+                                );
+                            } else if is_client_cancellation_error(&error_detail) {
+                                tracing::info!(
+                                    error = %error_detail,
+                                    "下游客户端取消响应流，不轮换代理 session"
+                                );
+                            }
                             ctx.record_upstream_error(
                                 "upstream_stream_error",
                                 format!("Kiro response stream failed: {e}"),
@@ -2381,6 +2436,13 @@ async fn retry_buffered_stream_after_upstream_failure(
         .await
     {
         Ok(call_result) => {
+            tracing::info!(
+                retry,
+                previous_credential_id = state.credential_id,
+                credential_id = call_result.credential_id,
+                reason,
+                "buffered stream transport retry obtained a new upstream response"
+            );
             let mut ctx = BufferedStreamContext::new(
                 &state.model,
                 state.fallback_input_tokens,
@@ -2530,7 +2592,11 @@ fn create_buffered_sse_stream(
                                 );
                                 let all_events = state.ctx.finish_and_get_all_events();
                                 let (i, o, cc, cr, credits) = state.ctx.final_usage();
-                                if state.ctx.tool_json_error_is_incomplete() {
+                                let transport_retryable =
+                                    is_retryable_transport_error(&error_detail);
+                                if state.ctx.tool_json_error_is_incomplete()
+                                    || transport_retryable
+                                {
                                     let message = state
                                         .ctx
                                         .response_error_message()
@@ -2538,17 +2604,26 @@ fn create_buffered_sse_stream(
                                     if retry_buffered_stream_after_upstream_failure(
                                         &mut state,
                                         &message,
-                                        "read_error",
+                                        if transport_retryable {
+                                            "stream_transport_error"
+                                        } else {
+                                            "read_error"
+                                        },
                                     )
                                     .await
                                     {
                                         let bytes: Vec<Result<Bytes, Infallible>> = Vec::new();
                                         return Some((stream::iter(bytes), state));
                                     }
-                                } else {
+                                } else if !is_client_cancellation_error(&error_detail) {
                                     state.provider.rotate_dynamic_proxy_session(
                                         state.credential_id,
                                         "buffered_stream_body_read_error",
+                                    );
+                                } else {
+                                    tracing::info!(
+                                        error = %error_detail,
+                                        "下游客户端取消缓冲响应流，不轮换代理 session"
                                     );
                                 }
                                 state.hook.record(state.credential_id, i, o, cc, cr, credits, "error");
@@ -2671,6 +2746,25 @@ mod tests {
             "ValidationException: transient backend issue".to_string()
         ));
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[test]
+    fn client_cancellation_does_not_look_like_proxy_transport_failure() {
+        assert!(is_client_cancellation_error(
+            "http2: response body closed: context canceled"
+        ));
+        assert!(is_client_cancellation_error("operation canceled by client"));
+        assert!(!is_client_cancellation_error(
+            "peer closed connection without sending TLS close_notify"
+        ));
+
+        assert!(!is_retryable_transport_error(
+            "http2: response body closed: context canceled"
+        ));
+        assert!(is_retryable_transport_error(
+            "error decoding response body: peer closed connection without sending TLS close_notify"
+        ));
+        assert!(is_retryable_transport_error("connection reset by peer"));
     }
 
     #[test]
